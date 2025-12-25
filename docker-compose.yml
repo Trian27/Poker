@@ -1,0 +1,122 @@
+services:
+  # PostgreSQL Database
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: poker-postgres
+    environment:
+      POSTGRES_DB: poker_db
+      POSTGRES_USER: poker_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-poker_dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poker_user -d poker_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poker-network
+
+  # Redis Cache
+  redis-cache:
+    image: redis:7-alpine
+    container_name: poker-redis
+    command: redis-server --appendonly no
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - poker-network
+
+  # FastAPI Auth Service
+  auth-api:
+    build:
+      context: ./poker-api
+      dockerfile: Dockerfile
+    container_name: poker-auth-api
+    environment:
+      DATABASE_URL: postgresql://poker_user:${POSTGRES_PASSWORD:-poker_dev_password}@postgres-db:5432/poker_db
+      SECRET_KEY: ${JWT_SECRET_KEY:-your-secret-key-change-in-production}
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    networks:
+      - poker-network
+    restart: unless-stopped
+
+  # FastAPI Agent API
+  agent-api:
+    build:
+      context: ./poker-agent-api
+      dockerfile: Dockerfile
+    container_name: poker-agent-api
+    environment:
+      GAME_SERVER_URL: http://game-server:3000
+      FASTAPI_AUTH_URL: http://auth-api:8000
+    ports:
+      - "8001:8001"
+    depends_on:
+      - game-server
+      - auth-api
+    networks:
+      - poker-network
+    restart: unless-stopped
+
+  # Node.js Game Server
+  game-server:
+    build:
+      context: ./GameImplementation
+      dockerfile: Dockerfile
+    container_name: poker-game-server
+    environment:
+      REDIS_HOST: redis-cache
+      REDIS_PORT: 6379
+      AUTH_API_URL: http://auth-api:8000
+      PORT: 3000
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      auth-api:
+        condition: service_started
+    networks:
+      - poker-network
+    restart: unless-stopped
+
+  # React UI (with nginx)
+  react-ui:
+    build:
+      context: ./poker-ui
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+        VITE_GAME_SERVER_URL: http://localhost:3000
+    container_name: poker-react-ui
+    ports:
+      - "5173:80"
+    depends_on:
+      - auth-api
+      - game-server
+    networks:
+      - poker-network
+    restart: unless-stopped
+
+networks:
+  poker-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

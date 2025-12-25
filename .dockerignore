@@ -1,0 +1,57 @@
+# Docker ignore patterns
+# Node.js
+node_modules/
+npm-debug.log*
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.virtualenvs/
+*.egg-info/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files (these should be in docker-compose.yml)
+.env
+.env.local
+
+# Logs
+logs/
+*.log
+
+# Documentation (not needed in containers)
+*.md
+CHUNK*.md
+PROJECT_SUMMARY.md
+TECHNICAL_DECISIONS.md
+
+# Test files (not needed in production containers)
+test_*.py
+*.test.ts
+__tests__/
+
+# Scripts (not needed in containers)
+start-all.sh
+stop-all.sh
+start_server.sh
+
+# Git
+.git/
+.gitignore
