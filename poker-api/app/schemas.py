@@ -61,6 +61,19 @@ class TokenData(BaseModel):
     username: str
 
 
+class AdminInviteRequest(BaseModel):
+    """Invite a user to be a league/community admin."""
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+
+class AdminUserResponse(BaseModel):
+    """Response schema for admin users."""
+    id: int
+    username: str
+    email: EmailStr
+
+
 # ============================================================================
 # League Schemas
 # ============================================================================
@@ -81,6 +94,8 @@ class LeagueResponse(LeagueBase):
     id: int
     owner_id: int
     created_at: datetime
+    is_member: Optional[bool] = None
+    has_pending_request: Optional[bool] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -105,6 +120,7 @@ class CommunityResponse(CommunityBase):
     """Schema for community responses"""
     id: int
     league_id: int
+    commissioner_id: Optional[int] = None
     created_at: datetime
     
     model_config = ConfigDict(from_attributes=True)
@@ -165,6 +181,7 @@ class TableCreate(TableBase):
     is_permanent: bool = Field(default=False, description="Whether this table persists when empty (owner-only)")
     max_queue_size: int = Field(default=10, ge=0, le=50, description="Maximum queue size (0 = no queue)")
     action_timeout_seconds: int = Field(default=30, ge=10, le=120, description="Timeout for player actions in seconds")
+    agents_allowed: bool = Field(default=True, description="Whether autonomous agents (bots) can join this table")
 
 
 class TableResponse(TableBase):
@@ -177,6 +194,7 @@ class TableResponse(TableBase):
     created_by_user_id: int
     max_queue_size: int
     action_timeout_seconds: int
+    agents_allowed: bool
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -281,3 +299,120 @@ class TableQueuePosition(BaseModel):
 class QueueJoinRequest(BaseModel):
     """Schema for joining a table queue"""
     buy_in_amount: int = Field(..., gt=0, description="Amount to buy in with when seated")
+
+
+# ============================================================================
+# Join Request Schemas
+# ============================================================================
+
+class JoinRequestCreate(BaseModel):
+    """Schema for creating a join request"""
+    community_id: int
+    message: Optional[str] = Field(None, max_length=250, description="Optional message to commissioner")
+
+
+class JoinRequestReview(BaseModel):
+    """Schema for reviewing a join request (commissioner)"""
+    approved: bool
+    custom_starting_balance: Optional[Decimal] = Field(None, ge=0, description="Custom starting balance (optional)")
+
+
+class JoinRequestResponse(BaseModel):
+    """Schema for join request responses"""
+    id: int
+    user_id: int
+    username: str
+    community_id: int
+    community_name: str
+    message: Optional[str]
+    status: str
+    custom_starting_balance: Optional[Decimal]
+    reviewed_by_user_id: Optional[int]
+    reviewed_at: Optional[datetime]
+    created_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================================================
+# Inbox Message Schemas
+# ============================================================================
+
+class InboxMessageResponse(BaseModel):
+    """Schema for inbox message responses"""
+    id: int
+    sender_username: Optional[str]
+    message_type: str
+    title: str
+    content: str
+    metadata: Optional[dict]
+    is_read: bool
+    is_actionable: bool
+    action_taken: Optional[str]
+    created_at: datetime
+    read_at: Optional[datetime]
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InboxMessageAction(BaseModel):
+    """Schema for taking action on an inbox message"""
+    action: str = Field(..., description="Action to take (e.g., 'approve', 'deny')")
+    custom_starting_balance: Optional[Decimal] = Field(None, ge=0)
+
+
+# ============================================================================
+# Email Verification Schemas
+# ============================================================================
+
+class EmailVerificationRequest(BaseModel):
+    """Schema for verifying email with code"""
+    email: str
+    verification_code: str = Field(..., min_length=6, max_length=6)
+
+
+class EmailVerificationResponse(BaseModel):
+    """Response after email verification"""
+    success: bool
+    message: str
+    access_token: Optional[str] = None
+    token_type: Optional[str] = None
+
+
+class RegistrationPendingResponse(BaseModel):
+    """Response when registration requires email verification"""
+    message: str
+    requires_verification: bool
+
+
+# ============================================================================
+# Profile Update Schemas
+# ============================================================================
+
+class ProfileUpdateRequest(BaseModel):
+    """Schema for requesting a profile update (initiates email verification)"""
+    new_username: Optional[str] = Field(None, min_length=3, max_length=50)
+    new_email: Optional[str] = Field(None, max_length=100)
+
+
+class ProfileUpdateInitResponse(BaseModel):
+    """Response when profile update verification is initiated"""
+    message: str
+    requires_verification: bool
+    verification_sent_to: str
+
+
+class ProfileUpdateVerifyRequest(BaseModel):
+    """Schema for verifying profile update with code"""
+    verification_code: str = Field(..., min_length=6, max_length=6)
+    new_username: Optional[str] = None
+    new_email: Optional[str] = None
+
+
+class ProfileUpdateResponse(BaseModel):
+    """Response after successful profile update"""
+    success: bool
+    message: str
+    user: Optional[UserResponse] = None
+    access_token: Optional[str] = None  # New token if email changed
+    email: str

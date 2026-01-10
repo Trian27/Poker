@@ -13,6 +13,11 @@ export const LoginPage: React.FC = () => {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   
+  // Admin 2FA state
+  const [showVerification, setShowVerification] = useState(false);
+  const [verificationCode, setVerificationCode] = useState('');
+  const [adminEmail, setAdminEmail] = useState('');
+  
   const navigate = useNavigate();
   const { login } = useAuth();
 
@@ -24,12 +29,21 @@ export const LoginPage: React.FC = () => {
     try {
       const response = await authApi.login(username, password);
       
-      // Store the token and user info
-      const user = {
-        id: 0, // We'll need to decode the JWT or fetch user info
+      // Check if this is an admin requiring 2FA
+      if (response.requires_2fa) {
+        setAdminEmail(response.email);
+        setShowVerification(true);
+        setLoading(false);
+        return;
+      }
+      
+      // Normal login - use user info from response
+      const user = response.user || {
+        id: 0,
         username,
-        email: '', // Not provided in login response
+        email: '',
         created_at: new Date().toISOString(),
+        is_admin: false
       };
       
       login(response.access_token, user);
@@ -40,6 +54,84 @@ export const LoginPage: React.FC = () => {
       setLoading(false);
     }
   };
+
+  const handleVerifyAdmin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+
+    try {
+      const response = await authApi.verifyAdminLogin(adminEmail, verificationCode);
+      
+      const user = response.user || {
+        id: 0,
+        username,
+        email: adminEmail,
+        created_at: new Date().toISOString(),
+        is_admin: true
+      };
+      
+      login(response.access_token, user);
+      navigate('/dashboard');
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Verification failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Admin 2FA verification screen
+  if (showVerification) {
+    return (
+      <div className="auth-container">
+        <div className="auth-card">
+          <h1>🃏 Poker Platform</h1>
+          <h2>Admin Verification</h2>
+          <p className="verification-info">
+            A verification code has been sent to your email.
+            Please enter it below to complete login.
+          </p>
+          
+          <form onSubmit={handleVerifyAdmin}>
+            <div className="form-group">
+              <label htmlFor="verificationCode">Verification Code</label>
+              <input
+                id="verificationCode"
+                type="text"
+                value={verificationCode}
+                onChange={(e) => setVerificationCode(e.target.value)}
+                required
+                disabled={loading}
+                placeholder="Enter 6-digit code"
+                maxLength={6}
+                pattern="[0-9]{6}"
+              />
+            </div>
+
+            {error && <div className="error-message">{error}</div>}
+
+            <button type="submit" disabled={loading || verificationCode.length !== 6} className="btn-primary">
+              {loading ? 'Verifying...' : 'Verify & Login'}
+            </button>
+          </form>
+
+          <p className="auth-link">
+            <button 
+              type="button" 
+              className="link-button"
+              onClick={() => {
+                setShowVerification(false);
+                setVerificationCode('');
+                setError('');
+              }}
+            >
+              ← Back to Login
+            </button>
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="auth-container">

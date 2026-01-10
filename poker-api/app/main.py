@@ -1,19 +1,25 @@
 """
 Main FastAPI application with all routes
 """
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from decimal import Decimal
 
 from .config import settings
-from .database import engine, Base, get_db
-from .models import User, League, Community, Wallet, Table, TableStatus, HandHistory, TableSeat, TableQueue
+from .database import get_db, SessionLocal
+from .models import (
+    User, League, Community, Wallet, Table, TableStatus, HandHistory, TableSeat, TableQueue,
+    LeagueAdmin, CommunityAdmin, LeagueMember, LeagueJoinRequest
+)
+from .schema_migrations import ensure_schema
 from .schemas import (
     UserCreate, UserResponse, Token,
+    AdminInviteRequest, AdminUserResponse,
     LeagueCreate, LeagueResponse,
-    CommunityCreate, CommunityResponse,
+    CommunityBase, CommunityCreate, CommunityResponse,
     WalletCreate, WalletResponse,
     TableCreate, TableResponse, TableJoinRequest, SeatPlayerRequest, TableSeatResponse,
     WalletOperation, WalletOperationResponse,
@@ -30,11 +36,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Security scheme for JWT Bearer tokens
-security = HTTPBearer()
-
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# Security scheme for JWT Bearer tokens (optional so query params can be used)
+security = HTTPBearer(auto_error=False)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -51,6 +54,64 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================================
+# Startup Tasks
+# ============================================================================
+
+def _bootstrap_admin_user() -> None:
+    if not (settings.ADMIN_USERNAME and settings.ADMIN_EMAIL and settings.ADMIN_PASSWORD):
+        return
+
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(
+            or_(User.username == settings.ADMIN_USERNAME, User.email == settings.ADMIN_EMAIL)
+        ).first()
+
+        if user:
+            updated = False
+            if not user.is_admin:
+                user.is_admin = True
+                updated = True
+            if not user.is_active:
+                user.is_active = True
+                updated = True
+            if not user.email_verified:
+                user.email_verified = True
+                updated = True
+            if settings.ADMIN_RESET_PASSWORD:
+                user.hashed_password = get_password_hash(settings.ADMIN_PASSWORD)
+                updated = True
+
+            if updated:
+                db.commit()
+                logger.info("Admin user updated: %s", user.username)
+            return
+
+        new_user = User(
+            username=settings.ADMIN_USERNAME,
+            email=settings.ADMIN_EMAIL,
+            hashed_password=get_password_hash(settings.ADMIN_PASSWORD),
+            is_admin=True,
+            is_active=True,
+            email_verified=True,
+        )
+        db.add(new_user)
+        db.commit()
+        logger.info("Admin user created: %s", new_user.username)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to bootstrap admin user")
+    finally:
+        db.close()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    ensure_schema()
+    _bootstrap_admin_user()
 
 
 # ============================================================================
@@ -81,14 +142,27 @@ def health_check():
 # ============================================================================
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    token: str | None = None
 ) -> dict:
     """
     Dependency to get current user from JWT token in Authorization header
-    Raises HTTPException if token is invalid
+    or from a `token` query parameter. Raises HTTPException if token is missing
+    or invalid.
     """
-    token = credentials.credentials
-    payload = decode_token(token)
+    access_token = None
+    if credentials:
+        access_token = credentials.credentials
+    elif token:
+        access_token = token
+
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token required"
+        )
+
+    payload = decode_token(access_token)
     if not payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -97,11 +171,50 @@ def get_current_user(
     return payload
 
 
+def _is_league_admin(db: Session, league_id: int, user_id: int) -> bool:
+    return db.query(LeagueAdmin.id).filter(
+        LeagueAdmin.league_id == league_id,
+        LeagueAdmin.user_id == user_id
+    ).first() is not None
+
+
+def _is_community_admin(db: Session, community_id: int, user_id: int) -> bool:
+    return db.query(CommunityAdmin.id).filter(
+        CommunityAdmin.community_id == community_id,
+        CommunityAdmin.user_id == user_id
+    ).first() is not None
+
+
+def _is_league_member(db: Session, league_id: int, user_id: int) -> bool:
+    owner_match = db.query(League.id).filter(
+        League.id == league_id,
+        League.owner_id == user_id
+    ).first()
+    if owner_match:
+        return True
+
+    if _is_league_admin(db, league_id, user_id):
+        return True
+
+    community_admin_match = db.query(CommunityAdmin.id).join(Community).filter(
+        CommunityAdmin.user_id == user_id,
+        Community.league_id == league_id
+    ).first()
+    if community_admin_match:
+        return True
+
+    member_match = db.query(LeagueMember.id).filter(
+        LeagueMember.league_id == league_id,
+        LeagueMember.user_id == user_id
+    ).first()
+    return member_match is not None
+
+
 # ============================================================================
 # Authentication Endpoints (Public)
 # ============================================================================
 
-@app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     """
     Register a new user account
@@ -109,7 +222,14 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     - **username**: Unique username (3-50 characters)
     - **email**: Unique email address
     - **password**: Password (min 8 characters)
+    
+    In production mode, sends a verification email with 6-digit code.
+    In dev mode, creates the user immediately.
     """
+    from .models import EmailVerification
+    from datetime import datetime, timedelta
+    import random
+    
     # Check if username already exists
     existing_user = db.query(User).filter(User.username == user_data.username).first()
     if existing_user:
@@ -126,22 +246,70 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
             detail="Email already registered"
         )
     
-    # Create new user
     hashed_password = get_password_hash(user_data.password)
+
+    # In dev mode, bootstrap the first admin user if none exist.
+    is_admin = False
+    if not settings.is_production:
+        existing_admin = db.query(User).filter(User.is_admin == True).first()
+        if not existing_admin:
+            is_admin = True
+    
+    # Production mode: require email verification
+    if settings.is_production:
+        # Check if pending verification exists
+        existing_verification = db.query(EmailVerification).filter(
+            EmailVerification.email == user_data.email,
+            EmailVerification.verified == False
+        ).first()
+        
+        if existing_verification:
+            # Update existing verification
+            verification_code = str(random.randint(100000, 999999))
+            existing_verification.username = user_data.username
+            existing_verification.hashed_password = hashed_password
+            existing_verification.verification_code = verification_code
+            existing_verification.expires_at = datetime.now() + timedelta(minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES)
+            db.commit()
+        else:
+            # Create new verification
+            verification_code = str(random.randint(100000, 999999))
+            verification = EmailVerification(
+                email=user_data.email,
+                username=user_data.username,
+                hashed_password=hashed_password,
+                verification_code=verification_code,
+                expires_at=datetime.now() + timedelta(minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES)
+            )
+            db.add(verification)
+            db.commit()
+        
+        # Send verification email
+        _send_verification_email(user_data.email, user_data.username, verification_code)
+        
+        return {
+            "message": "Verification code sent to your email",
+            "requires_verification": True,
+            "email": user_data.email
+        }
+    
+    # Dev mode: create user immediately
     new_user = User(
         username=user_data.username,
         email=user_data.email,
-        hashed_password=hashed_password
+        hashed_password=hashed_password,
+        email_verified=True,  # Auto-verified in dev mode
+        is_admin=is_admin
     )
     
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     
-    return new_user
+    return UserResponse.model_validate(new_user)
 
 
-@app.post("/auth/login", response_model=Token)
+@app.post("/auth/login")
 def login(username: str, password: str, db: Session = Depends(get_db)):
     """
     Login with username and password to get JWT token
@@ -149,8 +317,13 @@ def login(username: str, password: str, db: Session = Depends(get_db)):
     - **username**: Your username
     - **password**: Your password
     
-    Returns JWT access token to use for authenticated requests
+    Returns JWT access token to use for authenticated requests.
+    For admin users in production mode, requires 2FA verification.
     """
+    from .models import EmailVerification
+    from datetime import datetime, timedelta
+    import random
+    
     # Find user
     user = db.query(User).filter(User.username == username).first()
     if not user:
@@ -173,16 +346,147 @@ def login(username: str, password: str, db: Session = Depends(get_db)):
             detail="User account is disabled"
         )
     
+    # Admin users require 2FA in production mode
+    if user.is_admin and settings.is_production:
+        # Generate verification code
+        verification_code = str(random.randint(100000, 999999))
+        
+        # Delete any existing pending verifications for this user
+        db.query(EmailVerification).filter(
+            EmailVerification.email == user.email,
+            EmailVerification.verified == False
+        ).delete()
+        
+        # Create new verification record
+        verification = EmailVerification(
+            email=user.email,
+            username=user.username,
+            hashed_password=user.hashed_password,
+            verification_code=verification_code,
+            expires_at=datetime.now() + timedelta(minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES)
+        )
+        db.add(verification)
+        db.commit()
+        
+        # Send verification email
+        _send_admin_login_email(user.email, user.username, verification_code)
+        
+        return {
+            "requires_2fa": True,
+            "message": "Verification code sent to your email",
+            "email": user.email,
+            "is_admin": True
+        }
+    
+    # Create access token for non-admin or dev mode
+    access_token = create_access_token(
+        data={"user_id": user.id, "username": user.username}
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "is_admin": user.is_admin
+        }
+    }
+
+
+@app.post("/auth/verify-admin-login")
+def verify_admin_login(
+    email: str,
+    verification_code: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Verify admin login with 2FA code.
+    """
+    from .models import EmailVerification
+    from datetime import datetime
+    
+    # Find pending verification
+    verification = db.query(EmailVerification).filter(
+        EmailVerification.email == email,
+        EmailVerification.verification_code == verification_code,
+        EmailVerification.verified == False
+    ).first()
+    
+    if not verification:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification code"
+        )
+    
+    if verification.expires_at < datetime.now(verification.expires_at.tzinfo):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification code has expired. Please login again."
+        )
+    
+    # Find the user
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User not found"
+        )
+    
+    # Mark verification as used
+    verification.verified = True
+    db.commit()
+    
     # Create access token
     access_token = create_access_token(
         data={"user_id": user.id, "username": user.username}
     )
     
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "success": True,
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "is_admin": user.is_admin
+        }
+    }
+
+
+@app.get("/auth/me")
+def get_current_user_info(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get current authenticated user's info.
+    Used to refresh user data after login or when stored data may be stale.
+    """
+    user_id = current_user.get("user_id")
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "is_admin": user.is_admin
+    }
 
 
 # ============================================================================
-# League Endpoints (Public - requires auth)
+# League Endpoints
 # ============================================================================
 
 @app.post("/api/leagues", response_model=LeagueResponse, status_code=status.HTTP_201_CREATED)
@@ -192,7 +496,7 @@ def create_league(
     db: Session = Depends(get_db)
 ):
     """
-    Create a new league (requires authentication)
+    Create a new league
     
     - **name**: League name (3-100 characters)
     - **description**: Optional description
@@ -207,6 +511,8 @@ def create_league(
     )
     
     db.add(new_league)
+    db.flush()
+    db.add(LeagueMember(league_id=new_league.id, user_id=user_id))
     db.commit()
     db.refresh(new_league)
     
@@ -214,10 +520,293 @@ def create_league(
 
 
 @app.get("/api/leagues", response_model=list[LeagueResponse])
-def list_leagues(db: Session = Depends(get_db)):
-    """List all leagues"""
+def list_leagues(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List all leagues with membership status for the current user"""
+    user_id = current_user.get("user_id")
     leagues = db.query(League).all()
-    return leagues
+
+    if not leagues:
+        return []
+
+    league_ids = [league.id for league in leagues]
+    owned_ids = {league.id for league in leagues if league.owner_id == user_id}
+
+    member_ids = {
+        row[0] for row in db.query(LeagueMember.league_id).filter(
+            LeagueMember.user_id == user_id,
+            LeagueMember.league_id.in_(league_ids)
+        ).all()
+    }
+
+    admin_ids = {
+        row[0] for row in db.query(LeagueAdmin.league_id).filter(
+            LeagueAdmin.user_id == user_id,
+            LeagueAdmin.league_id.in_(league_ids)
+        ).all()
+    }
+
+    pending_ids = {
+        row[0] for row in db.query(LeagueJoinRequest.league_id).filter(
+            LeagueJoinRequest.user_id == user_id,
+            LeagueJoinRequest.status == "pending",
+            LeagueJoinRequest.league_id.in_(league_ids)
+        ).all()
+    }
+
+    result = []
+    for league in leagues:
+        is_member = league.id in owned_ids or league.id in member_ids or league.id in admin_ids
+        result.append({
+            "id": league.id,
+            "name": league.name,
+            "description": league.description,
+            "owner_id": league.owner_id,
+            "created_at": league.created_at,
+            "is_member": is_member,
+            "has_pending_request": league.id in pending_ids
+        })
+
+    return result
+
+
+@app.get("/api/leagues/{league_id}/admins")
+def list_league_admins(
+    league_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List league owner and league admins."""
+    user_id = current_user.get("user_id")
+
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    if not _is_league_member(db, league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a league member to view admins"
+        )
+
+    owner = db.query(User).filter(User.id == league.owner_id).first()
+    admins = db.query(User).join(
+        LeagueAdmin, LeagueAdmin.user_id == User.id
+    ).filter(LeagueAdmin.league_id == league_id).all()
+
+    return {
+        "owner": AdminUserResponse.model_validate(owner).model_dump() if owner else None,
+        "admins": [AdminUserResponse.model_validate(admin).model_dump() for admin in admins]
+    }
+
+
+@app.post("/api/leagues/{league_id}/request-join", status_code=status.HTTP_201_CREATED)
+def request_to_join_league(
+    league_id: int,
+    message: str | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Request to join a league. League owners/admins will review the request.
+    """
+    from .models import InboxMessage
+
+    user_id = current_user.get("user_id")
+    username = current_user.get("username")
+
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    if _is_league_member(db, league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Already a member of this league"
+        )
+
+    existing_request = db.query(LeagueJoinRequest).filter(
+        LeagueJoinRequest.user_id == user_id,
+        LeagueJoinRequest.league_id == league_id,
+        LeagueJoinRequest.status == "pending"
+    ).first()
+
+    if existing_request:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You already have a pending request for this league"
+        )
+
+    join_request = LeagueJoinRequest(
+        user_id=user_id,
+        league_id=league_id,
+        message=message[:250] if message else None,
+        status="pending"
+    )
+    db.add(join_request)
+    db.flush()
+
+    admin_user_ids = {league.owner_id}
+    admin_user_ids.update(
+        row[0] for row in db.query(LeagueAdmin.user_id).filter(
+            LeagueAdmin.league_id == league_id
+        ).all()
+    )
+
+    for admin_id in admin_user_ids:
+        inbox_message = InboxMessage(
+            recipient_user_id=admin_id,
+            sender_user_id=user_id,
+            message_type="league_join_request",
+            title=f"League Join Request: {username}",
+            content=(
+                f"{username} has requested to join {league.name}."
+                + (f"\n\nMessage: {message}" if message else "")
+            ),
+            message_metadata={
+                "request_id": join_request.id,
+                "league_id": league.id,
+                "league_name": league.name,
+                "user_id": user_id,
+                "username": username
+            },
+            is_actionable=True
+        )
+        db.add(inbox_message)
+
+    db.commit()
+
+    return {"message": "Join request submitted successfully", "request_id": join_request.id}
+
+
+@app.get("/api/leagues/{league_id}/join-requests")
+def get_league_join_requests(
+    league_id: int,
+    status_filter: str | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get join requests for a league (owner/admin only)
+    """
+    user_id = current_user.get("user_id")
+
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    if not (league.owner_id == user_id or _is_league_admin(db, league_id, user_id)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only league owners or admins can view join requests"
+        )
+
+    query = db.query(LeagueJoinRequest).filter(LeagueJoinRequest.league_id == league_id)
+    if status_filter:
+        query = query.filter(LeagueJoinRequest.status == status_filter)
+
+    requests = query.order_by(LeagueJoinRequest.created_at.desc()).all()
+
+    result = []
+    for req in requests:
+        user = db.query(User).filter(User.id == req.user_id).first()
+        result.append({
+            "id": req.id,
+            "user_id": req.user_id,
+            "username": user.username if user else "Unknown",
+            "league_id": league.id,
+            "league_name": league.name,
+            "message": req.message,
+            "status": req.status,
+            "reviewed_by_user_id": req.reviewed_by_user_id,
+            "reviewed_at": req.reviewed_at.isoformat() if req.reviewed_at else None,
+            "created_at": req.created_at.isoformat()
+        })
+
+    return result
+
+
+@app.post("/api/leagues/{league_id}/admins/invite")
+def invite_league_admin(
+    league_id: int,
+    invite: AdminInviteRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Invite a user to be a league admin (immediately grants role)."""
+    from .models import InboxMessage
+
+    user_id = current_user.get("user_id")
+
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    if not (league.owner_id == user_id or _is_league_admin(db, league_id, user_id)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only league owners or admins can invite league admins"
+        )
+
+    if not invite.username and not invite.email:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Username or email is required"
+        )
+
+    if invite.username and invite.email:
+        invited_user = db.query(User).filter(
+            or_(User.username == invite.username, User.email == invite.email)
+        ).first()
+    elif invite.username:
+        invited_user = db.query(User).filter(User.username == invite.username).first()
+    else:
+        invited_user = db.query(User).filter(User.email == invite.email).first()
+
+    if not invited_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if invited_user.id == league.owner_id:
+        return {"message": "User is already the league owner"}
+
+    existing = db.query(LeagueAdmin).filter(
+        LeagueAdmin.league_id == league_id,
+        LeagueAdmin.user_id == invited_user.id
+    ).first()
+    if existing:
+        return {"message": "User is already a league admin"}
+
+    new_admin = LeagueAdmin(
+        league_id=league_id,
+        user_id=invited_user.id,
+        invited_by_user_id=user_id
+    )
+    db.add(new_admin)
+    existing_member = db.query(LeagueMember).filter(
+        LeagueMember.league_id == league_id,
+        LeagueMember.user_id == invited_user.id
+    ).first()
+    if not existing_member:
+        db.add(LeagueMember(league_id=league_id, user_id=invited_user.id))
+
+    inbox_message = InboxMessage(
+        recipient_user_id=invited_user.id,
+        sender_user_id=user_id,
+        message_type="league_admin_invite",
+        title=f"League Admin Invite: {league.name}",
+        content=f"You have been added as a league admin for {league.name}.",
+        message_metadata={
+            "league_id": league.id,
+            "league_name": league.name
+        },
+        is_actionable=False
+    )
+    db.add(inbox_message)
+    db.commit()
+
+    return {"message": "League admin added successfully"}
 
 
 # ============================================================================
@@ -238,6 +827,8 @@ def create_community(
     - **league_id**: ID of the parent league
     - **starting_balance**: Initial balance for new members (default: 1000.00)
     """
+    user_id = current_user.get("user_id")
+
     # Verify league exists
     league = db.query(League).filter(League.id == community_data.league_id).first()
     if not league:
@@ -245,13 +836,20 @@ def create_community(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="League not found"
         )
-    
+
+    if not _is_league_member(db, league.id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a member of this league to create a community"
+        )
+
     # Create community
     new_community = Community(
         name=community_data.name,
         description=community_data.description,
         league_id=community_data.league_id,
-        starting_balance=community_data.starting_balance
+        starting_balance=community_data.starting_balance,
+        commissioner_id=user_id
     )
     
     db.add(new_community)
@@ -280,6 +878,18 @@ def join_community(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Community not found"
+        )
+
+    if not _is_league_member(db, community.league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a league member to join this community"
+        )
+
+    if not _is_league_member(db, community.league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a league member to request to join this community"
         )
     
     # Check if wallet already exists
@@ -324,25 +934,131 @@ def list_communities(league_id: int | None = None, db: Session = Depends(get_db)
     return communities
 
 
+@app.get("/api/communities/{community_id}/admins")
+def list_community_admins(
+    community_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List community commissioner and community admins."""
+    user_id = current_user.get("user_id")
+
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+
+    if not _is_league_member(db, community.league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a league member to view admins"
+        )
+
+    commissioner = db.query(User).filter(User.id == community.commissioner_id).first()
+    admins = db.query(User).join(
+        CommunityAdmin, CommunityAdmin.user_id == User.id
+    ).filter(CommunityAdmin.community_id == community_id).all()
+
+    return {
+        "commissioner": AdminUserResponse.model_validate(commissioner).model_dump() if commissioner else None,
+        "admins": [AdminUserResponse.model_validate(admin).model_dump() for admin in admins]
+    }
+
+
+@app.post("/api/communities/{community_id}/admins/invite")
+def invite_community_admin(
+    community_id: int,
+    invite: AdminInviteRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Invite a user to be a community admin (immediately grants role)."""
+    from .models import InboxMessage
+
+    user_id = current_user.get("user_id")
+
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+
+    if not (community.commissioner_id == user_id or _is_community_admin(db, community_id, user_id)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only community commissioners or admins can invite community admins"
+        )
+
+    if not invite.username and not invite.email:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Username or email is required"
+        )
+
+    if invite.username and invite.email:
+        invited_user = db.query(User).filter(
+            or_(User.username == invite.username, User.email == invite.email)
+        ).first()
+    elif invite.username:
+        invited_user = db.query(User).filter(User.username == invite.username).first()
+    else:
+        invited_user = db.query(User).filter(User.email == invite.email).first()
+
+    if not invited_user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if invited_user.id == community.commissioner_id:
+        return {"message": "User is already the community commissioner"}
+
+    existing = db.query(CommunityAdmin).filter(
+        CommunityAdmin.community_id == community_id,
+        CommunityAdmin.user_id == invited_user.id
+    ).first()
+    if existing:
+        return {"message": "User is already a community admin"}
+
+    new_admin = CommunityAdmin(
+        community_id=community_id,
+        user_id=invited_user.id,
+        invited_by_user_id=user_id
+    )
+    db.add(new_admin)
+    existing_member = db.query(LeagueMember).filter(
+        LeagueMember.league_id == community.league_id,
+        LeagueMember.user_id == invited_user.id
+    ).first()
+    if not existing_member:
+        db.add(LeagueMember(league_id=community.league_id, user_id=invited_user.id))
+
+    inbox_message = InboxMessage(
+        recipient_user_id=invited_user.id,
+        sender_user_id=user_id,
+        message_type="community_admin_invite",
+        title=f"Community Admin Invite: {community.name}",
+        content=f"You have been added as a community admin for {community.name}.",
+        message_metadata={
+            "community_id": community.id,
+            "community_name": community.name
+        },
+        is_actionable=False
+    )
+    db.add(inbox_message)
+    db.commit()
+
+    return {"message": "Community admin added successfully"}
+
+
 # ============================================================================
 # Wallet Endpoints (Public - requires auth)
 # ============================================================================
 
 @app.get("/api/wallets", response_model=list[WalletResponse])
-def get_my_wallets(token: str, db: Session = Depends(get_db)):
+def get_my_wallets(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Get all wallets for the authenticated user
     """
-    # Verify token
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token"
-        )
-    
-    user_id = payload.get("user_id")
-    
+    user_id = current_user.get("user_id")
+
     # Get all wallets for this user
     wallets = db.query(Wallet).filter(Wallet.user_id == user_id).all()
     return wallets
@@ -353,19 +1069,15 @@ def get_my_wallets(token: str, db: Session = Depends(get_db)):
 # ============================================================================
 
 @app.get("/api/communities/{community_id}/tables", response_model=list[TableResponse])
-def get_community_tables(community_id: int, token: str, db: Session = Depends(get_db)):
+def get_community_tables(
+    community_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Get all tables for a specific community
     Requires authentication
     """
-    # Verify token
-    payload = decode_token(token)
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token"
-        )
-    
     # Check if community exists
     community = db.query(Community).filter(Community.id == community_id).first()
     if not community:
@@ -373,7 +1085,7 @@ def get_community_tables(community_id: int, token: str, db: Session = Depends(ge
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Community not found"
         )
-    
+
     # Get all tables for this community
     tables = db.query(Table).filter(Table.community_id == community_id).all()
     return tables
@@ -1355,6 +2067,980 @@ def get_hand_details(
         played_at=result.played_at,
         hand_data=result.hand_data
     )
+
+
+# ============================================================================
+# Join Request Endpoints
+# ============================================================================
+
+@app.post("/api/communities/{community_id}/request-join", status_code=status.HTTP_201_CREATED)
+def request_to_join_community(
+    community_id: int,
+    message: str | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Request to join a community. The commissioner will review the request.
+    
+    - **community_id**: ID of the community to join
+    - **message**: Optional message to the commissioner (max 250 chars)
+    """
+    from .models import JoinRequest, InboxMessage
+    
+    user_id = current_user.get("user_id")
+    username = current_user.get("username")
+    
+    # Verify community exists
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Community not found"
+        )
+    
+    # Check if already a member
+    existing_wallet = db.query(Wallet).filter(
+        Wallet.user_id == user_id,
+        Wallet.community_id == community_id
+    ).first()
+    
+    if existing_wallet:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Already a member of this community"
+        )
+    
+    # Check if pending request already exists
+    existing_request = db.query(JoinRequest).filter(
+        JoinRequest.user_id == user_id,
+        JoinRequest.community_id == community_id,
+        JoinRequest.status == "pending"
+    ).first()
+    
+    if existing_request:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You already have a pending request for this community"
+        )
+    
+    # Create join request
+    join_request = JoinRequest(
+        user_id=user_id,
+        community_id=community_id,
+        message=message[:250] if message else None,
+        status="pending"
+    )
+    db.add(join_request)
+    db.commit()
+    db.refresh(join_request)
+    
+    # Send message to commissioner's inbox
+    commissioner_id = community.commissioner_id
+    if not commissioner_id:
+        # Fall back to league owner
+        league = db.query(League).filter(League.id == community.league_id).first()
+        commissioner_id = league.owner_id if league else None
+    
+    if commissioner_id:
+        inbox_message = InboxMessage(
+            recipient_user_id=commissioner_id,
+            sender_user_id=user_id,
+            message_type="join_request",
+            title=f"Join Request: {username}",
+            content=f"{username} has requested to join {community.name}." + (f"\n\nMessage: {message}" if message else ""),
+            message_metadata={
+                "request_id": join_request.id,
+                "community_id": community_id,
+                "community_name": community.name,
+                "user_id": user_id,
+                "username": username
+            },
+            is_actionable=True
+        )
+        db.add(inbox_message)
+        db.commit()
+    
+    return {"message": "Join request submitted successfully", "request_id": join_request.id}
+
+
+@app.get("/api/communities/{community_id}/join-requests")
+def get_community_join_requests(
+    community_id: int,
+    status_filter: str | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get join requests for a community (commissioner only)
+    
+    - **status_filter**: Optional filter by status (pending, approved, denied)
+    """
+    from .models import JoinRequest
+    
+    user_id = current_user.get("user_id")
+    
+    # Verify community exists and user is commissioner
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Community not found"
+        )
+    
+    # Check if user is commissioner
+    commissioner_id = community.commissioner_id
+    if not commissioner_id:
+        league = db.query(League).filter(League.id == community.league_id).first()
+        commissioner_id = league.owner_id if league else None
+    
+    if user_id != commissioner_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the commissioner can view join requests"
+        )
+    
+    # Build query
+    query = db.query(JoinRequest).filter(JoinRequest.community_id == community_id)
+    
+    if status_filter:
+        query = query.filter(JoinRequest.status == status_filter)
+    
+    requests = query.order_by(JoinRequest.created_at.desc()).all()
+    
+    # Build response with usernames
+    result = []
+    for req in requests:
+        user = db.query(User).filter(User.id == req.user_id).first()
+        result.append({
+            "id": req.id,
+            "user_id": req.user_id,
+            "username": user.username if user else "Unknown",
+            "community_id": req.community_id,
+            "community_name": community.name,
+            "message": req.message,
+            "status": req.status,
+            "custom_starting_balance": float(req.custom_starting_balance) if req.custom_starting_balance else None,
+            "reviewed_by_user_id": req.reviewed_by_user_id,
+            "reviewed_at": req.reviewed_at.isoformat() if req.reviewed_at else None,
+            "created_at": req.created_at.isoformat()
+        })
+    
+    return result
+
+
+@app.post("/api/join-requests/{request_id}/review")
+def review_join_request(
+    request_id: int,
+    approved: bool,
+    custom_starting_balance: float | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Review a join request (commissioner only)
+    
+    - **approved**: True to approve, False to deny
+    - **custom_starting_balance**: Optional custom starting balance (defaults to community default)
+    """
+    from .models import JoinRequest, InboxMessage
+    from datetime import datetime
+    
+    user_id = current_user.get("user_id")
+    
+    # Get the join request
+    join_request = db.query(JoinRequest).filter(JoinRequest.id == request_id).first()
+    if not join_request:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Join request not found"
+        )
+    
+    if join_request.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This request has already been {join_request.status}"
+        )
+    
+    # Verify user is commissioner
+    community = db.query(Community).filter(Community.id == join_request.community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+    
+    commissioner_id = community.commissioner_id
+    if not commissioner_id:
+        league = db.query(League).filter(League.id == community.league_id).first()
+        commissioner_id = league.owner_id if league else None
+    
+    if user_id != commissioner_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the commissioner can review join requests"
+        )
+    
+    # Update request
+    join_request.status = "approved" if approved else "denied"
+    join_request.reviewed_by_user_id = user_id
+    join_request.reviewed_at = datetime.now()
+    
+    if approved:
+        # Use custom balance or community default
+        starting_balance = Decimal(str(custom_starting_balance)) if custom_starting_balance else community.starting_balance
+        join_request.custom_starting_balance = starting_balance
+
+        existing_member = db.query(LeagueMember).filter(
+            LeagueMember.league_id == community.league_id,
+            LeagueMember.user_id == join_request.user_id
+        ).first()
+        if not existing_member:
+            db.add(LeagueMember(league_id=community.league_id, user_id=join_request.user_id))
+        
+        # Create wallet for user
+        new_wallet = Wallet(
+            user_id=join_request.user_id,
+            community_id=join_request.community_id,
+            balance=starting_balance
+        )
+        db.add(new_wallet)
+    
+    # Get requester info
+    requester = db.query(User).filter(User.id == join_request.user_id).first()
+    
+    # Send notification to requester
+    inbox_message = InboxMessage(
+        recipient_user_id=join_request.user_id,
+        sender_user_id=user_id,
+        message_type="join_approved" if approved else "join_denied",
+        title=f"Join Request {'Approved' if approved else 'Denied'}",
+        content=f"Your request to join {community.name} has been {'approved' if approved else 'denied'}." +
+                (f" You have been given {starting_balance} chips to start!" if approved else ""),
+        message_metadata={
+            "community_id": community.id,
+            "community_name": community.name,
+            "approved": approved
+        },
+        is_actionable=False
+    )
+    db.add(inbox_message)
+    
+    db.commit()
+    
+    return {
+        "message": f"Request {'approved' if approved else 'denied'} successfully",
+        "request_id": request_id,
+        "status": join_request.status
+    }
+
+
+@app.post("/api/league-join-requests/{request_id}/review")
+def review_league_join_request(
+    request_id: int,
+    approved: bool,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Review a league join request (owner/admin only)
+    """
+    from .models import InboxMessage
+    from datetime import datetime
+
+    user_id = current_user.get("user_id")
+
+    join_request = db.query(LeagueJoinRequest).filter(
+        LeagueJoinRequest.id == request_id
+    ).first()
+    if not join_request:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Join request not found")
+
+    if join_request.status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This request has already been {join_request.status}"
+        )
+
+    league = db.query(League).filter(League.id == join_request.league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    if not (league.owner_id == user_id or _is_league_admin(db, league.id, user_id)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only league owners or admins can review join requests"
+        )
+
+    join_request.status = "approved" if approved else "denied"
+    join_request.reviewed_by_user_id = user_id
+    join_request.reviewed_at = datetime.now()
+
+    if approved:
+        existing_member = db.query(LeagueMember).filter(
+            LeagueMember.league_id == league.id,
+            LeagueMember.user_id == join_request.user_id
+        ).first()
+        if not existing_member:
+            db.add(LeagueMember(league_id=league.id, user_id=join_request.user_id))
+
+    inbox_message = InboxMessage(
+        recipient_user_id=join_request.user_id,
+        sender_user_id=user_id,
+        message_type="league_join_approved" if approved else "league_join_denied",
+        title=f"League Join Request {'Approved' if approved else 'Denied'}",
+        content=f"Your request to join {league.name} has been {'approved' if approved else 'denied'}.",
+        message_metadata={
+            "league_id": league.id,
+            "league_name": league.name,
+            "approved": approved
+        },
+        is_actionable=False
+    )
+    db.add(inbox_message)
+
+    db.commit()
+
+    return {
+        "message": f"Request {'approved' if approved else 'denied'} successfully",
+        "request_id": request_id,
+        "status": join_request.status
+    }
+
+
+# ============================================================================
+# Inbox Endpoints
+# ============================================================================
+
+@app.get("/api/inbox")
+def get_inbox(
+    unread_only: bool = False,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get inbox messages for the current user
+    
+    - **unread_only**: If true, only return unread messages
+    """
+    from .models import InboxMessage
+    
+    user_id = current_user.get("user_id")
+    
+    query = db.query(InboxMessage).filter(InboxMessage.recipient_user_id == user_id)
+    
+    if unread_only:
+        query = query.filter(InboxMessage.is_read == False)
+    
+    messages = query.order_by(InboxMessage.created_at.desc()).all()
+    
+    result = []
+    for msg in messages:
+        sender = db.query(User).filter(User.id == msg.sender_user_id).first() if msg.sender_user_id else None
+        result.append({
+            "id": msg.id,
+            "sender_username": sender.username if sender else "System",
+            "message_type": msg.message_type,
+            "title": msg.title,
+            "content": msg.content,
+            "metadata": msg.message_metadata,
+            "is_read": msg.is_read,
+            "is_actionable": msg.is_actionable,
+            "action_taken": msg.action_taken,
+            "created_at": msg.created_at.isoformat(),
+            "read_at": msg.read_at.isoformat() if msg.read_at else None
+        })
+    
+    return result
+
+
+@app.get("/api/inbox/unread-count")
+def get_unread_count(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get count of unread messages"""
+    from .models import InboxMessage
+    
+    user_id = current_user.get("user_id")
+    
+    count = db.query(InboxMessage).filter(
+        InboxMessage.recipient_user_id == user_id,
+        InboxMessage.is_read == False
+    ).count()
+    
+    return {"unread_count": count}
+
+
+@app.post("/api/inbox/{message_id}/read")
+def mark_message_read(
+    message_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Mark a message as read"""
+    from .models import InboxMessage
+    from datetime import datetime
+    
+    user_id = current_user.get("user_id")
+    
+    message = db.query(InboxMessage).filter(
+        InboxMessage.id == message_id,
+        InboxMessage.recipient_user_id == user_id
+    ).first()
+    
+    if not message:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    
+    message.is_read = True
+    message.read_at = datetime.now()
+    db.commit()
+    
+    return {"message": "Message marked as read"}
+
+
+@app.post("/api/inbox/{message_id}/action")
+def take_message_action(
+    message_id: int,
+    action: str,
+    custom_starting_balance: float | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Take action on an actionable message (e.g., approve/deny join request)
+    
+    - **action**: The action to take (approve, deny)
+    - **custom_starting_balance**: Optional custom starting balance for approvals
+    """
+    from .models import InboxMessage
+    
+    user_id = current_user.get("user_id")
+    
+    message = db.query(InboxMessage).filter(
+        InboxMessage.id == message_id,
+        InboxMessage.recipient_user_id == user_id
+    ).first()
+    
+    if not message:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    
+    if not message.is_actionable:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This message has no actions")
+    
+    if message.action_taken:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Action already taken: {message.action_taken}")
+    
+    # Handle join request actions
+    if message.message_type == "join_request":
+        if action not in ["approve", "deny"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid action. Use 'approve' or 'deny'")
+        
+        request_id = message.message_metadata.get("request_id")
+        if not request_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid message metadata")
+        
+        # Call the review endpoint logic
+        result = review_join_request(
+            request_id=request_id,
+            approved=(action == "approve"),
+            custom_starting_balance=custom_starting_balance,
+            current_user=current_user,
+            db=db
+        )
+        
+        # Mark message action as taken
+        message.action_taken = action
+        message.is_read = True
+        db.commit()
+        
+        return result
+
+    if message.message_type == "league_join_request":
+        if action not in ["approve", "deny"]:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid action. Use 'approve' or 'deny'")
+
+        request_id = message.message_metadata.get("request_id")
+        if not request_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid message metadata")
+
+        result = review_league_join_request(
+            request_id=request_id,
+            approved=(action == "approve"),
+            current_user=current_user,
+            db=db
+        )
+
+        message.action_taken = action
+        message.is_read = True
+        db.commit()
+
+        return result
+    
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown message type for action")
+
+
+# ============================================================================
+# Create Community Endpoint (for dashboard)
+# ============================================================================
+
+@app.post("/api/leagues/{league_id}/communities", response_model=CommunityResponse, status_code=status.HTTP_201_CREATED)
+def create_community_in_league(
+    league_id: int,
+    community_data: CommunityBase | None = Body(default=None),
+    name: str | None = None,
+    description: str | None = None,
+    starting_balance: float | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Create a new community within a league.
+    The creator becomes the commissioner.
+    """
+    user_id = current_user.get("user_id")
+    if community_data:
+        name = community_data.name
+        description = community_data.description
+        starting_balance = float(community_data.starting_balance)
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Community name is required"
+        )
+    if starting_balance is None:
+        starting_balance = 1000.0
+    
+    # Verify league exists
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if not _is_league_member(db, league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a member of this league to create a community"
+        )
+    # Create community with user as commissioner
+    new_community = Community(
+        name=name,
+        description=description,
+        league_id=league_id,
+        starting_balance=Decimal(str(starting_balance)),
+        commissioner_id=user_id
+    )
+    
+    db.add(new_community)
+    db.commit()
+    db.refresh(new_community)
+    
+    # Auto-create wallet for the commissioner
+    commissioner_wallet = Wallet(
+        user_id=user_id,
+        community_id=new_community.id,
+        balance=Decimal(str(starting_balance))
+    )
+    db.add(commissioner_wallet)
+    db.commit()
+    
+    return new_community
+
+
+# ============================================================================
+# Email Verification Endpoints (Production Mode)
+# ============================================================================
+
+@app.post("/auth/verify-email")
+def verify_email(
+    email: str,
+    verification_code: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Verify email with the 6-digit code sent to user's email.
+    Only used in production mode.
+    """
+    from .models import EmailVerification
+    from datetime import datetime
+    
+    # Find pending verification
+    verification = db.query(EmailVerification).filter(
+        EmailVerification.email == email,
+        EmailVerification.verification_code == verification_code,
+        EmailVerification.verified == False
+    ).first()
+    
+    if not verification:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification code"
+        )
+    
+    if verification.expires_at < datetime.now(verification.expires_at.tzinfo):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification code has expired. Please register again."
+        )
+    
+    # Check if username/email now taken (race condition)
+    existing_user = db.query(User).filter(
+        (User.username == verification.username) | (User.email == verification.email)
+    ).first()
+    
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username or email already registered"
+        )
+    
+    # Create the user
+    new_user = User(
+        username=verification.username,
+        email=verification.email,
+        hashed_password=verification.hashed_password,
+        email_verified=True
+    )
+    
+    db.add(new_user)
+    verification.verified = True
+    db.commit()
+    db.refresh(new_user)
+    
+    # Create access token
+    access_token = create_access_token(
+        data={"user_id": new_user.id, "username": new_user.username}
+    )
+    
+    return {
+        "success": True,
+        "message": "Email verified successfully",
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": new_user.id,
+            "username": new_user.username,
+            "email": new_user.email,
+            "created_at": new_user.created_at.isoformat() if new_user.created_at else None,
+            "is_admin": new_user.is_admin
+        }
+    }
+
+
+@app.post("/auth/resend-verification")
+def resend_verification(
+    email: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Resend verification code to email.
+    Only used in production mode.
+    """
+    from .models import EmailVerification
+    from datetime import datetime, timedelta
+    import random
+    
+    if not settings.is_production:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email verification is only required in production mode"
+        )
+    
+    # Find pending verification for this email
+    verification = db.query(EmailVerification).filter(
+        EmailVerification.email == email,
+        EmailVerification.verified == False
+    ).order_by(EmailVerification.created_at.desc()).first()
+    
+    if not verification:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No pending verification found for this email"
+        )
+    
+    # Generate new code
+    new_code = str(random.randint(100000, 999999))
+    verification.verification_code = new_code
+    verification.expires_at = datetime.now() + timedelta(minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES)
+    db.commit()
+    
+    # Send email (simplified - in production use proper email service)
+    _send_verification_email(email, verification.username, new_code)
+    
+    return {"message": "Verification code resent to your email"}
+
+
+def _send_verification_email(email: str, username: str, code: str):
+    """Send verification email. In dev mode, just logs the code."""
+    if not settings.is_production:
+        logger.info(f"[DEV MODE] Verification code for {email}: {code}")
+        return
+    
+    # Production email sending
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    
+    if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
+        logger.error("SMTP credentials not configured")
+        return
+    
+    msg = MIMEMultipart()
+    msg['From'] = settings.EMAIL_FROM
+    msg['To'] = email
+    msg['Subject'] = "Poker Platform - Email Verification"
+    
+    body = f"""
+    Hello {username},
+    
+    Your verification code is: {code}
+    
+    This code expires in {settings.EMAIL_VERIFICATION_EXPIRE_MINUTES} minutes.
+    
+    If you didn't request this, please ignore this email.
+    
+    - Poker Platform Team
+    """
+    
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+        server.starttls()
+        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        server.sendmail(settings.EMAIL_FROM, email, msg.as_string())
+        server.quit()
+        logger.info(f"Verification email sent to {email}")
+    except Exception as e:
+        logger.error(f"Failed to send verification email: {e}")
+
+
+def _send_admin_login_email(email: str, username: str, code: str):
+    """Send admin 2FA login verification email."""
+    if not settings.is_production:
+        logger.info(f"[DEV MODE] Admin login code for {email}: {code}")
+        return
+    
+    # Production email sending
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    
+    if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
+        logger.error("SMTP credentials not configured")
+        return
+    
+    msg = MIMEMultipart()
+    msg['From'] = settings.EMAIL_FROM
+    msg['To'] = email
+    msg['Subject'] = "Poker Platform - Admin Login Verification"
+    
+    body = f"""
+    Hello {username},
+    
+    You are logging in as an administrator.
+    
+    Your verification code is: {code}
+    
+    This code expires in {settings.EMAIL_VERIFICATION_EXPIRE_MINUTES} minutes.
+    
+    If you didn't attempt to login, please secure your account immediately.
+    
+    - Poker Platform Team
+    """
+    
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+        server.starttls()
+        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        server.sendmail(settings.EMAIL_FROM, email, msg.as_string())
+        server.quit()
+        logger.info(f"Admin login verification email sent to {email}")
+    except Exception as e:
+        logger.error(f"Failed to send admin login email: {e}")
+
+
+# ============================================================================
+# Profile Update Endpoints
+# ============================================================================
+
+@app.get("/api/profile", response_model=UserResponse)
+def get_profile(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current user's profile"""
+    user = db.query(User).filter(User.id == current_user["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@app.post("/api/profile/request-update")
+def request_profile_update(
+    update_data: "ProfileUpdateRequest",
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Request a profile update. Sends verification code to current email.
+    User must verify before changes are applied.
+    """
+    from .schemas import ProfileUpdateRequest, ProfileUpdateInitResponse
+    from .models import EmailVerification
+    import random
+    import string
+    
+    user = db.query(User).filter(User.id == current_user["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Validate that at least one field is being updated
+    if not update_data.new_username and not update_data.new_email:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one field (username or email) must be provided"
+        )
+    
+    # Check if new username is already taken
+    if update_data.new_username and update_data.new_username != user.username:
+        existing_user = db.query(User).filter(User.username == update_data.new_username).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already taken")
+    
+    # Check if new email is already taken
+    if update_data.new_email and update_data.new_email != user.email:
+        existing_user = db.query(User).filter(User.email == update_data.new_email).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already in use")
+    
+    # Generate verification code
+    verification_code = ''.join(random.choices(string.digits, k=6))
+    
+    # Store pending update in EmailVerification table with metadata
+    # Delete any existing pending profile updates for this user
+    db.query(EmailVerification).filter(
+        EmailVerification.email == user.email,
+        EmailVerification.verified == False
+    ).delete()
+    
+    # Create new verification record
+    verification = EmailVerification(
+        email=user.email,
+        verification_code=verification_code,
+        expires_at=datetime.now() + timedelta(minutes=settings.EMAIL_VERIFICATION_EXPIRE_MINUTES)
+    )
+    db.add(verification)
+    db.commit()
+    
+    # Send verification email (in dev mode, just log it)
+    if settings.is_production:
+        send_profile_update_email(user.email, user.username, verification_code)
+    else:
+        logger.info(f"[DEV MODE] Profile update verification code for {user.email}: {verification_code}")
+    
+    return ProfileUpdateInitResponse(
+        message="Verification code sent to your email",
+        requires_verification=True,
+        verification_sent_to=user.email
+    )
+
+
+@app.post("/api/profile/verify-update")
+def verify_profile_update(
+    verify_data: "ProfileUpdateVerifyRequest",
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Verify profile update with code and apply changes.
+    """
+    from .schemas import ProfileUpdateVerifyRequest, ProfileUpdateResponse
+    from .models import EmailVerification
+    
+    user = db.query(User).filter(User.id == current_user["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Find the verification record
+    verification = db.query(EmailVerification).filter(
+        EmailVerification.email == user.email,
+        EmailVerification.verification_code == verify_data.verification_code,
+        EmailVerification.verified == False
+    ).first()
+    
+    if not verification:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+    
+    if verification.expires_at < datetime.now():
+        raise HTTPException(status_code=400, detail="Verification code has expired")
+    
+    # Apply updates
+    new_token = None
+    if verify_data.new_username and verify_data.new_username != user.username:
+        # Check again that username is available
+        existing = db.query(User).filter(User.username == verify_data.new_username).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already taken")
+        user.username = verify_data.new_username
+    
+    if verify_data.new_email and verify_data.new_email != user.email:
+        # Check again that email is available
+        existing = db.query(User).filter(User.email == verify_data.new_email).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        user.email = verify_data.new_email
+        # Generate new token with updated email
+        new_token = create_access_token(data={"sub": user.email, "user_id": user.id})
+    
+    # Mark verification as used
+    verification.verified = True
+    db.commit()
+    db.refresh(user)
+    
+    return ProfileUpdateResponse(
+        success=True,
+        message="Profile updated successfully",
+        user=UserResponse.model_validate(user),
+        access_token=new_token
+    )
+
+
+def send_profile_update_email(email: str, username: str, code: str):
+    """Send profile update verification email"""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    
+    msg = MIMEMultipart()
+    msg['From'] = settings.EMAIL_FROM
+    msg['To'] = email
+    msg['Subject'] = 'Profile Update Verification - Poker Platform'
+    
+    body = f"""
+    Hello {username},
+    
+    You requested to update your profile. Your verification code is: {code}
+    
+    This code expires in {settings.EMAIL_VERIFICATION_EXPIRE_MINUTES} minutes.
+    
+    If you didn't request this change, please secure your account immediately.
+    
+    - Poker Platform Team
+    """
+    
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+        server.starttls()
+        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        server.sendmail(settings.EMAIL_FROM, email, msg.as_string())
+        server.quit()
+        logger.info(f"Profile update verification email sent to {email}")
+    except Exception as e:
+        logger.error(f"Failed to send profile update verification email: {e}")
 
 
 if __name__ == "__main__":

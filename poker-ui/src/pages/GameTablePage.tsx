@@ -79,7 +79,7 @@ export const GameTablePage: React.FC = () => {
       setGameState(newGameState);
     });
 
-    newSocket.on('player_timeout', ({ playerId, playerName }: { playerId: string; playerName: string }) => {
+    newSocket.on('player_timeout', ({ playerId: _playerId, playerName }: { playerId: string; playerName: string }) => {
       console.log(`Player timed out: ${playerName}`);
       // Show notification (optional)
       setError(`${playerName} timed out - auto-folded/checked`);

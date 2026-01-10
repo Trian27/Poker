@@ -27,6 +27,7 @@ export default function CommunityLobbyPage() {
   const [smallBlind, setSmallBlind] = useState(10);
   const [bigBlind, setBigBlind] = useState(20);
   const [buyIn, setBuyIn] = useState(1000);
+  const [agentsAllowed, setAgentsAllowed] = useState(true);
   
   // Join table state
   const [buyInAmount, setBuyInAmount] = useState(1000);
@@ -80,10 +81,12 @@ export default function CommunityLobbyPage() {
         small_blind: smallBlind,
         big_blind: bigBlind,
         buy_in: buyIn,
+        agents_allowed: agentsAllowed,
       });
       
       // Reset form
       setTableName('');
+      setAgentsAllowed(true);
       setShowCreateModal(false);
       
       // Reload tables
@@ -248,6 +251,12 @@ export default function CommunityLobbyPage() {
                     <strong>0/{table.max_seats}</strong>
                   </div>
                   <div className="info-row">
+                    <span>Agents:</span>
+                    <span className={`agent-badge ${table.agents_allowed !== false ? 'allowed' : 'not-allowed'}`}>
+                      {table.agents_allowed !== false ? '🤖 Allowed' : '🚫 Humans Only'}
+                    </span>
+                  </div>
+                  <div className="info-row">
                     <span>Status:</span>
                     <span className={`status-badge ${table.status}`}>
                       {table.status}
@@ -360,6 +369,22 @@ export default function CommunityLobbyPage() {
                     required
                   />
                 </div>
+              </div>
+              
+              <div className="form-group checkbox-group">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={agentsAllowed}
+                    onChange={(e) => setAgentsAllowed(e.target.checked)}
+                  />
+                  <span className="checkbox-text">
+                    🤖 Allow Autonomous Agents (Bots)
+                  </span>
+                </label>
+                <p className="checkbox-hint">
+                  When enabled, AI poker agents can join this table
+                </p>
               </div>
               
               <div className="modal-actions">

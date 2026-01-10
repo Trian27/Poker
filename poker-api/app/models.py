@@ -1,7 +1,7 @@
 """
 Database models for the Poker Platform
 """
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Numeric, Boolean, Enum
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Numeric, Boolean, Enum, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -21,6 +21,8 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     is_active = Column(Boolean, default=True)
+    email_verified = Column(Boolean, default=False)
+    is_admin = Column(Boolean, default=False)  # Admin can create leagues
     
     # Relationships
     owned_leagues = relationship("League", back_populates="owner")
@@ -42,6 +44,24 @@ class League(Base):
     communities = relationship("Community", back_populates="league", cascade="all, delete-orphan")
 
 
+class LeagueMember(Base):
+    """League membership records."""
+    __tablename__ = "league_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    league_id = Column(Integer, ForeignKey("leagues.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    league = relationship("League")
+    user = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        UniqueConstraint("league_id", "user_id", name="uq_league_member"),
+    )
+
+
 class Community(Base):
     """Sub-groups within leagues with separate currencies"""
     __tablename__ = "communities"
@@ -51,12 +71,54 @@ class Community(Base):
     description = Column(String(500))
     league_id = Column(Integer, ForeignKey("leagues.id"), nullable=False)
     starting_balance = Column(Numeric(precision=15, scale=2), default=1000.00)
+    commissioner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
     league = relationship("League", back_populates="communities")
+    commissioner = relationship("User", foreign_keys=[commissioner_id])
     wallets = relationship("Wallet", back_populates="community", cascade="all, delete-orphan")
     tables = relationship("Table", back_populates="community", cascade="all, delete-orphan")
+
+
+class LeagueAdmin(Base):
+    """League-level admins (separate from global admins)."""
+    __tablename__ = "league_admins"
+
+    id = Column(Integer, primary_key=True, index=True)
+    league_id = Column(Integer, ForeignKey("leagues.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    invited_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    league = relationship("League")
+    user = relationship("User", foreign_keys=[user_id])
+    invited_by = relationship("User", foreign_keys=[invited_by_user_id])
+
+    __table_args__ = (
+        UniqueConstraint("league_id", "user_id", name="uq_league_admin"),
+    )
+
+
+class CommunityAdmin(Base):
+    """Community-level admins (separate from global admins)."""
+    __tablename__ = "community_admins"
+
+    id = Column(Integer, primary_key=True, index=True)
+    community_id = Column(Integer, ForeignKey("communities.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    invited_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    community = relationship("Community")
+    user = relationship("User", foreign_keys=[user_id])
+    invited_by = relationship("User", foreign_keys=[invited_by_user_id])
+
+    __table_args__ = (
+        UniqueConstraint("community_id", "user_id", name="uq_community_admin"),
+    )
 
 
 class TableStatus(str, enum.Enum):
@@ -89,6 +151,7 @@ class Table(Base):
     created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)  # Track who created the table
     max_queue_size = Column(Integer, default=10, nullable=False)  # Maximum players in queue (0 = no queue)
     action_timeout_seconds = Column(Integer, default=30, nullable=False)  # Time limit for player actions in seconds
+    agents_allowed = Column(Boolean, default=True, nullable=False)  # Whether autonomous agents (bots) can join
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
@@ -177,3 +240,85 @@ class TableQueue(Base):
     __table_args__ = (
         {"schema": None},
     )
+
+
+class JoinRequestStatus(str, enum.Enum):
+    """Status of a join request"""
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+
+
+class JoinRequest(Base):
+    """Requests to join a community"""
+    __tablename__ = "join_requests"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    community_id = Column(Integer, ForeignKey("communities.id", ondelete="CASCADE"), nullable=False)
+    message = Column(String(250), nullable=True)  # Optional description from user
+    status = Column(String(20), default="pending", nullable=False)
+    custom_starting_balance = Column(Numeric(precision=15, scale=2), nullable=True)
+    reviewed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id])
+    community = relationship("Community")
+    reviewer = relationship("User", foreign_keys=[reviewed_by_user_id])
+
+
+class LeagueJoinRequest(Base):
+    """Requests to join a league"""
+    __tablename__ = "league_join_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    league_id = Column(Integer, ForeignKey("leagues.id", ondelete="CASCADE"), nullable=False)
+    message = Column(String(250), nullable=True)
+    status = Column(String(20), default="pending", nullable=False)
+    reviewed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    user = relationship("User", foreign_keys=[user_id])
+    league = relationship("League")
+    reviewer = relationship("User", foreign_keys=[reviewed_by_user_id])
+
+
+class InboxMessage(Base):
+    """User inbox messages"""
+    __tablename__ = "inbox_messages"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    recipient_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    sender_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    message_type = Column(String(50), nullable=False)
+    title = Column(String(200), nullable=False)
+    content = Column(String, nullable=False)
+    message_metadata = Column("metadata", JSONB, nullable=True)  # Renamed to avoid conflict with SQLAlchemy
+    is_read = Column(Boolean, default=False)
+    is_actionable = Column(Boolean, default=False)
+    action_taken = Column(String(50), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    recipient = relationship("User", foreign_keys=[recipient_user_id])
+    sender = relationship("User", foreign_keys=[sender_user_id])
+
+
+class EmailVerification(Base):
+    """Pending email verifications for new user registration"""
+    __tablename__ = "email_verifications"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(100), nullable=False)
+    username = Column(String(50), nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    verification_code = Column(String(6), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    verified = Column(Boolean, default=False)

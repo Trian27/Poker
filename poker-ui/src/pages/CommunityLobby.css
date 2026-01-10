@@ -594,3 +594,56 @@
     font-size: 2rem;
   }
 }
+
+/* Agent badge styles */
+.agent-badge {
+  padding: 0.25rem 0.75rem;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.agent-badge.allowed {
+  background: #e8f5e9;
+  color: #2e7d32;
+}
+
+.agent-badge.not-allowed {
+  background: #ffebee;
+  color: #c62828;
+}
+
+/* Checkbox group styles */
+.checkbox-group {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: #f8f9fa;
+  border-radius: 8px;
+  border: 1px solid #e0e0e0;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.checkbox-label input[type="checkbox"] {
+  width: 20px;
+  height: 20px;
+  cursor: pointer;
+  accent-color: #667eea;
+}
+
+.checkbox-text {
+  font-size: 1rem;
+  color: #333;
+}
+
+.checkbox-hint {
+  margin: 0.5rem 0 0 2rem;
+  font-size: 0.85rem;
+  color: #666;
+}
