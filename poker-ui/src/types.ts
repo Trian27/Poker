@@ -8,6 +8,7 @@ export interface User {
   email: string;
   created_at: string;
   is_admin?: boolean;
+  is_banned?: boolean;
 }
 
 export interface AdminUser {
@@ -25,6 +26,7 @@ export interface League {
   id: number;
   name: string;
   description: string;
+  currency?: string;
   owner_id: number;
   created_at: string;
   is_member?: boolean | null;
@@ -36,6 +38,7 @@ export interface Community {
   name: string;
   description: string;
   league_id: number;
+  currency?: string;
   starting_balance: number | string;
   commissioner_id?: number | null;
   created_at: string;
@@ -108,10 +111,39 @@ export interface Player {
   username: string;
   stack: number;
   currentBet: number;
+  seatNumber?: number;
+  timeBankMs?: number;
+  timeBankSeconds?: number;
   hand?: Card[];
   hasFolded: boolean;
   isAllIn: boolean;
   position?: string;
+}
+
+export interface HandResultWinner {
+  playerId: string;
+  userId: number | null;
+  username: string;
+  amount: number;
+  handDescription: string;
+  bestHandCards: Card[];
+  holeCards: Card[];
+}
+
+export interface HandResultPlayerCards {
+  playerId: string;
+  userId: number | null;
+  username: string;
+  folded: boolean;
+  isWinner: boolean;
+  holeCards: Card[];
+}
+
+export interface HandResult {
+  totalPot: number;
+  endedByFold: boolean;
+  winners: HandResultWinner[];
+  players: HandResultPlayerCards[];
 }
 
 export interface GameState {
@@ -123,11 +155,17 @@ export interface GameState {
   currentTurnPlayerId: number | null;
   phase: 'waiting' | 'preflop' | 'flop' | 'turn' | 'river' | 'showdown' | 'finished';
   minBet: number;
+  minRaiseSize?: number;
   dealerPosition: number;
+  dealerPlayerId?: number | null;
   smallBlind: number;
+  smallBlindPlayerId?: number | null;
   bigBlind: number;
+  bigBlindPlayerId?: number | null;
+  lastHandResult?: HandResult | null;
   actionTimeoutSeconds?: number;
   remainingActionTime?: number;
+  remainingReserveTime?: number;
 }
 
 export interface GameAction {

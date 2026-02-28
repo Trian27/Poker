@@ -11,12 +11,16 @@ export interface GameConfig {
   initialStack: number;
   ante?: number; // Optional ante (used in tournaments)
   actionTimeoutSeconds?: number; // Optional action timeout in seconds (default: 30)
+  reserveTimeSeconds?: number; // Per-player total reserve time for this table session
 }
 
 export interface ActionResult {
   valid: boolean;
   error?: string;
   gameState?: GameState;
+  timeBankExhausted?: boolean;
+  exhaustedPlayerId?: string;
+  exhaustedPlayerName?: string;
 }
 
 export interface GameState {
@@ -29,9 +33,40 @@ export interface GameState {
   dealerIndex: number;
   smallBlindIndex: number;
   bigBlindIndex: number;
+  smallBlind: number;
+  bigBlind: number;
+  minRaiseSize: number;
   winners?: { playerId: string; amount: number; hand: string }[];
+  lastHandResult?: HandResult | null;
   actionTimeoutSeconds?: number;
   remainingActionTime?: number;
+  remainingReserveTime?: number;
+}
+
+export interface HandResultWinner {
+  playerId: string;
+  userId: number | null;
+  username: string;
+  amount: number;
+  handDescription: string;
+  bestHandCards: Card[];
+  holeCards: Card[];
+}
+
+export interface HandResultPlayerCards {
+  playerId: string;
+  userId: number | null;
+  username: string;
+  folded: boolean;
+  isWinner: boolean;
+  holeCards: Card[];
+}
+
+export interface HandResult {
+  totalPot: number;
+  endedByFold: boolean;
+  winners: HandResultWinner[];
+  players: HandResultPlayerCards[];
 }
 
 /**
@@ -54,9 +89,17 @@ export class Game {
   private config: GameConfig;
   private actionStartTime: number = 0; // Timestamp when current player's action started
   private currentActionPlayerId: string | null = null; // ID of player currently on the clock
+  private lastHandResult: HandResult | null = null;
+
+  private isActionStage(): boolean {
+    return this.stage === 'preflop' || this.stage === 'flop' || this.stage === 'turn' || this.stage === 'river';
+  }
 
   constructor(config: GameConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      reserveTimeSeconds: config.reserveTimeSeconds ?? 30
+    };
     this.deck = new Deck();
   }
 
@@ -69,7 +112,7 @@ export class Game {
     }
     
     // If game is in progress (not waiting, not complete), check blind position rule
-    if (this.stage !== 'waiting' && this.stage !== 'complete') {
+    if (this.stage !== 'waiting' && this.stage !== 'complete' && this.stage !== 'showdown') {
       const joinCheck = this.canPlayerJoinAtSeat(player.seatNumber ?? 0);
       if (!joinCheck.canJoin) {
         throw new Error(joinCheck.reason);
@@ -87,6 +130,68 @@ export class Game {
       const seatB = b.seatNumber ?? Infinity;
       return seatA - seatB;
     });
+  }
+
+  /**
+   * Removes a player from the game.
+   * Used when a player leaves a table so their seat can be reused.
+   */
+  removePlayer(playerId: string): boolean {
+    const playerIndex = this.players.findIndex((player) => player.id === playerId);
+    if (playerIndex === -1) {
+      return false;
+    }
+
+    this.players.splice(playerIndex, 1);
+    this.playersActedThisRound.delete(playerId);
+    if (this.currentActionPlayerId === playerId) {
+      this.currentActionPlayerId = null;
+      this.actionStartTime = 0;
+    }
+
+    if (this.players.length === 0) {
+      this.resetToWaitingState();
+      return true;
+    }
+
+    if (this.players.length === 1) {
+      if (this.pot > 0) {
+        this.players[0].addChips(this.pot);
+      }
+      this.resetToWaitingState();
+      return true;
+    }
+
+    const remapIndex = (index: number): number => {
+      if (index < 0) return index;
+      if (index > playerIndex) return index - 1;
+      if (index === playerIndex) return Math.min(playerIndex, this.players.length - 1);
+      return index;
+    };
+
+    this.currentPlayerIndex = remapIndex(this.currentPlayerIndex);
+    this.dealerIndex = remapIndex(this.dealerIndex);
+    this.smallBlindIndex = remapIndex(this.smallBlindIndex);
+    this.bigBlindIndex = remapIndex(this.bigBlindIndex);
+    this.lastRaiserIndex = this.lastRaiserIndex === -1 ? -1 : remapIndex(this.lastRaiserIndex);
+
+    // Keep the action moving after a leave.
+    if (this.stage !== 'waiting' && this.stage !== 'complete' && this.stage !== 'showdown') {
+      const activePlayers = this.players.filter((player) => player.getIsActive() && !player.getHasFolded());
+      if (activePlayers.length === 1) {
+        this.handleWinner(activePlayers[0]);
+      } else {
+        const nextActionableIndex = this.players.findIndex(
+          (player) => player.getIsActive() && !player.getHasFolded() && !player.getIsAllIn()
+        );
+        if (nextActionableIndex >= 0) {
+          this.currentPlayerIndex = nextActionableIndex;
+        }
+        this.startActionTimer();
+      }
+    }
+
+    return true;
   }
 
   /**
@@ -163,6 +268,7 @@ export class Game {
     this.lastRaiserIndex = -1;
     this.lastRaiseSize = 0;
     this.playersActedThisRound.clear();
+    this.lastHandResult = null;
 
     // Reset all players
     this.players.forEach(p => p.resetForNewHand());
@@ -223,45 +329,168 @@ export class Game {
    * Starts the action timer for the current player
    */
   private startActionTimer(): void {
+    if (!this.isActionStage() || this.players.length === 0) {
+      this.currentActionPlayerId = null;
+      this.actionStartTime = 0;
+      return;
+    }
     this.actionStartTime = Date.now();
     this.currentActionPlayerId = this.players[this.currentPlayerIndex].id;
+  }
+
+  private clearActionTimerState(): void {
+    this.currentActionPlayerId = null;
+    this.actionStartTime = 0;
+  }
+
+  private getPerTurnActionSeconds(): number {
+    const configured = Number(this.config.actionTimeoutSeconds ?? 30);
+    if (!Number.isFinite(configured) || configured <= 0) {
+      return 30;
+    }
+    return configured;
+  }
+
+  private getPerTurnActionMs(): number {
+    return Math.floor(this.getPerTurnActionSeconds() * 1000);
+  }
+
+  private getCurrentTurnElapsedMs(): number {
+    if (this.actionStartTime <= 0) {
+      return 0;
+    }
+    return Math.max(0, Date.now() - this.actionStartTime);
+  }
+
+  private getCurrentActionPlayer(): Player | null {
+    if (this.players.length === 0) {
+      return null;
+    }
+
+    if (this.currentPlayerIndex < 0 || this.currentPlayerIndex >= this.players.length) {
+      return null;
+    }
+
+    return this.players[this.currentPlayerIndex];
+  }
+
+  private getCurrentPlayerTimeBankRemainingSeconds(): number {
+    const currentPlayer = this.getCurrentActionPlayer();
+    if (!currentPlayer) {
+      return 0;
+    }
+
+    const elapsedMs = this.currentActionPlayerId === currentPlayer.id
+      ? this.getCurrentTurnElapsedMs()
+      : 0;
+    const overtimeMs = Math.max(0, elapsedMs - this.getPerTurnActionMs());
+    const remainingMs = Math.max(0, currentPlayer.getTimeBankMs() - overtimeMs);
+    return remainingMs / 1000;
+  }
+
+  private consumeCurrentPlayerTimeBank(): { player: Player | null; exhausted: boolean } {
+    const currentPlayer = this.getCurrentActionPlayer();
+    if (!currentPlayer) {
+      return { player: null, exhausted: false };
+    }
+
+    if (this.currentActionPlayerId !== currentPlayer.id || this.actionStartTime <= 0) {
+      this.currentActionPlayerId = currentPlayer.id;
+      this.actionStartTime = Date.now();
+      return { player: currentPlayer, exhausted: currentPlayer.getTimeBankMs() <= 0 };
+    }
+
+    const elapsedMs = this.getCurrentTurnElapsedMs();
+    const overtimeMs = Math.max(0, elapsedMs - this.getPerTurnActionMs());
+    const reserveBefore = currentPlayer.getTimeBankMs();
+
+    if (overtimeMs > 0) {
+      currentPlayer.deductTimeBank(Math.min(reserveBefore, overtimeMs));
+    }
+    this.actionStartTime = Date.now();
+
+    return { player: currentPlayer, exhausted: overtimeMs > 0 && overtimeMs >= reserveBefore };
+  }
+
+  private resetToWaitingState(): void {
+    this.stage = 'waiting';
+    this.communityCards = [];
+    this.pot = 0;
+    this.currentBet = 0;
+    this.currentPlayerIndex = 0;
+    this.dealerIndex = 0;
+    this.smallBlindIndex = 0;
+    this.bigBlindIndex = 0;
+    this.lastRaiserIndex = -1;
+    this.lastRaiseSize = 0;
+    this.playersActedThisRound.clear();
+    this.clearActionTimerState();
+    this.lastHandResult = null;
+    this.players.forEach((player) => player.resetForNewHand());
   }
 
   /**
    * Gets the remaining time in seconds for the current player's action
    */
   getRemainingActionTime(): number {
-    if (!this.config.actionTimeoutSeconds) {
-      return Infinity; // No timeout configured
+    if (!this.isActionStage() || !this.getCurrentActionPlayer()) {
+      return 0;
     }
 
-    const elapsed = (Date.now() - this.actionStartTime) / 1000;
-    const remaining = this.config.actionTimeoutSeconds - elapsed;
-    return Math.max(0, remaining);
+    const elapsedSeconds = this.getCurrentTurnElapsedMs() / 1000;
+    return Math.max(0, this.getPerTurnActionSeconds() - elapsedSeconds);
+  }
+
+  getRemainingReserveTime(): number {
+    if (!this.isActionStage()) {
+      return 0;
+    }
+    return Math.max(0, this.getCurrentPlayerTimeBankRemainingSeconds());
+  }
+
+  getRemainingTotalTime(): number {
+    return this.getRemainingActionTime() + this.getRemainingReserveTime();
   }
 
   /**
    * Checks if the current action has timed out
    */
   hasActionTimedOut(): boolean {
-    if (!this.config.actionTimeoutSeconds) {
-      return false; // No timeout configured
+    if (!this.isActionStage() || !this.getCurrentActionPlayer()) {
+      return false;
     }
 
-    return this.getRemainingActionTime() <= 0;
+    return this.getRemainingTotalTime() <= 0;
   }
 
   /**
    * Handles a timeout by automatically folding or checking the current player
    */
   handleTimeout(): ActionResult {
+    if (!this.isActionStage()) {
+      return {
+        valid: false,
+        error: 'No active hand in progress'
+      };
+    }
     const player = this.players[this.currentPlayerIndex];
+
+    const consumed = this.consumeCurrentPlayerTimeBank();
+    if (consumed.exhausted) {
+      return {
+        valid: false,
+        error: 'Time bank exhausted',
+        timeBankExhausted: true,
+        exhaustedPlayerId: player.id,
+        exhaustedPlayerName: player.name
+      };
+    }
     
     // If player can check (no bet to call), check; otherwise fold
     if (player.getCurrentBet() >= this.currentBet) {
-      return this.handleAction(player.id, 'check');
+      return this.executeAction(player.id, 'check', undefined, { skipTimeConsumption: true });
     } else {
-      return this.handleAction(player.id, 'fold');
+      return this.executeAction(player.id, 'fold', undefined, { skipTimeConsumption: true });
     }
   }
 
@@ -269,6 +498,19 @@ export class Game {
    * Handles a player action
    */
   handleAction(playerId: string, action: PlayerAction, amount?: number): ActionResult {
+    return this.executeAction(playerId, action, amount);
+  }
+
+  private executeAction(
+    playerId: string,
+    action: PlayerAction,
+    amount?: number,
+    options: { skipTimeConsumption?: boolean } = {}
+  ): ActionResult {
+    if (!this.isActionStage()) {
+      return { valid: false, error: 'Hand is complete. Wait for next hand.' };
+    }
+
     const player = this.players.find(p => p.id === playerId);
     if (!player) {
       return { valid: false, error: 'Player not found' };
@@ -282,8 +524,22 @@ export class Game {
       return { valid: false, error: 'Player is not active in this hand' };
     }
 
+    const timedOutBeforeAction = this.hasActionTimedOut();
+    if (!options.skipTimeConsumption) {
+      const consumed = this.consumeCurrentPlayerTimeBank();
+      if (consumed.exhausted) {
+        return {
+          valid: false,
+          error: 'Time bank exhausted',
+          timeBankExhausted: true,
+          exhaustedPlayerId: player.id,
+          exhaustedPlayerName: player.name
+        };
+      }
+    }
+
     // Check if action has timed out
-    if (this.hasActionTimedOut()) {
+    if (timedOutBeforeAction && !options.skipTimeConsumption) {
       return { valid: false, error: 'Action timed out' };
     }
 
@@ -526,8 +782,12 @@ export class Game {
         break;
     }
 
-    // Start timer for first player of new betting round
-    this.startActionTimer();
+    // Start timer only while betting is still active.
+    if (this.isActionStage()) {
+      this.startActionTimer();
+    } else {
+      this.clearActionTimerState();
+    }
   }
 
   private dealFlop(): void {
@@ -550,6 +810,7 @@ export class Game {
 
   private showdown(): void {
     this.stage = 'showdown';
+    const totalPot = this.pot;
     const activePlayers = this.players.filter(p => p.getIsActive() && !p.getHasFolded());
     
     // Evaluate all hands
@@ -571,12 +832,57 @@ export class Game {
     const winAmount = Math.floor(this.pot / winners.length);
     winners.forEach(w => w.player.addChips(winAmount));
 
+    this.lastHandResult = {
+      totalPot,
+      endedByFold: false,
+      winners: winners.map(({ player, evaluation }) => ({
+        playerId: player.id,
+        userId: Game.extractUserId(player.id),
+        username: player.name,
+        amount: winAmount,
+        handDescription: HandEvaluator.describeHand(evaluation),
+        bestHandCards: evaluation.cards,
+        holeCards: player.getHoleCards()
+      })),
+      players: this.buildRevealPlayers(new Set(winners.map(({ player }) => player.id)))
+    };
+
     this.stage = 'complete';
+    this.clearActionTimerState();
   }
 
   private handleWinner(winner: Player): void {
+    const totalPot = this.pot;
     winner.addChips(this.pot);
+    this.lastHandResult = {
+      totalPot,
+      endedByFold: true,
+      winners: [{
+        playerId: winner.id,
+        userId: Game.extractUserId(winner.id),
+        username: winner.name,
+        amount: totalPot,
+        handDescription: 'Won by fold',
+        bestHandCards: [],
+        holeCards: []
+      }],
+      players: this.buildRevealPlayers(new Set([winner.id]))
+    };
     this.stage = 'complete';
+    this.clearActionTimerState();
+  }
+
+  private buildRevealPlayers(winnerIds: Set<string>): HandResultPlayerCards[] {
+    return this.players
+      .filter((player) => player.getHoleCards().length > 0)
+      .map((player) => ({
+        playerId: player.id,
+        userId: Game.extractUserId(player.id),
+        username: player.name,
+        folded: player.getHasFolded(),
+        isWinner: winnerIds.has(player.id),
+        holeCards: player.getHoleCards()
+      }));
   }
 
   /**
@@ -615,6 +921,15 @@ export class Game {
    * Gets winner information for hand history
    */
   private getWinnerInfo(): any {
+    if (this.lastHandResult && this.lastHandResult.winners.length > 0) {
+      const winner = this.lastHandResult.winners[0];
+      return {
+        user_id: winner.userId || 0,
+        username: winner.username,
+        winning_hand: winner.handDescription
+      };
+    }
+
     // Find player(s) who won (have chips from pot)
     // This is a simplified version - in a real scenario we'd track this explicitly
     const activePlayers = this.players.filter(p => p.getIsActive() && !p.getHasFolded());
@@ -643,12 +958,29 @@ export class Game {
       communityCards: this.communityCards,
       currentPlayerIndex: this.currentPlayerIndex,
       currentBet: this.currentBet,
-      players: this.players.map(p => p.getPublicState()),
+      players: this.players.map((player) => {
+        const publicState = player.getPublicState();
+        const elapsedMs = this.currentActionPlayerId === player.id && this.actionStartTime > 0
+          ? this.getCurrentTurnElapsedMs()
+          : 0;
+        const overtimeMs = Math.max(0, elapsedMs - this.getPerTurnActionMs());
+        const remainingMs = Math.max(0, player.getTimeBankMs() - overtimeMs);
+        return {
+          ...publicState,
+          timeBankMs: remainingMs,
+          timeBankSeconds: Math.ceil(remainingMs / 1000)
+        };
+      }),
       dealerIndex: this.dealerIndex,
       smallBlindIndex: this.smallBlindIndex,
       bigBlindIndex: this.bigBlindIndex,
-      actionTimeoutSeconds: this.config.actionTimeoutSeconds,
-      remainingActionTime: this.getRemainingActionTime()
+      smallBlind: this.config.smallBlind,
+      bigBlind: this.config.bigBlind,
+      minRaiseSize: this.getMinimumRaise(),
+      lastHandResult: this.lastHandResult,
+      actionTimeoutSeconds: this.getPerTurnActionSeconds(),
+      remainingActionTime: this.getRemainingActionTime(),
+      remainingReserveTime: this.getRemainingReserveTime()
     };
   }
 
@@ -671,6 +1003,10 @@ export class Game {
     return this.stage;
   }
 
+  getLastHandResult(): HandResult | null {
+    return this.lastHandResult;
+  }
+
   /**
    * Serialize game to JSON for Redis storage
    */
@@ -683,6 +1019,7 @@ export class Game {
         stack: p.getStack(),
         bet: p.getCurrentBet(),
         totalBetThisRound: p.getTotalBetThisRound(),
+        timeBankMs: p.getTimeBankMs(),
         holeCards: p.getHoleCards().map(c => ({ rank: c.rank, suit: c.suit })),
         hasFolded: p.getHasFolded(),
         isAllIn: p.getIsAllIn(),
@@ -702,7 +1039,20 @@ export class Game {
       playersActedThisRound: Array.from(this.playersActedThisRound),
       deckCards: (this.deck as any).cards.map((c: Card) => ({ rank: c.rank, suit: c.suit })),
       actionStartTime: this.actionStartTime,
-      currentActionPlayerId: this.currentActionPlayerId
+      currentActionPlayerId: this.currentActionPlayerId,
+      lastHandResult: this.lastHandResult ? {
+        totalPot: this.lastHandResult.totalPot,
+        endedByFold: this.lastHandResult.endedByFold,
+        winners: this.lastHandResult.winners.map((winner) => ({
+          ...winner,
+          bestHandCards: winner.bestHandCards.map((card) => ({ rank: card.rank, suit: card.suit })),
+          holeCards: winner.holeCards.map((card) => ({ rank: card.rank, suit: card.suit }))
+        })),
+        players: this.lastHandResult.players.map((player) => ({
+          ...player,
+          holeCards: player.holeCards.map((card) => ({ rank: card.rank, suit: card.suit }))
+        }))
+      } : null
     };
   }
 
@@ -721,12 +1071,13 @@ export class Game {
       (player as any).hasFolded = pData.hasFolded;
       (player as any).isAllIn = pData.isAllIn;
       (player as any).isActive = pData.isActive;
-      (player as any).holeCards = pData.holeCards.map((c: any) => new Card(c.rank, c.suit));
+      (player as any).holeCards = pData.holeCards.map((c: any) => Game.deserializeCard(c));
+      player.setTimeBankMs(Number(pData.timeBankMs ?? 30000));
       return player;
     });
 
     // Restore community cards
-    game.communityCards = data.communityCards.map((c: any) => new Card(c.rank, c.suit));
+    game.communityCards = data.communityCards.map((c: any) => Game.deserializeCard(c));
 
     // Restore game state
     game.pot = data.pot;
@@ -738,15 +1089,74 @@ export class Game {
     game.bigBlindIndex = data.bigBlindIndex;
     game.lastRaiserIndex = data.lastRaiserIndex;
     game.lastRaiseSize = data.lastRaiseSize;
-    game.playersActedThisRound = new Set(data.playersActedThisRound);
+    game.playersActedThisRound = new Set(data.playersActedThisRound || []);
     game.actionStartTime = data.actionStartTime || 0;
     game.currentActionPlayerId = data.currentActionPlayerId || null;
+    game.lastHandResult = data.lastHandResult ? {
+      totalPot: Number(data.lastHandResult.totalPot || 0),
+      endedByFold: Boolean(data.lastHandResult.endedByFold),
+      winners: Array.isArray(data.lastHandResult.winners)
+        ? data.lastHandResult.winners.map((winner: any) => ({
+            playerId: winner.playerId,
+            userId: winner.userId ?? Game.extractUserId(winner.playerId),
+            username: winner.username,
+            amount: Number(winner.amount || 0),
+            handDescription: winner.handDescription || '',
+            bestHandCards: Array.isArray(winner.bestHandCards)
+              ? winner.bestHandCards.map((card: any) => Game.deserializeCard(card))
+              : [],
+            holeCards: Array.isArray(winner.holeCards)
+              ? winner.holeCards.map((card: any) => Game.deserializeCard(card))
+              : []
+          }))
+        : [],
+      players: Array.isArray(data.lastHandResult.players)
+        ? data.lastHandResult.players.map((player: any) => ({
+            playerId: player.playerId,
+            userId: player.userId ?? Game.extractUserId(player.playerId),
+            username: player.username,
+            folded: Boolean(player.folded),
+            isWinner: Boolean(player.isWinner),
+            holeCards: Array.isArray(player.holeCards)
+              ? player.holeCards.map((card: any) => Game.deserializeCard(card))
+              : []
+          }))
+        : []
+    } : null;
 
     // Restore deck
     const deck = new Deck();
-    (deck as any).cards = data.deckCards.map((c: any) => new Card(c.rank, c.suit));
+    (deck as any).cards = (data.deckCards || []).map((c: any) => Game.deserializeCard(c));
     game.deck = deck;
 
     return game;
+  }
+
+  private static extractUserId(playerId: string): number | null {
+    const match = playerId.match(/^player_(\d+)_/);
+    return match ? Number(match[1]) : null;
+  }
+
+  private static isSuit(value: unknown): value is Card['suit'] {
+    return value === 'hearts' || value === 'diamonds' || value === 'clubs' || value === 'spades';
+  }
+
+  private static isRank(value: unknown): value is Card['rank'] {
+    return value === '2' || value === '3' || value === '4' || value === '5' || value === '6' ||
+      value === '7' || value === '8' || value === '9' || value === '10' ||
+      value === 'J' || value === 'Q' || value === 'K' || value === 'A';
+  }
+
+  private static deserializeCard(data: any): Card {
+    if (Game.isSuit(data?.suit) && Game.isRank(data?.rank)) {
+      return new Card(data.suit, data.rank);
+    }
+
+    if (Game.isSuit(data?.rank) && Game.isRank(data?.suit)) {
+      return new Card(data.rank, data.suit);
+    }
+
+    // Fall back to a valid default card to avoid crashing restoration.
+    return new Card('spades', 'A');
   }
 }

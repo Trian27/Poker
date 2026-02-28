@@ -45,6 +45,7 @@ class UserResponse(UserBase):
     id: int
     created_at: datetime
     is_active: bool
+    is_banned: bool = False
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -74,6 +75,16 @@ class AdminUserResponse(BaseModel):
     email: EmailStr
 
 
+class BanStatusRequest(BaseModel):
+    """Set a user's ban status."""
+    is_banned: bool
+
+
+class CurrencyUpdateRequest(BaseModel):
+    """Update currency code for leagues/communities."""
+    currency: str = Field(..., min_length=1, max_length=10)
+
+
 # ============================================================================
 # League Schemas
 # ============================================================================
@@ -82,6 +93,7 @@ class LeagueBase(BaseModel):
     """Base league schema"""
     name: str = Field(..., min_length=3, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
+    currency: str = Field(default="chips", max_length=10)
 
 
 class LeagueCreate(LeagueBase):
@@ -108,6 +120,7 @@ class CommunityBase(BaseModel):
     """Base community schema"""
     name: str = Field(..., min_length=3, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
+    currency: str = Field(default="chips", max_length=10)
     starting_balance: Decimal = Field(default=Decimal("1000.00"), ge=0)
 
 
@@ -170,7 +183,7 @@ class TableBase(BaseModel):
     """Base table schema"""
     name: str = Field(..., min_length=3, max_length=100)
     game_type: GameType = Field(default=GameType.CASH)
-    max_seats: int = Field(default=9, ge=2, le=10)
+    max_seats: int = Field(default=8, ge=2, le=8)
     small_blind: int = Field(default=10, gt=0)
     big_blind: int = Field(default=20, gt=0)
     buy_in: int = Field(default=1000, gt=0)

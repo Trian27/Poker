@@ -73,6 +73,28 @@
   font-size: 0.9rem;
 }
 
+.rejoin-banner {
+  background: #fff7cc;
+  border: 1px solid #f3d56a;
+  color: #7a5d00;
+  padding: 12px;
+  border-radius: 6px;
+  margin-bottom: 20px;
+  font-size: 0.95rem;
+  text-align: center;
+  font-weight: 600;
+}
+
+.auth-rejoin-banner {
+  animation: pulse-banner 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse-banner {
+  0% { opacity: 1; }
+  50% { opacity: 0.7; }
+  100% { opacity: 1; }
+}
+
 .btn-primary {
   width: 100%;
   padding: 14px;

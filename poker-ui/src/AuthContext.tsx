@@ -4,15 +4,17 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import type { ReactNode } from 'react';
 import type { User } from './types';
-import { authApi } from './api';
+import { authApi, clearApiAuthStorage, setApiAuthToken } from './api';
 
 interface AuthContextType {
   user: User | null;
   token: string | null;
   login: (token: string, user: User) => void;
   logout: () => void;
+  setToken: (token: string | null) => void;
   setUser: (user: User) => void;
   isAuthenticated: boolean;
+  isReady: boolean;
   refreshUser: () => Promise<void>;
 }
 
@@ -30,9 +32,35 @@ interface AuthProviderProps {
   children: ReactNode;
 }
 
+const TOKEN_STORAGE_KEY = 'token';
+const USER_STORAGE_KEY = 'user';
+
+const clearPersistedAuth = () => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  window.localStorage.removeItem(USER_STORAGE_KEY);
+};
+
+const persistAuthForUser = (token: string | null, user: User | null) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  if (!token || !user || user.is_admin) {
+    clearPersistedAuth();
+    return;
+  }
+
+  window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
+};
+
 export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setTokenState] = useState<string | null>(null);
+  const [isReady, setIsReady] = useState(false);
 
   const refreshUser = async () => {
     try {
@@ -43,49 +71,74 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         email: userData.email,
         created_at: userData.created_at,
         is_admin: userData.is_admin,
+        is_banned: userData.is_banned,
       };
-      localStorage.setItem('user', JSON.stringify(newUser));
       setUser(newUser);
+      persistAuthForUser(token, newUser);
     } catch (err) {
       console.error('Failed to refresh user info:', err);
     }
   };
 
   useEffect(() => {
-    // Check for existing token on mount
-    const storedToken = localStorage.getItem('token');
-    const storedUser = localStorage.getItem('user');
-    
-    if (storedToken && storedUser) {
-      setToken(storedToken);
-      const parsedUser = JSON.parse(storedUser);
+    const storedToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    const storedUser = window.localStorage.getItem(USER_STORAGE_KEY);
+
+    if (!storedToken || !storedUser) {
+      setApiAuthToken(null);
+      setIsReady(true);
+      return;
+    }
+
+    try {
+      const parsedUser: User = JSON.parse(storedUser);
+
+      // Global admins should always re-authenticate on refresh.
+      if (parsedUser.is_admin) {
+        clearPersistedAuth();
+        setApiAuthToken(null);
+        setIsReady(true);
+        return;
+      }
+
+      setTokenState(storedToken);
+      setApiAuthToken(storedToken);
       setUser(parsedUser);
-      
+
       // Refresh user info if it seems incomplete (missing username or is_admin)
       if (!parsedUser.username || parsedUser.is_admin === undefined) {
-        // Need to set token first before calling API
         setTimeout(() => refreshUser(), 100);
       }
+    } catch (err) {
+      console.error('Failed to parse stored auth session:', err);
+      clearPersistedAuth();
+      setApiAuthToken(null);
     }
+    setIsReady(true);
   }, []);
 
   const login = (newToken: string, newUser: User) => {
-    localStorage.setItem('token', newToken);
-    localStorage.setItem('user', JSON.stringify(newUser));
-    setToken(newToken);
+    setTokenState(newToken);
+    setApiAuthToken(newToken);
     setUser(newUser);
+    persistAuthForUser(newToken, newUser);
   };
 
   const logout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    setToken(null);
+    clearApiAuthStorage();
+    setTokenState(null);
     setUser(null);
   };
 
   const updateUser = (newUser: User) => {
-    localStorage.setItem('user', JSON.stringify(newUser));
     setUser(newUser);
+    persistAuthForUser(token, newUser);
+  };
+
+  const updateToken = (newToken: string | null) => {
+    setTokenState(newToken);
+    setApiAuthToken(newToken);
+    persistAuthForUser(newToken, user);
   };
 
   const value = {
@@ -93,8 +146,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     token,
     login,
     logout,
+    setToken: updateToken,
     setUser: updateUser,
     isAuthenticated: !!token,
+    isReady,
     refreshUser,
   };
 

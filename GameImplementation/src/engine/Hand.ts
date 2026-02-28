@@ -28,6 +28,22 @@ export interface HandEvaluation {
  * Returns the best possible 5-card hand
  */
 export class HandEvaluator {
+  private static readonly VALUE_LABELS: Record<number, string> = {
+    2: 'Two',
+    3: 'Three',
+    4: 'Four',
+    5: 'Five',
+    6: 'Six',
+    7: 'Seven',
+    8: 'Eight',
+    9: 'Nine',
+    10: 'Ten',
+    11: 'Jack',
+    12: 'Queen',
+    13: 'King',
+    14: 'Ace'
+  };
+
   /**
    * Evaluates the best 5-card hand from the given cards
    */
@@ -59,14 +75,15 @@ export class HandEvaluator {
     // Check for flush
     const isFlush = this.isFlush(sorted);
     const isStraight = this.isStraight(sorted);
+    const straightHighCard = this.getStraightHighCard(sorted);
 
     if (isFlush && isStraight) {
-      const isRoyal = sorted[0].getValue() === 14; // Ace high
+      const isRoyal = straightHighCard === 14; // Ace high
       return {
         rank: isRoyal ? HandRank.ROYAL_FLUSH : HandRank.STRAIGHT_FLUSH,
         rankName: isRoyal ? 'Royal Flush' : 'Straight Flush',
         cards: sorted,
-        tiebreakers: [sorted[0].getValue()]
+        tiebreakers: [straightHighCard]
       };
     }
 
@@ -116,7 +133,7 @@ export class HandEvaluator {
         rank: HandRank.STRAIGHT,
         rankName: 'Straight',
         cards: sorted,
-        tiebreakers: [sorted[0].getValue()]
+        tiebreakers: [straightHighCard]
       };
     }
 
@@ -187,6 +204,36 @@ export class HandEvaluator {
     return 0; // Exact tie
   }
 
+  static describeHand(evaluation: HandEvaluation): string {
+    const [primary, secondary] = evaluation.tiebreakers;
+    const primaryLabel = this.valueToLabel(primary);
+    const secondaryLabel = this.valueToLabel(secondary);
+
+    switch (evaluation.rank) {
+      case HandRank.ROYAL_FLUSH:
+        return 'Royal Flush';
+      case HandRank.STRAIGHT_FLUSH:
+        return `Straight Flush, ${primaryLabel} high`;
+      case HandRank.FOUR_OF_A_KIND:
+        return `Four of a Kind, ${primaryLabel}s`;
+      case HandRank.FULL_HOUSE:
+        return `Full House, ${primaryLabel}s full of ${secondaryLabel}s`;
+      case HandRank.FLUSH:
+        return `Flush, ${primaryLabel} high`;
+      case HandRank.STRAIGHT:
+        return `Straight, ${primaryLabel} high`;
+      case HandRank.THREE_OF_A_KIND:
+        return `Three of a Kind, ${primaryLabel}s`;
+      case HandRank.TWO_PAIR:
+        return `Two Pair, ${primaryLabel}s and ${secondaryLabel}s`;
+      case HandRank.ONE_PAIR:
+        return `Pair of ${primaryLabel}s`;
+      case HandRank.HIGH_CARD:
+      default:
+        return `${primaryLabel} high`;
+    }
+  }
+
   private static isFlush(cards: Card[]): boolean {
     return cards.every(card => card.suit === cards[0].suit);
   }
@@ -207,6 +254,12 @@ export class HandEvaluator {
     const isWheel = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
 
     return isRegularStraight || isWheel;
+  }
+
+  private static getStraightHighCard(cards: Card[]): number {
+    const values = cards.map(c => c.getValue()).sort((a, b) => b - a);
+    const isWheel = values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2;
+    return isWheel ? 5 : values[0];
   }
 
   private static groupByRank(cards: Card[]): Record<number, Card[]> {
@@ -235,5 +288,9 @@ export class HandEvaluator {
       }
     }
     return combinations;
+  }
+
+  private static valueToLabel(value: number): string {
+    return this.VALUE_LABELS[value] || String(value || '');
   }
 }

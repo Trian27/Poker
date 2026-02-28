@@ -9,7 +9,7 @@ import { PokerServer } from '../server';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-in-production';
 const TEST_PORT = 3003; // Different port for testing
-const RECONNECT_TIMEOUT = 60000; // 60 seconds
+const RECONNECT_TIMEOUT = 30000; // 30 seconds
 
 describe('Reconnection Logic', () => {
   let server: PokerServer;
@@ -299,9 +299,9 @@ describe('Reconnection Logic', () => {
 
   describe('Failed Reconnection', () => {
     it('should reject reconnection after timeout window', (done) => {
-      // Note: This test would take 60+ seconds to run properly
+      // Note: This test would take 30+ seconds to run properly
       // For testing purposes, we verify the timeout exists
-      // In real scenario, client disconnected for >60s would be removed from game
+      // In real scenario, client disconnected for >30s would be removed from game
       const testId = `test5_${Date.now()}`;
       const token = jwt.sign(
         { id: 1005, username: `testuser_${testId}`, email: `test_${testId}@example.com` },
@@ -314,8 +314,8 @@ describe('Reconnection Logic', () => {
       });
 
       client.on('connect', () => {
-        // The RECONNECT_TIMEOUT constant exists and is set to 60000ms
-        expect(RECONNECT_TIMEOUT).toBe(60000);
+        // The RECONNECT_TIMEOUT constant exists and is set to 30000ms
+        expect(RECONNECT_TIMEOUT).toBe(30000);
         client.disconnect();
         done();
       });

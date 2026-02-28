@@ -1,5 +1,5 @@
 import { Server, Socket } from 'socket.io';
-import { Game, GameConfig } from './engine/Game';
+import { Game, GameConfig, HandResult } from './engine/Game';
 import { Player } from './engine/Player';
 import axios from 'axios';
 import jwt, { JwtPayload } from 'jsonwebtoken';
@@ -73,7 +73,9 @@ export class PokerServer {
   private tableReadiness: Map<string, TableReadiness> = new Map(); // gameId -> table readiness state
   private recentlyReconnected: Set<string> = new Set(); // playerId -> marker to avoid immediate reconnection loops
   private actionTimers: Map<string, NodeJS.Timeout> = new Map(); // gameId -> timeout handle
-  private readonly RECONNECT_TIMEOUT = 60000; // 60 seconds to reconnect
+  private showdownCardReveals: Map<string, Map<number, boolean>> = new Map(); // gameId -> userId -> shown
+  private readonly RECONNECT_TIMEOUT = 30000; // 30 seconds to reconnect
+  private readonly HAND_RESULT_DELAY = 7000; // 7 seconds to show showdown results
   private server: any; // HTTP server instance
   private app: express.Application; // Express app
 
@@ -264,6 +266,7 @@ export class PokerServer {
       const tableState = this.tableReadiness.get(gameId);
       if (tableState) {
         tableState.seatedPlayers.delete(userId.toString());
+        tableState.playerIds?.delete(userId.toString());
         console.log(`💺 User ${userId} unseated from table ${tableId}`);
       }
     } catch (error: any) {
@@ -301,7 +304,10 @@ export class PokerServer {
           const gameData = await GameStateStorage.loadGameState(gameId);
           if (gameData) {
             const game = Game.fromJSON(gameData);
-            const player = game.getPlayers().find((p: any) => p.name === user.username);
+            const player = game.getPlayers().find((p: any) => {
+              const match = p.id.match(/^player_(\d+)_/);
+              return match ? Number(match[1]) === user.id : p.name === user.username;
+            });
             if (player) {
               playerId = player.id;
               tableState.playerIds.set(userIdStr, player.id);
@@ -321,6 +327,31 @@ export class PokerServer {
             gameId
           };
           this.connectedPlayers.set(socketId, { ...existing, ...playerInfo });
+
+          // Always provide an immediate snapshot so clients don't get stuck waiting
+          // when gameStarted is already true and no broadcast is triggered.
+          const liveGameData = await GameStateStorage.loadGameState(gameId);
+          if (liveGameData) {
+            try {
+              const liveGame = Game.fromJSON(liveGameData);
+              this.io.to(socketId).emit('game_state_update', {
+                gameState: liveGame.getPlayerGameState(playerId)
+              });
+              const revealState = this.showdownCardReveals.get(gameId);
+              if (revealState) {
+                for (const [revealedUserId, show] of revealState.entries()) {
+                  if (show) {
+                    this.io.to(socketId).emit('player_show_hand_update', {
+                      userId: revealedUserId,
+                      show: true
+                    });
+                  }
+                }
+              }
+            } catch (error: any) {
+              console.warn(`⚠️  Failed to emit immediate game state for ${user.username}:`, error.message);
+            }
+          }
         } else {
           console.warn(`⚠️  Could not resolve playerId for user ${user.id} in ${gameId}`);
         }
@@ -348,7 +379,6 @@ export class PokerServer {
 
     if (readyPlayerCount >= 2) {
       console.log(`🚀 Starting game ${gameId} with ${readyPlayerCount} players!`);
-      tableState.gameStarted = true;
 
       // Load game from Redis
       const gameData = await GameStateStorage.loadGameState(gameId);
@@ -358,8 +388,22 @@ export class PokerServer {
       }
 
       const game = Game.fromJSON(gameData);
+      const stage = game.getStage();
+      const hasActiveHand = stage !== 'waiting' && stage !== 'complete';
 
       try {
+        if (hasActiveHand) {
+          tableState.gameStarted = true;
+          if (stage !== 'showdown') {
+            const timeoutSeconds = Math.max(1, Math.ceil(game.getRemainingTotalTime()));
+            this.startActionTimer(gameId, timeoutSeconds);
+          }
+          await this.broadcastGameState(gameId);
+          return;
+        }
+
+        tableState.gameStarted = true;
+
         // Start the hand
         game.startHand();
         console.log(`🎲 Hand started for game ${gameId}`);
@@ -368,11 +412,9 @@ export class PokerServer {
         await GameStateStorage.saveGameState(gameId, game.toJSON());
 
         // Start action timer if configured
-        const timeoutSeconds = game.getGameState().actionTimeoutSeconds;
-        if (timeoutSeconds) {
-          this.startActionTimer(gameId, timeoutSeconds);
-          console.log(`⏰ Action timer started: ${timeoutSeconds} seconds`);
-        }
+        const timeoutSeconds = Math.max(1, Math.ceil(game.getRemainingTotalTime()));
+        this.startActionTimer(gameId, timeoutSeconds);
+        console.log(`⏰ Action timer started: ${timeoutSeconds} seconds`);
 
         // Broadcast game state to all players in the room
         await this.broadcastGameState(gameId);
@@ -555,28 +597,60 @@ export class PokerServer {
         this.handleReconnection(socket, oldSocketId);
       }
 
-      const handleJoin = ({ communityId }: { communityId: number }) => {
+      const handleJoin = async ({ communityId }: { communityId: number }) => {
+        const existingPlayer = this.connectedPlayers.get(socket.id);
+
+        // If this socket is already attached to a table game, ignore lobby join events.
+        // This prevents remapping the player to a temporary lobby ID and breaking actions.
+        if (existingPlayer?.gameId) {
+          const gameData = await GameStateStorage.loadGameState(existingPlayer.gameId);
+          if (gameData) {
+            const game = Game.fromJSON(gameData);
+            this.io.to(socket.id).emit('game_state_update', {
+              gameState: game.getPlayerGameState(existingPlayer.playerId)
+            });
+          }
+          return;
+        }
+
         this.handleJoinLobby(socket, communityId);
       };
 
-      socket.on('join_game', handleJoin);
-      socket.on('join_lobby', handleJoin);
+      socket.on('join_game', (payload: { communityId: number }) => {
+        handleJoin(payload).catch((error) => {
+          console.error('❌ Failed to process join_game:', error);
+          this.io.to(socket.id).emit('error', { message: 'Failed to join game lobby' });
+        });
+      });
+      socket.on('join_lobby', (payload: { communityId: number }) => {
+        handleJoin(payload).catch((error) => {
+          console.error('❌ Failed to process join_lobby:', error);
+          this.io.to(socket.id).emit('error', { message: 'Failed to join game lobby' });
+        });
+      });
 
       socket.on('game_action', ({ action, amount }: { action: string; amount?: number }) => {
         this.handleGameAction(socket.id, action, amount);
+      });
+
+      socket.on('show_hand_choice', ({ show }: { show: boolean }) => {
+        this.handleShowHandChoice(socket.id, show).catch((error) => {
+          console.error('❌ Failed to process show_hand_choice:', error);
+          this.io.to(socket.id).emit('error', { message: 'Failed to update show-hand preference' });
+        });
       });
 
       socket.on('chat_message', ({ message, gameId }: { message: string; gameId?: string }) => {
         this.handleChatMessage(socket, message, gameId);
       });
 
-      socket.on('leave_game', () => {
-        this.handleLeaveGame(socket.id);
+      socket.on('leave_game', (payload?: { tableId?: number }) => {
+        this.handleLeaveGame(socket.id, payload?.tableId, socket.data.user);
       });
 
-      socket.on('disconnect', () => {
-        console.log(`❌ Player disconnected: ${user.username} (${socket.id})`);
-        this.handleDisconnect(socket);
+      socket.on('disconnect', (reason) => {
+        console.log(`❌ Player disconnected: ${user.username} (${socket.id}) reason=${reason}`);
+        this.handleDisconnect(socket, reason);
       });
     });
   }
@@ -687,7 +761,7 @@ export class PokerServer {
       return;
     }
 
-    const gameId = this.playerGameMap.get(playerInfo.playerId);
+    const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
     if (!gameId) {
       this.io.to(socketId).emit('error', { message: 'You are not in a game' });
       return;
@@ -706,6 +780,11 @@ export class PokerServer {
     const result = game.handleAction(playerInfo.playerId, action as any, amount);
 
     if (!result.valid) {
+      if (result.timeBankExhausted && result.exhaustedPlayerId) {
+        console.log(`   🪫 Time bank exhausted: ${result.exhaustedPlayerName || result.exhaustedPlayerId}`);
+        await this.removePlayerForTimeBankExhaustion(gameId, result.exhaustedPlayerId, result.exhaustedPlayerName);
+        return;
+      }
       this.io.to(socketId).emit('action_error', { error: result.error });
       console.log(`   ❌ Invalid: ${result.error}`);
       return;
@@ -715,8 +794,8 @@ export class PokerServer {
     await GameStateStorage.saveGameState(gameId, game.toJSON());
 
     // Clear existing timer and start new one for next player
-    const timeoutSeconds = game.getGameState().actionTimeoutSeconds;
-    if (timeoutSeconds && game.getStage() !== 'complete' && game.getStage() !== 'showdown') {
+    if (game.getStage() !== 'complete' && game.getStage() !== 'showdown') {
+      const timeoutSeconds = Math.max(1, Math.ceil(game.getRemainingTotalTime()));
       this.startActionTimer(gameId, timeoutSeconds);
     }
 
@@ -725,30 +804,56 @@ export class PokerServer {
 
     // Check if game is complete
     if (game.getStage() === 'complete') {
-      console.log(`🏆 Game ${gameId} completed`);
-      
-      // Record hand history (fire and forget)
-      this.recordHandHistory(gameId, game).catch(err => {
-        console.error(`❌ Failed to record hand history for ${gameId}:`, err.message);
-      });
-      
-      // Process payouts
-      await this.processGamePayouts(gameId, game);
-      
-      setTimeout(async () => {
-        // Start new hand
-        game.startHand();
-        await GameStateStorage.saveGameState(gameId, game.toJSON());
-        
-        // Start action timer for new hand
-        const timeoutSeconds = game.getGameState().actionTimeoutSeconds;
-        if (timeoutSeconds) {
-          this.startActionTimer(gameId, timeoutSeconds);
-        }
-        
-        await this.broadcastGameState(gameId);
-      }, 3000);
+      await this.handleCompletedHand(gameId, 'player action');
     }
+  }
+
+  private async handleShowHandChoice(socketId: string, show: boolean): Promise<void> {
+    const playerInfo = this.connectedPlayers.get(socketId);
+    if (!playerInfo) {
+      return;
+    }
+
+    const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
+    if (!gameId) {
+      this.io.to(socketId).emit('error', { message: 'You are not in a game' });
+      return;
+    }
+
+    const gameData = await GameStateStorage.loadGameState(gameId);
+    if (!gameData) {
+      this.io.to(socketId).emit('error', { message: 'Game not found' });
+      return;
+    }
+
+    const game = Game.fromJSON(gameData);
+    const handResult = game.getLastHandResult();
+    if (game.getStage() !== 'complete' || !handResult) {
+      this.io.to(socketId).emit('error', { message: 'You can only show cards after a hand ends' });
+      return;
+    }
+
+    const canShowCards = handResult.players.some((player) => {
+      const resultUserId = player.userId ?? this.extractUserIdFromPlayerId(player.playerId);
+      return resultUserId === playerInfo.userId && player.holeCards.length > 0;
+    });
+
+    if (!canShowCards) {
+      this.io.to(socketId).emit('error', { message: 'No cards available to show' });
+      return;
+    }
+
+    let gameRevealState = this.showdownCardReveals.get(gameId);
+    if (!gameRevealState) {
+      gameRevealState = new Map<number, boolean>();
+      this.showdownCardReveals.set(gameId, gameRevealState);
+    }
+
+    gameRevealState.set(playerInfo.userId, Boolean(show));
+    this.io.to(gameId).emit('player_show_hand_update', {
+      userId: playerInfo.userId,
+      show: Boolean(show),
+    });
   }
 
   /**
@@ -830,6 +935,283 @@ export class PokerServer {
     }
   }
 
+  private extractUserIdFromPlayerId(playerId: string): number | null {
+    const match = playerId.match(/^player_(\d+)_/);
+    return match ? Number(match[1]) : null;
+  }
+
+  private getSocketIdsForUserInGame(userId: number, gameId: string): string[] {
+    const matchingSocketIds = new Set<string>();
+
+    for (const [socketId, info] of this.connectedPlayers.entries()) {
+      if (info.userId !== userId) {
+        continue;
+      }
+
+      const socket = this.io.sockets.sockets.get(socketId);
+      if (!socket) {
+        continue;
+      }
+
+      // Prefer explicit game mapping, but also allow room-based matching for
+      // legacy/lobby player records that may not carry gameId.
+      if (info.gameId === gameId || socket.rooms.has(gameId)) {
+        matchingSocketIds.add(socketId);
+      }
+    }
+
+    const latestSocketId = this.userIdToSocketId.get(userId);
+    if (latestSocketId) {
+      const latestSocket = this.io.sockets.sockets.get(latestSocketId);
+      if (latestSocket && latestSocket.rooms.has(gameId)) {
+        matchingSocketIds.add(latestSocketId);
+      }
+    }
+
+    return Array.from(matchingSocketIds);
+  }
+
+  private async removeBustedPlayers(gameId: string, game: Game): Promise<void> {
+    const bustedPlayers = game.getPlayers().filter((player) => player.getStack() <= 0);
+    if (bustedPlayers.length === 0) {
+      return;
+    }
+
+    const tableState = this.tableReadiness.get(gameId);
+
+    for (const bustedPlayer of bustedPlayers) {
+      if (!game.removePlayer(bustedPlayer.id)) {
+        continue;
+      }
+
+      this.playerGameMap.delete(bustedPlayer.id);
+      this.io.to(gameId).emit('player_eliminated', { playerName: bustedPlayer.name });
+
+      const userId = this.extractUserIdFromPlayerId(bustedPlayer.id);
+      if (userId === null) {
+        continue;
+      }
+
+      const userIdStr = userId.toString();
+      tableState?.seatedPlayers.delete(userIdStr);
+      tableState?.connectedPlayers.delete(userIdStr);
+      tableState?.playerIds?.delete(userIdStr);
+
+      await this.unseatPlayer(gameId, userId);
+
+      const socketIds = this.getSocketIdsForUserInGame(userId, gameId);
+      for (const socketId of socketIds) {
+        this.io.to(socketId).emit('player_busted', {
+          userId,
+          message: 'You have run out of chips and were removed from the table.',
+          gameId
+        });
+
+        const socket = this.io.sockets.sockets.get(socketId);
+        if (socket) {
+          socket.leave(gameId);
+        }
+      }
+
+      for (const [connectedSocketId, playerInfo] of Array.from(this.connectedPlayers.entries())) {
+        if (playerInfo.userId === userId && playerInfo.gameId === gameId) {
+          this.connectedPlayers.set(connectedSocketId, {
+            ...playerInfo,
+            gameId: undefined
+          });
+        }
+      }
+
+      for (const [playerId, mappedGameId] of Array.from(this.playerGameMap.entries())) {
+        const mappedUserId = this.extractUserIdFromPlayerId(playerId);
+        if (mappedGameId === gameId && mappedUserId === userId) {
+          this.playerGameMap.delete(playerId);
+        }
+      }
+    }
+  }
+
+  private async removePlayerForTimeBankExhaustion(gameId: string, exhaustedPlayerId: string, exhaustedPlayerName?: string): Promise<void> {
+    const gameData = await GameStateStorage.loadGameState(gameId);
+    if (!gameData) {
+      return;
+    }
+
+    const game = Game.fromJSON(gameData);
+    const targetPlayer = game.getPlayers().find((player) => player.id === exhaustedPlayerId);
+    if (!targetPlayer) {
+      return;
+    }
+
+    const userId = this.extractUserIdFromPlayerId(targetPlayer.id);
+    const tableState = this.tableReadiness.get(gameId);
+    const playerName = targetPlayer.name || exhaustedPlayerName || 'Player';
+
+    if (userId !== null) {
+      const userInfo = Array.from(this.connectedPlayers.values()).find(
+        (info) => info.userId === userId && info.gameId === gameId
+      );
+
+      if (userInfo?.communityId && targetPlayer.getStack() > 0) {
+        await this.creditWallet(
+          userInfo.userId,
+          userInfo.communityId,
+          targetPlayer.getStack(),
+          `Refund after time-bank removal: ${targetPlayer.getStack()} chips`
+        );
+      }
+    }
+
+    if (!game.removePlayer(targetPlayer.id)) {
+      return;
+    }
+
+    this.playerGameMap.delete(targetPlayer.id);
+    this.io.to(gameId).emit('player_eliminated', {
+      playerName,
+      reason: 'time_bank_exhausted'
+    });
+
+    if (userId !== null) {
+      const userIdStr = userId.toString();
+      tableState?.seatedPlayers.delete(userIdStr);
+      tableState?.connectedPlayers.delete(userIdStr);
+      tableState?.playerIds?.delete(userIdStr);
+
+      await this.unseatPlayer(gameId, userId);
+
+      const socketIds = this.getSocketIdsForUserInGame(userId, gameId);
+      for (const socketId of socketIds) {
+        this.io.to(socketId).emit('player_busted', {
+          userId,
+          message: 'Your 30-second reserve time ran out. You were removed from the table.',
+          gameId
+        });
+
+        const socket = this.io.sockets.sockets.get(socketId);
+        if (socket) {
+          socket.leave(gameId);
+        }
+      }
+
+      for (const [connectedSocketId, playerInfo] of Array.from(this.connectedPlayers.entries())) {
+        if (playerInfo.userId === userId && playerInfo.gameId === gameId) {
+          this.connectedPlayers.set(connectedSocketId, {
+            ...playerInfo,
+            gameId: undefined
+          });
+        }
+      }
+
+      for (const [playerId, mappedGameId] of Array.from(this.playerGameMap.entries())) {
+        const mappedUserId = this.extractUserIdFromPlayerId(playerId);
+        if (mappedGameId === gameId && mappedUserId === userId) {
+          this.playerGameMap.delete(playerId);
+        }
+      }
+    }
+
+    const remainingPlayers = game.getPlayers().length;
+    this.clearActionTimer(gameId);
+
+    if (remainingPlayers === 0) {
+      await GameStateStorage.deleteGameState(gameId);
+      if (tableState) {
+        tableState.gameStarted = false;
+      }
+      await this.checkAndCleanupTable(gameId);
+      return;
+    }
+
+    await GameStateStorage.saveGameState(gameId, game.toJSON());
+
+    if (remainingPlayers < 2) {
+      if (tableState) {
+        tableState.gameStarted = false;
+      }
+      await this.broadcastGameState(gameId);
+      return;
+    }
+
+    if (game.getStage() === 'complete') {
+      await this.handleCompletedHand(gameId, 'time bank exhausted');
+      return;
+    }
+
+    await this.broadcastGameState(gameId);
+
+    const timeoutSeconds = Math.max(1, Math.ceil(game.getRemainingTotalTime()));
+    this.startActionTimer(gameId, timeoutSeconds);
+  }
+
+  private async handleCompletedHand(gameId: string, reason: string): Promise<void> {
+    const gameData = await GameStateStorage.loadGameState(gameId);
+    if (!gameData) {
+      return;
+    }
+
+    const game = Game.fromJSON(gameData);
+    const handResult: HandResult | null = game.getLastHandResult();
+    this.showdownCardReveals.delete(gameId);
+
+    if (handResult) {
+      this.io.to(gameId).emit('hand_complete', handResult);
+    }
+
+    console.log(`🏆 Game ${gameId} completed (${reason})`);
+
+    this.recordHandHistory(gameId, game).catch((err) => {
+      console.error(`❌ Failed to record hand history for ${gameId}:`, err.message);
+    });
+
+    await this.processGamePayouts(gameId, game);
+    this.clearActionTimer(gameId);
+
+    setTimeout(async () => {
+      const latestData = await GameStateStorage.loadGameState(gameId);
+      if (!latestData) {
+        return;
+      }
+
+      const latestGame = Game.fromJSON(latestData);
+      await this.removeBustedPlayers(gameId, latestGame);
+
+      const remainingPlayers = latestGame.getPlayers().length;
+      const tableState = this.tableReadiness.get(gameId);
+
+      if (remainingPlayers === 0) {
+        await GameStateStorage.deleteGameState(gameId);
+        this.clearActionTimer(gameId);
+        this.showdownCardReveals.delete(gameId);
+        if (tableState) {
+          tableState.gameStarted = false;
+        }
+        await this.checkAndCleanupTable(gameId);
+        return;
+      }
+
+      if (remainingPlayers < 2) {
+        if (tableState) {
+          tableState.gameStarted = false;
+        }
+        await GameStateStorage.saveGameState(gameId, latestGame.toJSON());
+        await this.broadcastGameState(gameId);
+        this.clearActionTimer(gameId);
+        this.showdownCardReveals.delete(gameId);
+        return;
+      }
+
+      latestGame.startHand();
+      await GameStateStorage.saveGameState(gameId, latestGame.toJSON());
+      this.showdownCardReveals.delete(gameId);
+
+      const timeoutSeconds = Math.max(1, Math.ceil(latestGame.getRemainingTotalTime()));
+      this.startActionTimer(gameId, timeoutSeconds);
+
+      await this.broadcastGameState(gameId);
+    }, this.HAND_RESULT_DELAY);
+  }
+
   private async broadcastGameState(gameId: string): Promise<void> {
     // Load game from Redis
     const gameData = await GameStateStorage.loadGameState(gameId);
@@ -837,30 +1219,33 @@ export class PokerServer {
 
     const game = Game.fromJSON(gameData);
 
-    // Send personalized state to each player (with their hole cards)
+    // Send personalized state to every in-room socket for each player.
+    // This avoids stale userId->socket mappings delivering private state
+    // to sockets that are not actually attached to this game.
     for (const player of game.getPlayers()) {
-      // Try to find socket by playerId (old lobby system)
-      let socketId = Array.from(this.connectedPlayers.entries())
-        .find(([_, info]) => info.playerId === player.id)?.[0];
-      
-      // If not found, try to find by userId from player name (table system)
-      // Player name format is the username, and we can look up socketId from userIdToSocketId
-      if (!socketId) {
-        // Extract userId from playerId (format: player_<userId>_<timestamp>)
-        const match = player.id.match(/^player_(\d+)_/);
-        if (match) {
-          const userId = parseInt(match[1]);
-          socketId = this.userIdToSocketId.get(userId);
+      const socketIds = new Set<string>();
+
+      for (const [socketId, info] of this.connectedPlayers.entries()) {
+        if (info.playerId !== player.id) {
+          continue;
+        }
+        const socket = this.io.sockets.sockets.get(socketId);
+        if (socket && socket.rooms.has(gameId)) {
+          socketIds.add(socketId);
         }
       }
-      
-      if (socketId) {
-        const socket = this.io.sockets.sockets.get(socketId);
-        if (socket) {
-          this.io.to(socketId).emit('game_state_update', {
-            gameState: game.getPlayerGameState(player.id)
-          });
+
+      const userId = this.extractUserIdFromPlayerId(player.id);
+      if (userId !== null) {
+        for (const socketId of this.getSocketIdsForUserInGame(userId, gameId)) {
+          socketIds.add(socketId);
         }
+      }
+
+      for (const socketId of socketIds) {
+        this.io.to(socketId).emit('game_state_update', {
+          gameState: game.getPlayerGameState(player.id)
+        });
       }
     }
   }
@@ -872,10 +1257,12 @@ export class PokerServer {
     // Clear any existing timer for this game
     this.clearActionTimer(gameId);
 
+    const safeTimeoutMs = Math.max(250, Math.ceil(timeoutSeconds * 1000));
+
     // Set new timer
     const timerId = setTimeout(async () => {
       await this.handleActionTimeout(gameId);
-    }, timeoutSeconds * 1000);
+    }, safeTimeoutMs);
 
     this.actionTimers.set(gameId, timerId);
   }
@@ -926,6 +1313,11 @@ export class PokerServer {
     const result = game.handleTimeout();
 
     if (!result.valid) {
+      if (result.timeBankExhausted && result.exhaustedPlayerId) {
+        console.log(`   🪫 Time bank exhausted: ${result.exhaustedPlayerName || result.exhaustedPlayerId}`);
+        await this.removePlayerForTimeBankExhaustion(gameId, result.exhaustedPlayerId, result.exhaustedPlayerName);
+        return;
+      }
       console.error(`   ❌ Timeout handling failed: ${result.error}`);
       return;
     }
@@ -938,55 +1330,71 @@ export class PokerServer {
 
     // Check if game is complete after timeout
     if (game.getStage() === 'complete') {
-      console.log(`🏆 Game ${gameId} completed after timeout`);
-      
-      // Record hand history
-      this.recordHandHistory(gameId, game).catch(err => {
-        console.error(`❌ Failed to record hand history for ${gameId}:`, err.message);
-      });
-      
-      // Process payouts
-      await this.processGamePayouts(gameId, game);
-      
-      // Clear timer
-      this.clearActionTimer(gameId);
-      
-      setTimeout(async () => {
-        // Start new hand
-        game.startHand();
-        await GameStateStorage.saveGameState(gameId, game.toJSON());
-        await this.broadcastGameState(gameId);
-        
-        // Restart timer for new hand
-        const timeoutSeconds = game.getGameState().actionTimeoutSeconds;
-        if (timeoutSeconds) {
-          this.startActionTimer(gameId, timeoutSeconds);
-        }
-      }, 3000);
+      await this.handleCompletedHand(gameId, 'timeout');
     } else {
       // Game continues - restart timer for next player
-      const timeoutSeconds = game.getGameState().actionTimeoutSeconds;
-      if (timeoutSeconds) {
-        this.startActionTimer(gameId, timeoutSeconds);
-      }
+      const timeoutSeconds = Math.max(1, Math.ceil(game.getRemainingTotalTime()));
+      this.startActionTimer(gameId, timeoutSeconds);
     }
   }
 
-  private async handleLeaveGame(socketId: string): Promise<void> {
+  private async handleLeaveGame(socketId: string, tableIdHint?: number, userHint?: AuthenticatedUser): Promise<void> {
     const playerInfo = this.connectedPlayers.get(socketId);
-    if (!playerInfo) return;
+    if (!playerInfo) {
+      if (!tableIdHint || !userHint) {
+        return;
+      }
 
-    const gameId = this.playerGameMap.get(playerInfo.playerId);
-    if (gameId) {
-      // Load game from Redis
-      const gameData = await GameStateStorage.loadGameState(gameId);
-      
-      // Credit remaining stack back to wallet
-      if (gameData && playerInfo.communityId) {
+      const fallbackGameId = `table_${tableIdHint}`;
+      const fallbackUserId = userHint.id;
+
+      // Best-effort cleanup path when socket-player mapping is missing.
+      const gameData = await GameStateStorage.loadGameState(fallbackGameId);
+      if (gameData) {
         const game = Game.fromJSON(gameData);
-        const player = game.getPlayers().find((p: any) => p.id === playerInfo.playerId);
-        if (player) {
-          const stackAmount = player.getStack();
+        const stalePlayer = game.getPlayers().find((player) => this.extractUserIdFromPlayerId(player.id) === fallbackUserId);
+
+        if (stalePlayer && game.removePlayer(stalePlayer.id)) {
+          this.playerGameMap.delete(stalePlayer.id);
+          const remainingPlayers = game.getPlayers().length;
+
+          if (remainingPlayers > 0) {
+            await GameStateStorage.saveGameState(fallbackGameId, game.toJSON());
+            await this.broadcastGameState(fallbackGameId);
+          } else {
+            await GameStateStorage.deleteGameState(fallbackGameId);
+            this.clearActionTimer(fallbackGameId);
+            this.showdownCardReveals.delete(fallbackGameId);
+          }
+        }
+      }
+
+      await this.unseatPlayer(fallbackGameId, fallbackUserId);
+      await this.checkAndCleanupTable(fallbackGameId);
+
+      return;
+    }
+
+    const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
+    if (gameId) {
+      let remainingPlayers = 0;
+      let gameStateUpdated = false;
+
+      // Load game from Redis and remove leaving player from the live game state.
+      const gameData = await GameStateStorage.loadGameState(gameId);
+      if (gameData) {
+        const game = Game.fromJSON(gameData);
+
+        let leavingPlayer = game.getPlayers().find((p: any) => p.id === playerInfo.playerId);
+        if (!leavingPlayer) {
+          leavingPlayer = game.getPlayers().find((p: any) => {
+            const match = p.id.match(/^player_(\d+)_/);
+            return match ? Number(match[1]) === playerInfo.userId : p.name === playerInfo.playerName;
+          });
+        }
+
+        if (leavingPlayer && playerInfo.communityId) {
+          const stackAmount = leavingPlayer.getStack();
           if (stackAmount > 0) {
             await this.creditWallet(
               playerInfo.userId,
@@ -997,38 +1405,51 @@ export class PokerServer {
             console.log(`💸 ${playerInfo.playerName} refunded ${stackAmount} chips`);
           }
         }
-      }
-      
-      this.io.to(gameId).emit('player_left', { 
-        playerName: playerInfo.playerName 
-      });
-      
-      // Only delete game if all players have left
-      // Check if any other players are still in this game
-      const playersStillInGame = Array.from(this.connectedPlayers.values())
-        .filter(info => info.playerId !== playerInfo.playerId && this.playerGameMap.get(info.playerId) === gameId);
-      
-      const disconnectedPlayersInGame = Array.from(this.disconnectedPlayers.values())
-        .filter(info => info.playerInfo.playerId !== playerInfo.playerId && info.gameId === gameId);
-      
-      if (playersStillInGame.length === 0 && disconnectedPlayersInGame.length === 0) {
-        // No other players in this game, safe to delete
-        await GameStateStorage.deleteGameState(gameId);
-        console.log(`🗑️  Game ${gameId} deleted - no players remaining`);
-        
-        // Unseat player from table in database
-        await this.unseatPlayer(gameId, playerInfo.userId);
-        
-        // Check if table should be cleaned up (non-permanent tables only)
-        await this.checkAndCleanupTable(gameId);
+
+        if (leavingPlayer && game.removePlayer(leavingPlayer.id)) {
+          this.playerGameMap.delete(leavingPlayer.id);
+        }
+
+        remainingPlayers = game.getPlayers().length;
+        if (remainingPlayers > 0) {
+          await GameStateStorage.saveGameState(gameId, game.toJSON());
+          gameStateUpdated = true;
+        } else {
+          await GameStateStorage.deleteGameState(gameId);
+          this.clearActionTimer(gameId);
+          this.showdownCardReveals.delete(gameId);
+          console.log(`🗑️  Game ${gameId} deleted - no players remaining`);
+        }
       } else {
-        console.log(`⏳ Game ${gameId} preserved - ${playersStillInGame.length} connected, ${disconnectedPlayersInGame.length} disconnected`);
-        
-        // Unseat player even if game continues
-        await this.unseatPlayer(gameId, playerInfo.userId);
+        // Missing state should still allow seat cleanup in the auth API.
+        this.clearActionTimer(gameId);
+        this.showdownCardReveals.delete(gameId);
       }
-      
+
+      this.io.to(gameId).emit('player_left', {
+        playerName: playerInfo.playerName
+      });
+
+      const tableState = this.tableReadiness.get(gameId);
+      if (tableState) {
+        tableState.connectedPlayers.delete(playerInfo.userId.toString());
+      }
+
+      // Unseat player from table in database for both leave and timeout cleanup.
+      await this.unseatPlayer(gameId, playerInfo.userId);
+      if (remainingPlayers === 0) {
+        await this.checkAndCleanupTable(gameId);
+      } else if (gameStateUpdated) {
+        await this.broadcastGameState(gameId);
+      }
+
       this.playerGameMap.delete(playerInfo.playerId);
+      for (const [playerId, mappedGameId] of Array.from(this.playerGameMap.entries())) {
+        const match = playerId.match(/^player_(\d+)_/);
+        if (mappedGameId === gameId && match && Number(match[1]) === playerInfo.userId) {
+          this.playerGameMap.delete(playerId);
+        }
+      }
     }
 
     // Remove from lobby if waiting
@@ -1047,9 +1468,17 @@ export class PokerServer {
         console.log(`💸 ${playerInfo.playerName} refunded buy-in (left lobby)`);
       }
     }
+
+    // Clean up socket mappings for this session.
+    // Keep newer sockets for the same user intact (reconnection uses a different socketId).
+    this.connectedPlayers.delete(socketId);
+    this.disconnectedPlayers.delete(socketId);
+    if (this.userIdToSocketId.get(playerInfo.userId) === socketId) {
+      this.userIdToSocketId.delete(playerInfo.userId);
+    }
   }
 
-  private async handleDisconnect(socket: AuthenticatedSocket): Promise<void> {
+  private async handleDisconnect(socket: AuthenticatedSocket, reason?: string): Promise<void> {
     const socketId = socket.id;
     const user = socket.data.user;
     const playerInfo = this.connectedPlayers.get(socketId);
@@ -1062,6 +1491,12 @@ export class PokerServer {
       }
     }
 
+    // User intentionally left this socket/session. Skip reconnection grace and unseat immediately.
+    if (reason === 'client namespace disconnect') {
+      await this.handleLeaveGame(socketId);
+      return;
+    }
+
     if (playerInfo && this.recentlyReconnected.has(playerInfo.playerId)) {
       // Player just reconnected and disconnected quickly - might be a flaky connection
       // Give them normal reconnection grace instead of immediate cleanup
@@ -1071,11 +1506,13 @@ export class PokerServer {
     }
 
     if (!playerInfo) {
-      this.userIdToSocketId.delete(user.id);
+      if (this.userIdToSocketId.get(user.id) === socketId) {
+        this.userIdToSocketId.delete(user.id);
+      }
       return;
     }
 
-    const gameId = this.playerGameMap.get(playerInfo.playerId);
+    const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
 
     // If player is in an active game, give them time to reconnect
     if (gameId && await GameStateStorage.gameExists(gameId)) {
@@ -1201,6 +1638,13 @@ export class PokerServer {
         const result = game.handleAction(playerId, action as any, amount);
 
         if (!result.valid) {
+          if (result.timeBankExhausted && result.exhaustedPlayerId) {
+            await this.removePlayerForTimeBankExhaustion(gameId, result.exhaustedPlayerId, result.exhaustedPlayerName);
+            return res.status(400).json({
+              error: result.error,
+              valid: false
+            });
+          }
           return res.status(400).json({ 
             error: result.error,
             valid: false 
@@ -1215,27 +1659,10 @@ export class PokerServer {
 
         // Check if game is complete
         if (game.getStage() === 'complete') {
-          console.log(`🏆 Game ${gameId} completed (agent action)`);
-          
-          // Record hand history (fire and forget)
-          this.recordHandHistory(gameId, game).catch(err => {
-            console.error(`❌ Failed to record hand history for ${gameId}:`, err.message);
-          });
-          
-          await this.processGamePayouts(gameId, game);
-          
-          setTimeout(async () => {
-            game.startHand();
-            await GameStateStorage.saveGameState(gameId, game.toJSON());
-            
-            // Start action timer for new hand
-            const timeoutSeconds = game.getGameState().actionTimeoutSeconds;
-            if (timeoutSeconds) {
-              this.startActionTimer(gameId, timeoutSeconds);
-            }
-            
-            await this.broadcastGameState(gameId);
-          }, 3000);
+          await this.handleCompletedHand(gameId, 'agent action');
+        } else if (game.getStage() !== 'showdown') {
+          const timeoutSeconds = Math.max(1, Math.ceil(game.getRemainingTotalTime()));
+          this.startActionTimer(gameId, timeoutSeconds);
         }
 
         // Return the updated game state
@@ -1326,11 +1753,13 @@ export class PokerServer {
         const gameId = `table_${table_id}`;
         const playerId = `player_${user_id}_${Date.now()}`;
 
-        // Fetch table configuration including action_timeout_seconds
+        // Fetch table configuration including action_timeout_seconds and max_seats
         let actionTimeoutSeconds: number | undefined;
+        let maxSeats = 8;
         try {
           const tableResponse = await axios.get(`${FASTAPI_URL}/api/internal/tables/${table_id}`);
           actionTimeoutSeconds = tableResponse.data.action_timeout_seconds;
+          maxSeats = Number(tableResponse.data.max_seats) || 8;
           console.log(`⏱️  Table ${table_id} action timeout: ${actionTimeoutSeconds} seconds`);
         } catch (error: any) {
           console.warn(`⚠️  Failed to fetch table config for ${table_id}:`, error.response?.data || error.message);
@@ -1357,40 +1786,7 @@ export class PokerServer {
         // Create player object with seat number
         const player = new Player(playerId, username, stack, seat_number);
 
-        // Check if player already seated
-        const existingPlayer = game.getPlayers().find(p => p.name === username);
-        if (existingPlayer) {
-          return res.status(400).json({ 
-            error: 'Player already seated at this table' 
-          });
-        }
-
-        // Check if seat is already taken
-        const seatTaken = game.getPlayers().find(p => p.seatNumber === seat_number);
-        if (seatTaken) {
-          return res.status(400).json({ 
-            error: `Seat ${seat_number} is already occupied` 
-          });
-        }
-
-        // Check if table is full
-        // TODO: Get max_seats from table config, for now use 9
-        const maxSeats = 9;
-        if (game.getPlayers().length >= maxSeats) {
-          return res.status(400).json({ 
-            error: 'Table is full' 
-          });
-        }
-
-        // Add player to game
-        game.addPlayer(player);
-        console.log(`✅ Player ${username} added to game at seat ${seat_number}. Total players: ${game.getPlayers().length}`);        // Save game state to Redis
-        await GameStateStorage.saveGameState(gameId, game.toJSON());
-
-        // Map player to game for future lookups
-        this.playerGameMap.set(playerId, gameId);
-
-        // Track seated player for readiness check
+        // Ensure table readiness exists for both fresh seats and idempotent re-seats.
         if (!this.tableReadiness.has(gameId)) {
           this.tableReadiness.set(gameId, {
             gameId,
@@ -1412,7 +1808,100 @@ export class PokerServer {
         if (table_name && tableState.tableName !== table_name) {
           tableState.tableName = table_name;
         }
+
+        // Check if player already seated
+        const existingPlayer = game.getPlayers().find((p) => {
+          const match = p.id.match(/^player_(\d+)_/);
+          return match ? Number(match[1]) === Number(user_id) : p.name === username;
+        });
+        if (existingPlayer) {
+          // Rebuild ephemeral mappings after server restarts so seated users can reconnect.
+          tableState.seatedPlayers.add(user_id.toString());
+          tableState.playerIds.set(user_id.toString(), existingPlayer.id);
+          this.playerGameMap.set(existingPlayer.id, gameId);
+
+          const currentSocketId = this.userIdToSocketId.get(Number(user_id));
+          if (currentSocketId) {
+            const existing = this.connectedPlayers.get(currentSocketId);
+            if (existing) {
+              this.connectedPlayers.set(currentSocketId, {
+                ...existing,
+                playerId: existingPlayer.id,
+                playerName: username,
+                userId: Number(user_id),
+                communityId: tableState.communityId,
+                gameId
+              });
+            }
+            const currentSocket = this.io.sockets.sockets.get(currentSocketId);
+            if (currentSocket) {
+              currentSocket.join(gameId);
+              const playerState = game.getPlayerGameState(existingPlayer.id);
+              currentSocket.emit('game_state_update', { gameState: playerState });
+            }
+          }
+
+          console.log(`♻️  Re-seated existing player ${username} at table ${table_id}.`);
+          console.log(`📋 Table ${table_id}: ${tableState.seatedPlayers.size} seated, ${tableState.connectedPlayers.size} connected`);
+
+          await this.checkAndStartGame(gameId);
+
+          return res.json({
+            success: true,
+            message: `Player ${username} already seated at this table`,
+            game_id: gameId,
+            player_id: existingPlayer.id,
+            players_count: game.getPlayers().length,
+            max_seats: maxSeats
+          });
+        }
+
+        // Check if seat is already taken
+        const seatTaken = game.getPlayers().find(p => p.seatNumber === seat_number);
+        if (seatTaken) {
+          return res.status(400).json({ 
+            error: `Seat ${seat_number} is already occupied` 
+          });
+        }
+
+        // Check if table is full
+        if (game.getPlayers().length >= maxSeats) {
+          return res.status(400).json({ 
+            error: 'Table is full' 
+          });
+        }
+
+        // Add player to game
+        game.addPlayer(player);
+        console.log(`✅ Player ${username} added to game at seat ${seat_number}. Total players: ${game.getPlayers().length}`);        // Save game state to Redis
+        await GameStateStorage.saveGameState(gameId, game.toJSON());
+
+        // Map player to game for future lookups
+        this.playerGameMap.set(playerId, gameId);
+
+        // Track seated player for readiness check
         tableState.seatedPlayers.add(user_id.toString());
+        tableState.playerIds.set(user_id.toString(), playerId);
+
+        const currentSocketId = this.userIdToSocketId.get(Number(user_id));
+        if (currentSocketId) {
+          const existing = this.connectedPlayers.get(currentSocketId);
+          if (existing) {
+            this.connectedPlayers.set(currentSocketId, {
+              ...existing,
+              playerId,
+              playerName: username,
+              userId: Number(user_id),
+              communityId: tableState.communityId,
+              gameId
+            });
+          }
+          const currentSocket = this.io.sockets.sockets.get(currentSocketId);
+          if (currentSocket) {
+            currentSocket.join(gameId);
+          }
+        }
+
         console.log(`📋 Table ${table_id}: ${tableState.seatedPlayers.size} seated, ${tableState.connectedPlayers.size} connected`);
 
         // Broadcast game state update to all connected players at this table
@@ -1421,7 +1910,7 @@ export class PokerServer {
             const socket = this.io.sockets.sockets.get(socketId);
             if (socket) {
               const playerState = game.getPlayerGameState(playerInfo.playerId);
-              socket.emit('game_state_update', playerState);
+              socket.emit('game_state_update', { gameState: playerState });
             }
           }
         }

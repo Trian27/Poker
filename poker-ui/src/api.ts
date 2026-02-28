@@ -4,6 +4,33 @@
 import axios from 'axios';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const TOKEN_STORAGE_KEY = 'token';
+const USER_STORAGE_KEY = 'user';
+let inMemoryToken: string | null = null;
+
+const readPersistentToken = (): string | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+};
+
+export const setApiAuthToken = (token: string | null) => {
+  inMemoryToken = token;
+};
+
+export const getApiAuthToken = (): string | null => {
+  return inMemoryToken ?? readPersistentToken();
+};
+
+export const clearApiAuthStorage = () => {
+  inMemoryToken = null;
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  window.localStorage.removeItem(USER_STORAGE_KEY);
+};
 
 // Create axios instance with default config
 export const api = axios.create({
@@ -16,7 +43,7 @@ export const api = axios.create({
 // Add request interceptor to attach JWT token
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('token');
+    const token = getApiAuthToken();
     if (token) {
       config.params = {
         ...config.params,
@@ -36,8 +63,7 @@ api.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       // Unauthorized - clear token and redirect to login
-      localStorage.removeItem('token');
-      localStorage.removeItem('user');
+      clearApiAuthStorage();
       window.location.href = '/login';
     }
     return Promise.reject(error);
@@ -212,6 +238,11 @@ export const leaguesApi = {
 export const tablesApi = {
   getByCommunity: async (communityId: number) => {
     const response = await api.get(`/api/communities/${communityId}/tables`);
+    return response.data;
+  },
+
+  getMyActiveSeat: async () => {
+    const response = await api.get('/api/tables/me/active-seat');
     return response.data;
   },
 

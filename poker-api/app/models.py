@@ -23,6 +23,7 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     email_verified = Column(Boolean, default=False)
     is_admin = Column(Boolean, default=False)  # Admin can create leagues
+    is_banned = Column(Boolean, default=False)
     
     # Relationships
     owned_leagues = relationship("League", back_populates="owner")
@@ -36,6 +37,7 @@ class League(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     description = Column(String(500))
+    currency = Column(String(10), nullable=False, default="chips")
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
@@ -70,6 +72,7 @@ class Community(Base):
     name = Column(String(100), nullable=False)
     description = Column(String(500))
     league_id = Column(Integer, ForeignKey("leagues.id"), nullable=False)
+    currency = Column(String(10), nullable=False, default="chips")
     starting_balance = Column(Numeric(precision=15, scale=2), default=1000.00)
     commissioner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -143,7 +146,7 @@ class Table(Base):
     name = Column(String(100), nullable=False)
     status = Column(Enum(TableStatus), default=TableStatus.WAITING, nullable=False)
     game_type = Column(Enum(GameType), default=GameType.CASH, nullable=False)
-    max_seats = Column(Integer, default=9, nullable=False)
+    max_seats = Column(Integer, default=8, nullable=False)
     small_blind = Column(Integer, default=10, nullable=False)
     big_blind = Column(Integer, default=20, nullable=False)
     buy_in = Column(Integer, default=1000, nullable=False)  # For tournaments, this is entry fee; for cash, minimum buy-in

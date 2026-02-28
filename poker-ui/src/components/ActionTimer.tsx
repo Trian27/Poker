@@ -5,50 +5,60 @@ import React, { useState, useEffect } from 'react';
 import './ActionTimer.css';
 
 interface ActionTimerProps {
-  totalSeconds?: number;
-  remainingSeconds?: number;
+  turnSeconds?: number;
+  remainingTurnSeconds?: number;
+  reserveSeconds?: number;
   isMyTurn: boolean;
 }
 
 export const ActionTimer: React.FC<ActionTimerProps> = ({ 
-  totalSeconds, 
-  remainingSeconds: initialRemaining, 
+  turnSeconds,
+  remainingTurnSeconds: initialTurnRemaining,
+  reserveSeconds: initialReserveSeconds,
   isMyTurn 
 }) => {
-  const [remainingSeconds, setRemainingSeconds] = useState(initialRemaining || 0);
+  const [remainingTurnSeconds, setRemainingTurnSeconds] = useState(initialTurnRemaining || 0);
+  const [remainingReserveSeconds, setRemainingReserveSeconds] = useState(initialReserveSeconds || 0);
 
   useEffect(() => {
-    // Update remaining time when prop changes
-    setRemainingSeconds(initialRemaining || 0);
-  }, [initialRemaining]);
+    setRemainingTurnSeconds(initialTurnRemaining || 0);
+  }, [initialTurnRemaining]);
 
   useEffect(() => {
-    // Only count down if it's the player's turn and there's time remaining
-    if (!isMyTurn || !totalSeconds || remainingSeconds <= 0) {
+    setRemainingReserveSeconds(initialReserveSeconds || 0);
+  }, [initialReserveSeconds]);
+
+  useEffect(() => {
+    if (!isMyTurn || (remainingTurnSeconds <= 0 && remainingReserveSeconds <= 0)) {
       return;
     }
 
     const interval = setInterval(() => {
-      setRemainingSeconds(prev => {
-        const next = prev - 1;
-        return next >= 0 ? next : 0;
+      setRemainingTurnSeconds((previousTurn) => {
+        if (previousTurn > 0) {
+          return Math.max(0, previousTurn - 1);
+        }
+
+        setRemainingReserveSeconds((previousReserve) => Math.max(0, previousReserve - 1));
+        return previousTurn;
       });
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [isMyTurn, totalSeconds, remainingSeconds]);
+  }, [isMyTurn, remainingTurnSeconds, remainingReserveSeconds]);
 
-  // Don't render if no timeout configured
-  if (!totalSeconds) {
+  if (!turnSeconds && !initialReserveSeconds) {
     return null;
   }
 
-  // Calculate percentage for visual indicator
-  const percentage = totalSeconds > 0 ? (remainingSeconds / totalSeconds) * 100 : 0;
+  const inReserve = remainingTurnSeconds <= 0 && isMyTurn;
+  const percentage = inReserve
+    ? (initialReserveSeconds && initialReserveSeconds > 0 ? (remainingReserveSeconds / initialReserveSeconds) * 100 : 0)
+    : (turnSeconds && turnSeconds > 0 ? (remainingTurnSeconds / turnSeconds) * 100 : 0);
 
-  // Determine warning level
-  const isUrgent = remainingSeconds <= 5;
-  const isWarning = remainingSeconds <= 10 && !isUrgent;
+  const activeSeconds = inReserve ? remainingReserveSeconds : remainingTurnSeconds;
+  const isUrgent = activeSeconds <= 5;
+  const isWarning = activeSeconds <= 10 && !isUrgent;
 
   return (
     <div className={`action-timer ${isMyTurn ? 'active' : ''} ${isUrgent ? 'urgent' : isWarning ? 'warning' : ''}`}>
@@ -61,8 +71,8 @@ export const ActionTimer: React.FC<ActionTimerProps> = ({
       <div className="timer-text">
         {isMyTurn ? (
           <>
-            <span className="timer-label">Your Turn:</span>
-            <span className="timer-value">{remainingSeconds}s</span>
+            <span className="timer-label">{inReserve ? 'Reserve:' : 'Your Turn:'}</span>
+            <span className="timer-value">{Math.max(0, Math.ceil(activeSeconds))}s</span>
           </>
         ) : (
           <span className="timer-label">Waiting for other players...</span>

@@ -13,6 +13,8 @@ export interface PlayerState {
   isAllIn: boolean;
   isActive: boolean; // Still in the hand
   seatNumber?: number; // Position at the table
+  timeBankMs: number;
+  timeBankSeconds: number;
 }
 
 /**
@@ -29,12 +31,14 @@ export class Player {
   private hasFolded: boolean = false;
   private isAllIn: boolean = false;
   private isActive: boolean = true;
+  private timeBankMs: number = 30000;
 
-  constructor(id: string, name: string, initialStack: number, seatNumber?: number) {
+  constructor(id: string, name: string, initialStack: number, seatNumber?: number, initialTimeBankMs: number = 30000) {
     this.id = id;
     this.name = name;
     this.stack = initialStack;
     this.seatNumber = seatNumber;
+    this.timeBankMs = Math.max(0, Math.floor(initialTimeBankMs));
   }
 
   /**
@@ -126,7 +130,9 @@ export class Player {
       hasFolded: this.hasFolded,
       isAllIn: this.isAllIn,
       isActive: this.isActive,
-      seatNumber: this.seatNumber
+      seatNumber: this.seatNumber,
+      timeBankMs: this.timeBankMs,
+      timeBankSeconds: Math.ceil(this.timeBankMs / 1000)
     };
   }
 
@@ -177,5 +183,22 @@ export class Player {
    */
   setActive(): void {
     this.isActive = true;
+  }
+
+  getTimeBankMs(): number {
+    return this.timeBankMs;
+  }
+
+  setTimeBankMs(value: number): void {
+    this.timeBankMs = Math.max(0, Math.floor(value));
+  }
+
+  deductTimeBank(elapsedMs: number): number {
+    if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+      return this.timeBankMs;
+    }
+
+    this.timeBankMs = Math.max(0, this.timeBankMs - Math.floor(elapsedMs));
+    return this.timeBankMs;
   }
 }

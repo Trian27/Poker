@@ -4,7 +4,7 @@
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
-import { authApi } from '../api';
+import { authApi, tablesApi } from '../api';
 import './AuthPages.css';
 
 export const LoginPage: React.FC = () => {
@@ -12,6 +12,7 @@ export const LoginPage: React.FC = () => {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [isRejoiningTable, setIsRejoiningTable] = useState(false);
   
   // Admin 2FA state
   const [showVerification, setShowVerification] = useState(false);
@@ -20,6 +21,24 @@ export const LoginPage: React.FC = () => {
   
   const navigate = useNavigate();
   const { login } = useAuth();
+
+  const navigateAfterLogin = async () => {
+    setIsRejoiningTable(true);
+    try {
+      const activeSeat = await tablesApi.getMyActiveSeat();
+      if (activeSeat?.active && activeSeat.table_id) {
+        const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
+        navigate(`/game/${activeSeat.table_id}${communityParam}`);
+        return;
+      }
+    } catch (err) {
+      console.error('Failed to fetch active seat after login:', err);
+    } finally {
+      setIsRejoiningTable(false);
+    }
+
+    navigate('/dashboard');
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -43,11 +62,12 @@ export const LoginPage: React.FC = () => {
         username,
         email: '',
         created_at: new Date().toISOString(),
-        is_admin: false
+        is_admin: false,
+        is_banned: false
       };
       
       login(response.access_token, user);
-      navigate('/dashboard');
+      await navigateAfterLogin();
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Login failed. Please try again.');
     } finally {
@@ -68,11 +88,12 @@ export const LoginPage: React.FC = () => {
         username,
         email: adminEmail,
         created_at: new Date().toISOString(),
-        is_admin: true
+        is_admin: true,
+        is_banned: false
       };
       
       login(response.access_token, user);
-      navigate('/dashboard');
+      await navigateAfterLogin();
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Verification failed. Please try again.');
     } finally {
@@ -138,6 +159,12 @@ export const LoginPage: React.FC = () => {
       <div className="auth-card">
         <h1>🃏 Poker Platform</h1>
         <h2>Login</h2>
+
+        {isRejoiningTable && (
+          <div className="rejoin-banner auth-rejoin-banner">
+            Rejoining your active table...
+          </div>
+        )}
         
         <form onSubmit={handleSubmit}>
           <div className="form-group">

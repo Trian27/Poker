@@ -12,12 +12,12 @@ from .config import settings
 from .database import get_db, SessionLocal
 from .models import (
     User, League, Community, Wallet, Table, TableStatus, HandHistory, TableSeat, TableQueue,
-    LeagueAdmin, CommunityAdmin, LeagueMember, LeagueJoinRequest
+    LeagueAdmin, CommunityAdmin, LeagueMember, LeagueJoinRequest, JoinRequest, InboxMessage
 )
 from .schema_migrations import ensure_schema
 from .schemas import (
     UserCreate, UserResponse, Token,
-    AdminInviteRequest, AdminUserResponse,
+    AdminInviteRequest, AdminUserResponse, BanStatusRequest, CurrencyUpdateRequest,
     LeagueCreate, LeagueResponse,
     CommunityBase, CommunityCreate, CommunityResponse,
     WalletCreate, WalletResponse,
@@ -210,6 +210,34 @@ def _is_league_member(db: Session, league_id: int, user_id: int) -> bool:
     return member_match is not None
 
 
+def _is_global_admin(db: Session, user_id: int) -> bool:
+    user = db.query(User).filter(User.id == user_id).first()
+    return bool(user and user.is_admin)
+
+
+def _get_user_or_404(db: Session, user_id: int) -> User:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return user
+
+
+def _require_global_admin(db: Session, current_user: dict) -> User:
+    user_id = current_user.get("user_id")
+    user = _get_user_or_404(db, user_id)
+    if not user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return user
+
+
+def _ensure_not_banned(user: User) -> None:
+    if user.is_banned:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account has been banned"
+        )
+
+
 # ============================================================================
 # Authentication Endpoints (Public)
 # ============================================================================
@@ -391,7 +419,8 @@ def login(username: str, password: str, db: Session = Depends(get_db)):
             "username": user.username,
             "email": user.email,
             "created_at": user.created_at.isoformat() if user.created_at else None,
-            "is_admin": user.is_admin
+            "is_admin": user.is_admin,
+            "is_banned": user.is_banned
         }
     }
 
@@ -453,7 +482,8 @@ def verify_admin_login(
             "username": user.username,
             "email": user.email,
             "created_at": user.created_at.isoformat() if user.created_at else None,
-            "is_admin": user.is_admin
+            "is_admin": user.is_admin,
+            "is_banned": user.is_banned
         }
     }
 
@@ -481,8 +511,173 @@ def get_current_user_info(
         "username": user.username,
         "email": user.email,
         "created_at": user.created_at.isoformat() if user.created_at else None,
-        "is_admin": user.is_admin
+        "is_admin": user.is_admin,
+        "is_banned": user.is_banned
     }
+
+
+# ============================================================================
+# Admin Endpoints (Global Admin Only)
+# ============================================================================
+
+@app.patch("/api/admin/users/{user_id}/ban")
+def set_user_ban_status(
+    user_id: int,
+    payload: BanStatusRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    admin_user = _require_global_admin(db, current_user)
+    target_user = _get_user_or_404(db, user_id)
+
+    if target_user.id == admin_user.id and payload.is_banned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot ban your own account"
+        )
+
+    target_user.is_banned = payload.is_banned
+    db.commit()
+
+    return {"message": "Ban status updated", "user_id": target_user.id, "is_banned": target_user.is_banned}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user_account(
+    user_id: int,
+    reassign_to_user_id: int | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    admin_user = _require_global_admin(db, current_user)
+    target_user = _get_user_or_404(db, user_id)
+
+    if target_user.id == admin_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot delete your own account while authenticated"
+        )
+
+    if reassign_to_user_id is None:
+        reassign_to_user_id = admin_user.id
+    if reassign_to_user_id == target_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reassign user cannot be the same as the deleted user"
+        )
+
+    reassign_user = _get_user_or_404(db, reassign_to_user_id)
+
+    # Reassign ownership/creator roles
+    db.query(League).filter(League.owner_id == target_user.id).update(
+        {"owner_id": reassign_user.id}
+    )
+    db.query(Community).filter(Community.commissioner_id == target_user.id).update(
+        {"commissioner_id": reassign_user.id}
+    )
+    db.query(Table).filter(Table.created_by_user_id == target_user.id).update(
+        {"created_by_user_id": reassign_user.id}
+    )
+
+    # Clear seats and queue entries
+    db.query(TableSeat).filter(TableSeat.user_id == target_user.id).update(
+        {"user_id": None, "occupied_at": None}
+    )
+
+    queue_table_ids = [
+        row[0] for row in db.query(TableQueue.table_id).filter(TableQueue.user_id == target_user.id).all()
+    ]
+    db.query(TableQueue).filter(TableQueue.user_id == target_user.id).delete()
+    for table_id in queue_table_ids:
+        entries = db.query(TableQueue).filter(TableQueue.table_id == table_id).order_by(TableQueue.position).all()
+        for index, entry in enumerate(entries, start=1):
+            entry.position = index
+
+    # Remove memberships/admin roles
+    db.query(LeagueMember).filter(LeagueMember.user_id == target_user.id).delete()
+    db.query(LeagueAdmin).filter(LeagueAdmin.user_id == target_user.id).delete()
+    db.query(CommunityAdmin).filter(CommunityAdmin.user_id == target_user.id).delete()
+
+    # Null out inviter/reviewer references
+    db.query(LeagueAdmin).filter(LeagueAdmin.invited_by_user_id == target_user.id).update(
+        {"invited_by_user_id": None}
+    )
+    db.query(CommunityAdmin).filter(CommunityAdmin.invited_by_user_id == target_user.id).update(
+        {"invited_by_user_id": None}
+    )
+    db.query(JoinRequest).filter(JoinRequest.reviewed_by_user_id == target_user.id).update(
+        {"reviewed_by_user_id": None}
+    )
+    db.query(LeagueJoinRequest).filter(LeagueJoinRequest.reviewed_by_user_id == target_user.id).update(
+        {"reviewed_by_user_id": None}
+    )
+
+    # Delete membership requests by the user
+    db.query(JoinRequest).filter(JoinRequest.user_id == target_user.id).delete()
+    db.query(LeagueJoinRequest).filter(LeagueJoinRequest.user_id == target_user.id).delete()
+
+    # Delete wallets and inbox for the user
+    db.query(Wallet).filter(Wallet.user_id == target_user.id).delete()
+    db.query(InboxMessage).filter(InboxMessage.recipient_user_id == target_user.id).delete()
+    db.query(InboxMessage).filter(InboxMessage.sender_user_id == target_user.id).update(
+        {"sender_user_id": None}
+    )
+
+    # Ensure reassigned user is a member of leagues they now manage
+    reassigned_league_ids = {
+        row[0] for row in db.query(League.id).filter(League.owner_id == reassign_user.id).all()
+    }
+    reassigned_league_ids.update(
+        row[0] for row in db.query(Community.league_id).filter(Community.commissioner_id == reassign_user.id).all()
+    )
+    for league_id in reassigned_league_ids:
+        existing_member = db.query(LeagueMember).filter(
+            LeagueMember.league_id == league_id,
+            LeagueMember.user_id == reassign_user.id
+        ).first()
+        if not existing_member:
+            db.add(LeagueMember(league_id=league_id, user_id=reassign_user.id))
+
+    db.delete(target_user)
+    db.commit()
+
+    return {"message": "User deleted", "user_id": target_user.id}
+
+
+@app.patch("/api/admin/leagues/{league_id}/currency")
+def set_league_currency(
+    league_id: int,
+    payload: CurrencyUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    _require_global_admin(db, current_user)
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+
+    league.currency = payload.currency
+    db.commit()
+
+    return {"message": "League currency updated", "league_id": league.id, "currency": league.currency}
+
+
+@app.patch("/api/admin/communities/{community_id}/currency")
+def set_community_currency(
+    community_id: int,
+    payload: CurrencyUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    _require_global_admin(db, current_user)
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+
+    community.currency = payload.currency
+    db.commit()
+
+    return {"message": "Community currency updated", "community_id": community.id, "currency": community.currency}
 
 
 # ============================================================================
@@ -507,6 +702,7 @@ def create_league(
     new_league = League(
         name=league_data.name,
         description=league_data.description,
+        currency=league_data.currency,
         owner_id=user_id
     )
     
@@ -563,6 +759,7 @@ def list_leagues(
             "id": league.id,
             "name": league.name,
             "description": league.description,
+            "currency": league.currency,
             "owner_id": league.owner_id,
             "created_at": league.created_at,
             "is_member": is_member,
@@ -585,7 +782,7 @@ def list_league_admins(
     if not league:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
 
-    if not _is_league_member(db, league_id, user_id):
+    if not (_is_global_admin(db, user_id) or _is_league_member(db, league_id, user_id)):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You must be a league member to view admins"
@@ -616,6 +813,8 @@ def request_to_join_league(
 
     user_id = current_user.get("user_id")
     username = current_user.get("username")
+    user = _get_user_or_404(db, user_id)
+    _ensure_not_banned(user)
 
     league = db.query(League).filter(League.id == league_id).first()
     if not league:
@@ -843,11 +1042,16 @@ def create_community(
             detail="You must be a member of this league to create a community"
         )
 
+    currency = community_data.currency
+    if "currency" not in community_data.model_fields_set:
+        currency = league.currency
+    
     # Create community
     new_community = Community(
         name=community_data.name,
         description=community_data.description,
         league_id=community_data.league_id,
+        currency=currency,
         starting_balance=community_data.starting_balance,
         commissioner_id=user_id
     )
@@ -871,6 +1075,8 @@ def join_community(
     - **community_id**: ID of the community to join
     """
     user_id = current_user.get("user_id")
+    user = _get_user_or_404(db, user_id)
+    _ensure_not_banned(user)
     
     # Verify community exists
     community = db.query(Community).filter(Community.id == community_id).first()
@@ -884,12 +1090,6 @@ def join_community(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You must be a league member to join this community"
-        )
-
-    if not _is_league_member(db, community.league_id, user_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You must be a league member to request to join this community"
         )
     
     # Check if wallet already exists
@@ -947,10 +1147,17 @@ def list_community_admins(
     if not community:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
 
-    if not _is_league_member(db, community.league_id, user_id):
+    can_view_admins = (
+        _is_global_admin(db, user_id)
+        or community.commissioner_id == user_id
+        or _is_community_admin(db, community_id, user_id)
+        or _is_league_member(db, community.league_id, user_id)
+    )
+
+    if not can_view_admins:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="You must be a league member to view admins"
+            detail="You do not have permission to view community admins"
         )
 
     commissioner = db.query(User).filter(User.id == community.commissioner_id).first()
@@ -1216,6 +1423,40 @@ def delete_table(
     return None
 
 
+@app.get("/api/tables/me/active-seat")
+def get_my_active_table_seat(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Return the current user's active seated table (if any).
+
+    This is used by the frontend to auto-rejoin a table after a page reload
+    while the disconnect grace period is still active.
+    """
+    user_id = current_user.get("user_id")
+
+    seat_record = (
+        db.query(TableSeat, Table)
+        .join(Table, Table.id == TableSeat.table_id)
+        .filter(TableSeat.user_id == user_id)
+        .order_by(TableSeat.occupied_at.desc(), TableSeat.id.desc())
+        .first()
+    )
+
+    if not seat_record:
+        return {"active": False}
+
+    seat, table = seat_record
+    return {
+        "active": True,
+        "table_id": seat.table_id,
+        "community_id": table.community_id,
+        "seat_number": seat.seat_number,
+        "occupied_at": seat.occupied_at.isoformat() if seat.occupied_at else None
+    }
+
+
 @app.post("/api/tables/{table_id}/queue/join", response_model=TableQueuePosition)
 def join_table_queue(
     table_id: int,
@@ -1227,6 +1468,8 @@ def join_table_queue(
     Requires authentication
     """
     user_id = current_user.get("user_id")
+    user = _get_user_or_404(db, user_id)
+    _ensure_not_banned(user)
     
     # Check if table exists
     table = db.query(Table).filter(Table.id == table_id).first()
@@ -1290,14 +1533,11 @@ def join_table_queue(
     
     logger.info(f"User {user_id} joined queue for table {table_id} at position {next_position}")
     
-    # Get user name for response
-    user = db.query(User).filter(User.id == user_id).first()
-    
     return TableQueuePosition(
         id=queue_entry.id,
         table_id=table_id,
         user_id=user_id,
-        username=user.username if user else "Unknown",
+        username=user.username,
         position=next_position,
         joined_at=queue_entry.joined_at
     )
@@ -1449,6 +1689,8 @@ async def join_table(
     """
     user_id = current_user.get("user_id")
     username = current_user.get("username")
+    user = _get_user_or_404(db, user_id)
+    _ensure_not_banned(user)
     
     # Step 2: Get table and verify it exists
     table = db.query(Table).filter(Table.id == table_id).first()
@@ -1458,42 +1700,102 @@ async def join_table(
             detail="Table not found"
         )
     
-    # Step 2b: Verify seat number is valid and available
+    # Step 2b: Verify seat number is valid
     from .models import TableSeat
     if request.seat_number < 1 or request.seat_number > table.max_seats:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Seat number must be between 1 and {table.max_seats}"
         )
-    
-    seat = db.query(TableSeat).filter(
-        TableSeat.table_id == table_id,
-        TableSeat.seat_number == request.seat_number
-    ).first()
-    
-    if not seat:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Seat {request.seat_number} not found"
-        )
-    
-    if seat.user_id is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Seat {request.seat_number} is already occupied"
-        )
-    
+
     # Check if user is already seated at this table
     existing_seat = db.query(TableSeat).filter(
         TableSeat.table_id == table_id,
         TableSeat.user_id == user_id
     ).first()
-    
+
     if existing_seat:
+        if existing_seat.seat_number != request.seat_number:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"You are already seated at this table in seat {existing_seat.seat_number}. Rejoin that seat or leave first."
+            )
+
+        wallet = db.query(Wallet).filter(
+            Wallet.user_id == user_id,
+            Wallet.community_id == table.community_id
+        ).first()
+
+        if not wallet:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="You don't have a wallet in this community. Join the community first."
+            )
+
+        # Idempotent rejoin: ensure game server has this seat mapping (important after game-server restarts).
+        try:
+            async with httpx.AsyncClient() as client:
+                game_server_url = "http://game-server:3000/_internal/seat-player"
+                seat_request = SeatPlayerRequest(
+                    table_id=table_id,
+                    user_id=user_id,
+                    username=username,
+                    stack=request.buy_in_amount,
+                    seat_number=request.seat_number
+                )
+
+                response = await client.post(
+                    game_server_url,
+                    json=seat_request.model_dump(),
+                    timeout=10.0
+                )
+
+                if response.status_code != 200:
+                    response_text = response.text or ""
+                    try:
+                        response_json = response.json()
+                        if isinstance(response_json, dict) and response_json.get("error"):
+                            response_text = str(response_json.get("error"))
+                    except Exception:
+                        pass
+
+                    # The player may already exist in game state, which is fine for rejoin.
+                    if not (response.status_code == 400 and "already seated" in response_text.lower()):
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Failed to rejoin table: {response_text}"
+                        )
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Game server unavailable: {str(e)}"
+            )
+
+        logger.info(f"User {user_id} rejoined table {table_id} at existing seat {existing_seat.seat_number}")
+        return {
+            "success": True,
+            "message": f"Rejoined table at seat {existing_seat.seat_number}",
+            "new_balance": float(wallet.balance),
+            "table_id": table_id
+        }
+
+    seat = db.query(TableSeat).filter(
+        TableSeat.table_id == table_id,
+        TableSeat.seat_number == request.seat_number
+    ).first()
+
+    if not seat:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Seat {request.seat_number} not found"
+        )
+
+    if seat.user_id is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"You are already seated at this table in seat {existing_seat.seat_number}"
+            detail=f"Seat {request.seat_number} is already occupied"
         )
+
     
     # Step 3: Validate buy-in amount
     if request.buy_in_amount < table.buy_in:
@@ -1595,7 +1897,10 @@ async def join_table(
 # ============================================================================
 
 @app.post("/api/internal/auth/verify", response_model=TokenVerifyResponse)
-def verify_token_internal(request: TokenVerifyRequest):
+def verify_token_internal(
+    request: TokenVerifyRequest,
+    db: Session = Depends(get_db)
+):
     """
     Internal endpoint: Verify a JWT token and return user info
     
@@ -1618,11 +1923,13 @@ def verify_token_internal(request: TokenVerifyRequest):
             message="Token missing required fields"
         )
     
-    return TokenVerifyResponse(
-        valid=True,
-        user_id=user_id,
-        username=username
-    )
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return TokenVerifyResponse(valid=False, message="User not found")
+    if user.is_banned:
+        return TokenVerifyResponse(valid=False, message="User is banned")
+
+    return TokenVerifyResponse(valid=True, user_id=user_id, username=username)
 
 
 @app.post("/api/internal/wallets/debit", response_model=WalletOperationResponse)
@@ -1816,6 +2123,24 @@ async def unseat_player(table_id: int, user_id: int, db: Session = Depends(get_d
     first_in_queue = db.query(TableQueue).filter(
         TableQueue.table_id == table_id
     ).order_by(TableQueue.position).first()
+    
+    while first_in_queue:
+        queued_user = db.query(User).filter(User.id == first_in_queue.user_id).first()
+        if not queued_user or queued_user.is_banned:
+            db.delete(first_in_queue)
+            db.commit()
+            remaining_queue = db.query(TableQueue).filter(
+                TableQueue.table_id == table_id,
+                TableQueue.position > first_in_queue.position
+            ).order_by(TableQueue.position).all()
+            for entry in remaining_queue:
+                entry.position -= 1
+            db.commit()
+            first_in_queue = db.query(TableQueue).filter(
+                TableQueue.table_id == table_id
+            ).order_by(TableQueue.position).first()
+            continue
+        break
     
     if first_in_queue:
         queued_user_id = first_in_queue.user_id
@@ -2090,6 +2415,8 @@ def request_to_join_community(
     
     user_id = current_user.get("user_id")
     username = current_user.get("username")
+    user = _get_user_or_404(db, user_id)
+    _ensure_not_banned(user)
     
     # Verify community exists
     community = db.query(Community).filter(Community.id == community_id).first()
@@ -2097,6 +2424,12 @@ def request_to_join_community(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Community not found"
+        )
+
+    if not _is_league_member(db, community.league_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You must be a league member to request to join this community"
         )
     
     # Check if already a member
@@ -2587,6 +2920,7 @@ def create_community_in_league(
     community_data: CommunityBase | None = Body(default=None),
     name: str | None = None,
     description: str | None = None,
+    currency: str | None = None,
     starting_balance: float | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -2599,6 +2933,9 @@ def create_community_in_league(
     if community_data:
         name = community_data.name
         description = community_data.description
+        currency = community_data.currency
+        if "currency" not in community_data.model_fields_set:
+            currency = None
         starting_balance = float(community_data.starting_balance)
     if not name:
         raise HTTPException(
@@ -2621,11 +2958,14 @@ def create_community_in_league(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You must be a member of this league to create a community"
         )
+    if not currency:
+        currency = league.currency
     # Create community with user as commissioner
     new_community = Community(
         name=name,
         description=description,
         league_id=league_id,
+        currency=currency,
         starting_balance=Decimal(str(starting_balance)),
         commissioner_id=user_id
     )

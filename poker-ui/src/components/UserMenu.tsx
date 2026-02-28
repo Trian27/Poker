@@ -8,7 +8,7 @@ interface UserMenuProps {
 }
 
 export default function UserMenu({ username }: UserMenuProps) {
-  const { user, logout, setUser } = useAuth();
+  const { user, logout, setUser, setToken } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
@@ -100,12 +100,11 @@ export default function UserMenu({ username }: UserMenuProps) {
       // Update local user state
       if (response.user && setUser) {
         setUser(response.user);
-        localStorage.setItem('user', JSON.stringify(response.user));
       }
       
       // Update token if email changed
       if (response.access_token) {
-        localStorage.setItem('token', response.access_token);
+        setToken(response.access_token);
       }
       
       setSuccess('Profile updated successfully!');

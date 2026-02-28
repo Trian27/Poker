@@ -36,7 +36,7 @@ function App() {
             }
           />
           <Route
-            path="/game/:communityId"
+            path="/game/:tableId"
             element={
               <ProtectedRoute>
                 <GameTablePage />

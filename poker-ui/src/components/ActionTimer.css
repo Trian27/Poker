@@ -5,8 +5,11 @@
 .action-timer {
   padding: 12px 20px;
   background-color: rgba(0, 0, 0, 0.6);
+  border: 2px solid transparent;
+  box-sizing: border-box;
   border-radius: 8px;
   margin: 10px 0;
+  min-height: 72px;
   transition: all 0.3s ease;
 }
 
@@ -58,6 +61,7 @@
   color: white;
   font-size: 14px;
   font-weight: 500;
+  min-height: 22px;
 }
 
 .timer-label {

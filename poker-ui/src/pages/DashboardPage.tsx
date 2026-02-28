@@ -1,20 +1,22 @@
 /**
  * Dashboard/Lobby page - shows leagues, communities, wallets, inbox
  */
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
-import { communitiesApi, walletsApi, leaguesApi, inboxApi } from '../api';
+import { communitiesApi, walletsApi, leaguesApi, inboxApi, tablesApi } from '../api';
 import type { Community, Wallet, League, InboxMessage, AdminUser } from '../types';
 import UserMenu from '../components/UserMenu';
 import './Dashboard.css';
 
 export const DashboardPage: React.FC = () => {
+  const REFRESH_INTERVAL_MS = 5000;
   const [communities, setCommunities] = useState<Community[]>([]);
   const [wallets, setWallets] = useState<Wallet[]>([]);
   const [leagues, setLeagues] = useState<League[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [isRejoiningTable, setIsRejoiningTable] = useState(false);
   
   // Expanded leagues state
   const [expandedLeagues, setExpandedLeagues] = useState<Set<number>>(new Set());
@@ -61,22 +63,12 @@ export const DashboardPage: React.FC = () => {
   const { user } = useAuth();
   const navigate = useNavigate();
 
-  useEffect(() => {
-    loadData();
-    loadUnreadCount();
-  }, []);
-  
-  // Auto-expand leagues when loaded
-  useEffect(() => {
-    if (leagues.length > 0 && expandedLeagues.size === 0) {
-      setExpandedLeagues(new Set(leagues.map(l => l.id)));
-    }
-  }, [leagues]);
-
-  const loadData = async () => {
+  const loadData = useCallback(async (showLoader: boolean = false) => {
     try {
-      setLoading(true);
-      setError('');
+      if (showLoader) {
+        setLoading(true);
+        setError('');
+      }
       
       const [communitiesData, walletsData, leaguesData] = await Promise.all([
         communitiesApi.getAll(),
@@ -88,20 +80,100 @@ export const DashboardPage: React.FC = () => {
       setWallets(walletsData);
       setLeagues(leaguesData);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load data');
+      const message = err.response?.data?.detail || 'Failed to load data';
+      if (showLoader) {
+        setError(message);
+      } else {
+        console.error('Background dashboard refresh failed:', message);
+      }
     } finally {
-      setLoading(false);
+      if (showLoader) {
+        setLoading(false);
+      }
     }
-  };
+  }, []);
 
-  const loadUnreadCount = async () => {
+  const loadUnreadCount = useCallback(async () => {
     try {
       const data = await inboxApi.getUnreadCount();
       setUnreadCount(data.unread_count);
     } catch (err) {
       console.error('Failed to load unread count:', err);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadData(true);
+    loadUnreadCount();
+  }, [loadData, loadUnreadCount]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const tryAutoRejoinOnReload = async () => {
+      const navigationEntries = performance.getEntriesByType('navigation');
+      const navigationEntry = navigationEntries[0] as PerformanceNavigationTiming | undefined;
+      const isReload = navigationEntry?.type === 'reload';
+
+      if (!isReload) {
+        return;
+      }
+
+      setIsRejoiningTable(true);
+      try {
+        const activeSeat = await tablesApi.getMyActiveSeat();
+        if (!cancelled && activeSeat?.active && activeSeat.table_id) {
+          const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
+          navigate(`/game/${activeSeat.table_id}${communityParam}`, { replace: true });
+          return;
+        }
+      } catch (err) {
+        console.error('Failed to check active seat for auto-rejoin:', err);
+      } finally {
+        if (!cancelled) {
+          setIsRejoiningTable(false);
+        }
+      }
+    };
+
+    tryAutoRejoinOnReload();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [navigate]);
+
+  useEffect(() => {
+    const refreshDashboardState = async () => {
+      await Promise.all([loadData(false), loadUnreadCount()]);
+    };
+
+    const intervalId = window.setInterval(refreshDashboardState, REFRESH_INTERVAL_MS);
+    const onWindowFocus = () => {
+      refreshDashboardState();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        refreshDashboardState();
+      }
+    };
+
+    window.addEventListener('focus', onWindowFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onWindowFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [loadData, loadUnreadCount]);
+  
+  // Auto-expand leagues when loaded
+  useEffect(() => {
+    if (leagues.length > 0 && expandedLeagues.size === 0) {
+      setExpandedLeagues(new Set(leagues.map(l => l.id)));
+    }
+  }, [leagues]);
 
   const loadInbox = async () => {
     try {
@@ -415,6 +487,12 @@ export const DashboardPage: React.FC = () => {
         </div>
       </header>
 
+      {isRejoiningTable && (
+        <div className="rejoin-banner">
+          Rejoining your active table...
+        </div>
+      )}
+
       {error && <div className="error-message">{error}</div>}
 
       <main className="dashboard-main">
@@ -495,7 +573,7 @@ export const DashboardPage: React.FC = () => {
                                   }}
                                   className="btn-secondary btn-small"
                                 >
-                                  Settings
+                                  League Settings
                                 </button>
                               )}
                               {canCreateCommunity && (
@@ -550,7 +628,7 @@ export const DashboardPage: React.FC = () => {
                                           onClick={() => openCommunitySettings(community)}
                                           className="btn-secondary"
                                         >
-                                          Settings
+                                          Community Settings
                                         </button>
                                       )}
                                     </div>

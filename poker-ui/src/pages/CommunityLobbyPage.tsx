@@ -1,15 +1,21 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback, type CSSProperties } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { communitiesApi, tablesApi, walletsApi } from '../api';
+import { useAuth } from '../AuthContext';
 import type { Community, Table, Wallet, TableSeat } from '../types';
 import './CommunityLobby.css';
+
+const MAX_TABLE_SEATS = 8;
+const LOBBY_REFRESH_INTERVAL_MS = 3000;
 
 export default function CommunityLobbyPage() {
   const { communityId } = useParams<{ communityId: string }>();
   const navigate = useNavigate();
+  const { user } = useAuth();
   
   const [community, setCommunity] = useState<Community | null>(null);
   const [tables, setTables] = useState<Table[]>([]);
+  const [tableSeatCounts, setTableSeatCounts] = useState<Record<number, number>>({});
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -23,7 +29,7 @@ export default function CommunityLobbyPage() {
   // Create table form state
   const [tableName, setTableName] = useState('');
   const [gameType, setGameType] = useState<'cash' | 'tournament'>('cash');
-  const [maxSeats, setMaxSeats] = useState(9);
+  const [maxSeats, setMaxSeats] = useState(MAX_TABLE_SEATS);
   const [smallBlind, setSmallBlind] = useState(10);
   const [bigBlind, setBigBlind] = useState(20);
   const [buyIn, setBuyIn] = useState(1000);
@@ -33,42 +39,135 @@ export default function CommunityLobbyPage() {
   const [buyInAmount, setBuyInAmount] = useState(1000);
   const [selectedSeat, setSelectedSeat] = useState<number | null>(null);
 
-  useEffect(() => {
-    loadData();
-  }, [communityId]);
+  const parsedCommunityId = Number(communityId);
 
-  const loadData = async () => {
+  const loadData = useCallback(async (options: { showLoader?: boolean; silent?: boolean } = {}) => {
+    const { showLoader = false, silent = false } = options;
+
+    if (!Number.isFinite(parsedCommunityId) || parsedCommunityId <= 0) {
+      setError('Invalid community');
+      if (showLoader) {
+        setLoading(false);
+      }
+      return;
+    }
+
     try {
-      setLoading(true);
-      setError(null);
-      
-      // Get all communities to find this one
-      const communities = await communitiesApi.getAll();
-      const comm = communities.find((c: Community) => c.id === Number(communityId));
-      
+      if (showLoader) {
+        setLoading(true);
+      }
+      if (!silent) {
+        setError(null);
+      }
+
+      const [communities, wallets, tablesData] = await Promise.all([
+        communitiesApi.getAll(),
+        walletsApi.getAll(),
+        tablesApi.getByCommunity(parsedCommunityId),
+      ]);
+
+      const comm = communities.find((c: Community) => c.id === parsedCommunityId);
       if (!comm) {
         setError('Community not found');
+        setCommunity(null);
+        setTables([]);
+        setWallet(null);
+        setTableSeatCounts({});
         return;
       }
-      
+
       setCommunity(comm);
-      
-      // Get tables for this community
-      const tablesData = await tablesApi.getByCommunity(Number(communityId));
       setTables(tablesData);
-      
-      // Get user's wallet in this community
-      const wallets = await walletsApi.getAll();
-      const userWallet = wallets.find((w: Wallet) => w.community_id === Number(communityId));
+
+      if (tablesData.length > 0) {
+        const seatCountsEntries = await Promise.all(
+          tablesData.map(async (table: Table) => {
+            try {
+              const seatsData = await tablesApi.getSeats(table.id);
+              const occupiedCount = seatsData.filter((seat: TableSeat) => seat.user_id !== null).length;
+              return [table.id, occupiedCount] as const;
+            } catch (error) {
+              console.error(`Failed to load seat count for table ${table.id}:`, error);
+              return [table.id, 0] as const;
+            }
+          })
+        );
+
+        setTableSeatCounts(Object.fromEntries(seatCountsEntries));
+      } else {
+        setTableSeatCounts({});
+      }
+
+      const userWallet = wallets.find((w: Wallet) => w.community_id === parsedCommunityId);
       setWallet(userWallet || null);
-      
     } catch (err: any) {
-      console.error('Error loading community data:', err);
-      setError(err.response?.data?.detail || 'Failed to load community data');
+      const message = err.response?.data?.detail || 'Failed to load community data';
+      if (silent) {
+        console.error('Background community refresh failed:', message);
+      } else {
+        console.error('Error loading community data:', err);
+        setError(message);
+      }
     } finally {
-      setLoading(false);
+      if (showLoader) {
+        setLoading(false);
+      }
     }
-  };
+  }, [parsedCommunityId]);
+
+  useEffect(() => {
+    loadData({ showLoader: true });
+  }, [loadData]);
+
+  useEffect(() => {
+    if (!showJoinModal || !selectedTable) {
+      return;
+    }
+
+    const updatedSelectedTable = tables.find((table) => table.id === selectedTable.id);
+    if (!updatedSelectedTable) {
+      setShowJoinModal(false);
+      setSelectedTable(null);
+      setSelectedSeat(null);
+      setSeats([]);
+      alert('This table is no longer available.');
+      return;
+    }
+
+    // Keep modal table details in sync with server updates without triggering fetch loops.
+    if (updatedSelectedTable !== selectedTable) {
+      setSelectedTable(updatedSelectedTable);
+    }
+  }, [showJoinModal, selectedTable, tables]);
+
+  useEffect(() => {
+    if (!Number.isFinite(parsedCommunityId) || parsedCommunityId <= 0) {
+      return;
+    }
+
+    const refreshLobbyState = () => {
+      loadData({ silent: true });
+    };
+
+    const intervalId = window.setInterval(refreshLobbyState, LOBBY_REFRESH_INTERVAL_MS);
+    const onWindowFocus = () => {
+      refreshLobbyState();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        refreshLobbyState();
+      }
+    };
+
+    window.addEventListener('focus', onWindowFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onWindowFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [parsedCommunityId, loadData]);
 
   const handleCreateTable = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -90,7 +189,7 @@ export default function CommunityLobbyPage() {
       setShowCreateModal(false);
       
       // Reload tables
-      await loadData();
+      await loadData({ silent: true });
       
       alert('Table created successfully!');
     } catch (err: any) {
@@ -123,10 +222,22 @@ export default function CommunityLobbyPage() {
       setShowJoinModal(false);
       
       // Navigate to game table
-      navigate(`/game/${selectedTable.id}`);
+      const communityQuery = Number.isFinite(parsedCommunityId) && parsedCommunityId > 0
+        ? `?communityId=${parsedCommunityId}`
+        : '';
+      navigate(`/game/${selectedTable.id}${communityQuery}`);
       
     } catch (err: any) {
       console.error('Error joining table:', err);
+      if (err?.response?.status === 404) {
+        setShowJoinModal(false);
+        setSelectedTable(null);
+        setSelectedSeat(null);
+        setSeats([]);
+        await loadData({ silent: true });
+        alert('This table is no longer available.');
+        return;
+      }
       alert(err.response?.data?.detail || 'Failed to join table');
     }
   };
@@ -136,18 +247,75 @@ export default function CommunityLobbyPage() {
     setBuyInAmount(table.buy_in);
     setSelectedSeat(null);
     setShowJoinModal(true);
-    
-    // Load available seats
-    setLoadingSeats(true);
+    await loadSeats(table, true);
+  };
+
+  const loadSeats = async (table: Table, showLoading: boolean = false) => {
+    if (showLoading) {
+      setLoadingSeats(true);
+    }
+
     try {
       const seatsData = await tablesApi.getSeats(table.id);
-      setSeats(seatsData);
+      const filteredSeats = seatsData
+        .filter((seat: TableSeat) => seat.seat_number <= table.max_seats)
+        .sort((a: TableSeat, b: TableSeat) => a.seat_number - b.seat_number);
+
+      setSeats(filteredSeats);
+      setTableSeatCounts((previous) => ({
+        ...previous,
+        [table.id]: filteredSeats.filter((seat: TableSeat) => seat.user_id !== null).length,
+      }));
+
+      if (selectedSeat !== null && !filteredSeats.some((seat: TableSeat) => seat.seat_number === selectedSeat && seat.user_id === null)) {
+        setSelectedSeat(null);
+      }
     } catch (err: any) {
       console.error('Error loading seats:', err);
-      alert('Failed to load seat information');
+      if (err?.response?.status === 404) {
+        setShowJoinModal(false);
+        setSelectedTable(null);
+        setSelectedSeat(null);
+        setSeats([]);
+        await loadData({ silent: true });
+        alert('This table is no longer available.');
+        return;
+      }
+      if (showLoading) {
+        alert('Failed to load seat information');
+      }
     } finally {
-      setLoadingSeats(false);
+      if (showLoading) {
+        setLoadingSeats(false);
+      }
     }
+  };
+
+  useEffect(() => {
+    if (!showJoinModal || !selectedTable) {
+      return;
+    }
+
+    const refreshSeats = () => {
+      loadSeats(selectedTable, false);
+    };
+
+    const intervalId = window.setInterval(refreshSeats, 3000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [showJoinModal, selectedTable, selectedSeat]);
+
+  const getSeatPositionStyle = (seatIndex: number, totalSeats: number): CSSProperties => {
+    const normalizedSeats = Math.max(totalSeats, 2);
+    const angle = (seatIndex / normalizedSeats) * (Math.PI * 2) - Math.PI / 2;
+    const radiusXPercent = 40;
+    const radiusYPercent = 36;
+
+    return {
+      left: `${50 + Math.cos(angle) * radiusXPercent}%`,
+      top: `${50 + Math.sin(angle) * radiusYPercent}%`,
+    };
   };
 
   if (loading) {
@@ -248,7 +416,7 @@ export default function CommunityLobbyPage() {
                   </div>
                   <div className="info-row">
                     <span>Seats:</span>
-                    <strong>0/{table.max_seats}</strong>
+                    <strong>{tableSeatCounts[table.id] ?? 0}/{table.max_seats}</strong>
                   </div>
                   <div className="info-row">
                     <span>Agents:</span>
@@ -363,9 +531,15 @@ export default function CommunityLobbyPage() {
                   <input
                     type="number"
                     value={maxSeats}
-                    onChange={(e) => setMaxSeats(Number(e.target.value))}
+                    onChange={(e) => {
+                      const value = Number(e.target.value);
+                      if (Number.isNaN(value)) {
+                        return;
+                      }
+                      setMaxSeats(Math.max(2, Math.min(MAX_TABLE_SEATS, value)));
+                    }}
                     min="2"
-                    max="10"
+                    max={MAX_TABLE_SEATS}
                     required
                   />
                 </div>
@@ -439,30 +613,39 @@ export default function CommunityLobbyPage() {
               ) : (
                 <div className="poker-table-visual">
                   <div className="table-felt">
-                    {seats.map((seat) => {
-                      const isOccupied = seat.user_id !== null;
+                    {seats.map((seat, seatIndex) => {
+                      const isTakenByMe = seat.user_id !== null && seat.user_id === user?.id;
+                      const isOccupied = seat.user_id !== null && !isTakenByMe;
                       const isSelected = selectedSeat === seat.seat_number;
+                      const seatPositionStyle = getSeatPositionStyle(seatIndex, seats.length);
                       
                       return (
-                        <button
-                          key={seat.id}
-                          className={`seat-button seat-${seat.seat_number} ${isOccupied ? 'occupied' : 'available'} ${isSelected ? 'selected' : ''}`}
-                          onClick={() => !isOccupied && setSelectedSeat(seat.seat_number)}
-                          disabled={isOccupied}
-                          title={isOccupied ? `Occupied by ${seat.username}` : `Seat ${seat.seat_number} - Available`}
-                        >
-                          <div className="seat-number">{seat.seat_number}</div>
-                          {isOccupied ? (
-                            <div className="seat-player">
-                              <div className="player-avatar">👤</div>
-                              <div className="player-name">{seat.username}</div>
-                            </div>
-                          ) : (
-                            <div className="seat-empty">
-                              {isSelected ? '✓' : '+'}
-                            </div>
-                          )}
-                        </button>
+                        <div key={seat.id} className="seat-slot" style={seatPositionStyle}>
+                          <button
+                            className={`seat-button ${isOccupied ? 'occupied' : 'available'} ${isTakenByMe ? 'yours' : ''} ${isSelected ? 'selected' : ''}`}
+                            onClick={() => !isOccupied && setSelectedSeat(seat.seat_number)}
+                            disabled={isOccupied}
+                            title={
+                              isOccupied
+                                ? `Occupied by ${seat.username}`
+                                : isTakenByMe
+                                  ? `Seat ${seat.seat_number} - Your current seat`
+                                  : `Seat ${seat.seat_number} - Available`
+                            }
+                          >
+                            <div className="seat-number">{seat.seat_number}</div>
+                            {isOccupied || isTakenByMe ? (
+                              <div className="seat-player">
+                                <div className="player-avatar">👤</div>
+                                <div className="player-name">{isTakenByMe ? `${seat.username} (You)` : seat.username}</div>
+                              </div>
+                            ) : (
+                              <div className="seat-empty">
+                                {isSelected ? '✓' : '+'}
+                              </div>
+                            )}
+                          </button>
+                        </div>
                       );
                     })}
                   </div>

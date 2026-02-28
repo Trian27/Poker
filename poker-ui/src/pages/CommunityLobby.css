@@ -438,8 +438,13 @@
     0 8px 30px rgba(0, 0, 0, 0.4);
 }
 
-.seat-button {
+.seat-slot {
   position: absolute;
+  transform: translate(-50%, -50%);
+}
+
+.seat-button {
+  position: relative;
   width: 90px;
   height: 90px;
   border-radius: 50%;
@@ -471,6 +476,11 @@
   background: #f5f5f5;
   border-color: #ccc;
   cursor: not-allowed;
+}
+
+.seat-button.yours {
+  background: #fff8e1;
+  border-color: #ffb300;
 }
 
 .seat-button.selected {
@@ -534,18 +544,6 @@
 .seat-button.selected .seat-empty {
   color: white;
 }
-
-/* Seat positions around the table (oval) */
-.seat-1 { top: 5%; left: 50%; transform: translateX(-50%); }
-.seat-2 { top: 15%; left: 75%; }
-.seat-3 { top: 40%; left: 85%; }
-.seat-4 { bottom: 15%; left: 75%; }
-.seat-5 { bottom: 5%; left: 50%; transform: translateX(-50%); }
-.seat-6 { bottom: 15%; left: 15%; }
-.seat-7 { top: 40%; left: 5%; }
-.seat-8 { top: 15%; left: 15%; }
-.seat-9 { top: 30%; left: 50%; transform: translateX(-50%); }
-.seat-10 { bottom: 30%; left: 50%; transform: translateX(-50%); }
 
 .seat-selected-info {
   text-align: center;
