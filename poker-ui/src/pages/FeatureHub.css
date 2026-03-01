@@ -1,0 +1,132 @@
+.feature-page {
+  min-height: 100vh;
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+  color: #0f172a;
+  padding: 18px;
+}
+
+.feature-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.feature-header h1 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+.feature-header .secondary {
+  border: 1px solid #334155;
+  background: #f8fafc;
+  color: #0f172a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.feature-card {
+  background: #fff;
+  border: 1px solid #dbeafe;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08);
+}
+
+.feature-card h3 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
+
+.feature-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feature-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.feature-row input,
+.feature-row select,
+.feature-row textarea,
+.feature-card input,
+.feature-card select,
+.feature-card textarea {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 0.9rem;
+}
+
+.feature-card button {
+  border: 1px solid #1d4ed8;
+  background: #2563eb;
+  color: #fff;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.feature-card button.secondary {
+  border-color: #334155;
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+.feature-meta {
+  font-size: 0.82rem;
+  color: #475569;
+}
+
+.msg-thread {
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  padding: 10px;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.msg-bubble {
+  max-width: 86%;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #dbeafe;
+}
+
+.msg-bubble.mine {
+  align-self: flex-end;
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
+.emote-bank {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.coin-packages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

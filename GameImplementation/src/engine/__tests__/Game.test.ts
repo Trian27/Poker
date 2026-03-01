@@ -1,5 +1,6 @@
 import { Game, GameConfig } from '../Game';
 import { Player } from '../Player';
+import { Card } from '../Card';
 
 describe('Game', () => {
   let game: Game;
@@ -32,15 +33,50 @@ describe('Game', () => {
         .toThrow('Maximum 10 players allowed');
     });
 
-    it('should throw error when adding players after game started', () => {
+    it('should seat players during active hands and queue when not at big blind', () => {
       game.addPlayer(player1);
       game.addPlayer(player2);
       game.startHand();
       
       const player3 = new Player('p3', 'Charlie', 1000);
-      // After blind join prevention, the error message is more specific
-      expect(() => game.addPlayer(player3))
-        .toThrow('You can only join when you would be the big blind');
+      expect(() => game.addPlayer(player3)).not.toThrow();
+
+      const state = game.getGameState();
+      const queued = state.players.find((player) => player.id === 'p3');
+      expect(queued).toBeDefined();
+      expect(queued?.waitingForBigBlind).toBe(true);
+      expect(queued?.isActive).toBe(false);
+    });
+
+    it('should eventually activate queued players when their big blind arrives', () => {
+      const seatedP1 = new Player('p1', 'Alice', 1000, 1);
+      const seatedP2 = new Player('p2', 'Bob', 1000, 2);
+      const queuedP3 = new Player('p3', 'Charlie', 1000, 3);
+      game.addPlayer(seatedP1);
+      game.addPlayer(seatedP2);
+      game.startHand();
+
+      game.addPlayer(queuedP3);
+      let queuedState = game.getGameState().players.find((player) => player.id === 'p3');
+      expect(queuedState?.waitingForBigBlind).toBe(true);
+
+      for (let i = 0; i < 6; i++) {
+        const current = game.getGameState();
+        if (current.stage !== 'complete') {
+          const actorId = current.players[current.currentPlayerIndex]?.id;
+          if (actorId) {
+            game.handleAction(actorId, 'fold');
+          }
+        }
+        game.startHand();
+        queuedState = game.getGameState().players.find((player) => player.id === 'p3');
+        if (!queuedState?.waitingForBigBlind) {
+          break;
+        }
+      }
+
+      expect(queuedState?.waitingForBigBlind).toBe(false);
+      expect(queuedState?.isActive).toBe(true);
     });
   });
 
@@ -681,6 +717,99 @@ describe('Game', () => {
       const state = game.getGameState();
       expect(state.stage).toBe('river');
       expect(state.communityCards).toHaveLength(5);
+    });
+  });
+
+  describe('Side Pot Handling', () => {
+    it('should distribute main and side pots to the correct winners', () => {
+      const sidePotGame = new Game({ smallBlind: 10, bigBlind: 20, initialStack: 1000 });
+      const p1 = new Player('p1', 'Alice', 1000);
+      const p2 = new Player('p2', 'Bob', 1000);
+      const p3 = new Player('p3', 'Charlie', 1000);
+      sidePotGame.addPlayer(p1);
+      sidePotGame.addPlayer(p2);
+      sidePotGame.addPlayer(p3);
+      sidePotGame.startHand();
+
+      // Force deterministic showdown cards:
+      // p1 wins main pot with ace-high flush
+      // p2 wins side pot against p3
+      p1.dealHoleCards([new Card('hearts', 'A'), new Card('hearts', 'Q')]);
+      p2.dealHoleCards([new Card('clubs', 'K'), new Card('spades', 'K')]);
+      p3.dealHoleCards([new Card('clubs', 'Q'), new Card('clubs', 'J')]);
+      (sidePotGame as any).communityCards = [
+        new Card('hearts', '2'),
+        new Card('hearts', '3'),
+        new Card('hearts', '4'),
+        new Card('clubs', '9'),
+        new Card('diamonds', 'K'),
+      ];
+
+      // Contributions: p1=100, p2=300, p3=300 => total pot 700
+      (p1 as any).stack = 900;
+      (p2 as any).stack = 700;
+      (p3 as any).stack = 700;
+      (p1 as any).totalBetThisRound = 100;
+      (p2 as any).totalBetThisRound = 300;
+      (p3 as any).totalBetThisRound = 300;
+      (sidePotGame as any).pot = 700;
+
+      (sidePotGame as any).showdown();
+
+      const result = sidePotGame.getLastHandResult();
+      expect(result).not.toBeNull();
+      expect(result?.winners).toHaveLength(2);
+
+      const winnerById = new Map(result?.winners.map((winner) => [winner.playerId, winner.amount]));
+      expect(winnerById.get('p1')).toBe(300);
+      expect(winnerById.get('p2')).toBe(400);
+      expect(winnerById.get('p3')).toBeUndefined();
+
+      expect(p1.getStack()).toBe(1200);
+      expect(p2.getStack()).toBe(1100);
+      expect(p3.getStack()).toBe(700);
+    });
+
+    it('should expose side pots separately from total pot in game state', () => {
+      const sidePotGame = new Game({ smallBlind: 10, bigBlind: 20, initialStack: 1000 });
+      const p1 = new Player('p1', 'Alice', 1000);
+      const p2 = new Player('p2', 'Bob', 1000);
+      const p3 = new Player('p3', 'Charlie', 1000);
+      sidePotGame.addPlayer(p1);
+      sidePotGame.addPlayer(p2);
+      sidePotGame.addPlayer(p3);
+      sidePotGame.startHand();
+
+      (p1 as any).totalBetThisRound = 100;
+      (p2 as any).totalBetThisRound = 300;
+      (p3 as any).totalBetThisRound = 300;
+      (p1 as any).isAllIn = true;
+      (sidePotGame as any).pot = 700;
+
+      const state = sidePotGame.getGameState();
+      expect(state.pot).toBe(700);
+      expect(state.sidePots).toHaveLength(1);
+      expect(state.sidePots[0].amount).toBe(400);
+    });
+
+    it('should not expose side pot labels when nobody is all-in', () => {
+      const regularBetGame = new Game({ smallBlind: 10, bigBlind: 20, initialStack: 1000 });
+      const p1 = new Player('p1', 'Alice', 1000);
+      const p2 = new Player('p2', 'Bob', 1000);
+      const p3 = new Player('p3', 'Charlie', 1000);
+      regularBetGame.addPlayer(p1);
+      regularBetGame.addPlayer(p2);
+      regularBetGame.addPlayer(p3);
+      regularBetGame.startHand();
+
+      (p1 as any).totalBetThisRound = 100;
+      (p2 as any).totalBetThisRound = 300;
+      (p3 as any).totalBetThisRound = 300;
+      (regularBetGame as any).pot = 700;
+
+      const state = regularBetGame.getGameState();
+      expect(state.pot).toBe(700);
+      expect(state.sidePots).toHaveLength(0);
     });
   });
 });

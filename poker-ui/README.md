@@ -32,6 +32,37 @@ npm run build
 npm run preview
 ```
 
+## Responsive Smoke Tests (Playwright)
+
+These tests protect layout stability across major aspect ratios (phones, tablets, laptops, desktop).
+
+### One-time Browser Install
+```bash
+npx playwright install chromium
+```
+
+### Run the Responsive Smoke Matrix
+```bash
+npm run test:ui:smoke
+```
+
+### Useful Variants
+```bash
+# Faster visual debugging on key viewports
+npm run test:ui:smoke:headed
+
+# Open HTML report from the last run
+npm run test:ui:smoke:report
+```
+
+What this covers:
+- Login layout
+- Register layout
+- Authenticated dashboard layout
+- Authenticated community lobby layout
+
+The suite uses mocked API responses so it is deterministic and does not require backend services running.
+
 ## Project Structure
 
 ```

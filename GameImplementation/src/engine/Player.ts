@@ -12,6 +12,7 @@ export interface PlayerState {
   hasFolded: boolean;
   isAllIn: boolean;
   isActive: boolean; // Still in the hand
+  waitingForBigBlind: boolean;
   seatNumber?: number; // Position at the table
   timeBankMs: number;
   timeBankSeconds: number;
@@ -31,6 +32,7 @@ export class Player {
   private hasFolded: boolean = false;
   private isAllIn: boolean = false;
   private isActive: boolean = true;
+  private waitingForBigBlind: boolean = false;
   private timeBankMs: number = 30000;
 
   constructor(id: string, name: string, initialStack: number, seatNumber?: number, initialTimeBankMs: number = 30000) {
@@ -106,7 +108,7 @@ export class Player {
     this.holeCards = [];
     this.hasFolded = false;
     this.isAllIn = false;
-    this.isActive = this.stack > 0; // Only active if they have chips
+    this.isActive = this.stack > 0 && !this.waitingForBigBlind; // Sit out while waiting to post BB
   }
 
   /**
@@ -130,6 +132,7 @@ export class Player {
       hasFolded: this.hasFolded,
       isAllIn: this.isAllIn,
       isActive: this.isActive,
+      waitingForBigBlind: this.waitingForBigBlind,
       seatNumber: this.seatNumber,
       timeBankMs: this.timeBankMs,
       timeBankSeconds: Math.ceil(this.timeBankMs / 1000)
@@ -183,6 +186,17 @@ export class Player {
    */
   setActive(): void {
     this.isActive = true;
+  }
+
+  isWaitingForBigBlind(): boolean {
+    return this.waitingForBigBlind;
+  }
+
+  setWaitingForBigBlind(waiting: boolean): void {
+    this.waitingForBigBlind = waiting;
+    if (waiting) {
+      this.isActive = false;
+    }
   }
 
   getTimeBankMs(): number {

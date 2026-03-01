@@ -6,9 +6,15 @@
 import { io as ioc, Socket as ClientSocket } from 'socket.io-client';
 import jwt from 'jsonwebtoken';
 import { PokerServer } from '../server';
+import { redis } from '../redis';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-in-production';
 const TEST_PORT = 3002; // Different port for testing
+
+const simulateNetworkDrop = (client: ClientSocket): void => {
+  const socketWithEngine = client as ClientSocket & { io?: { engine?: { close?: () => void } } };
+  socketWithEngine.io?.engine?.close?.();
+};
 
 describe('Chat Functionality', () => {
   let server: PokerServer;
@@ -21,7 +27,14 @@ describe('Chat Functionality', () => {
   });
 
   afterAll((done) => {
-    serverInstance?.close(done);
+    serverInstance?.close(async () => {
+      try {
+        await redis.quit();
+      } catch {
+        // Ignore if already closed by another cleanup path.
+      }
+      done();
+    });
   });
 
   describe('Chat Messages', () => {
@@ -44,11 +57,13 @@ describe('Chat Functionality', () => {
       );
 
       client1 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token1 }
+        auth: { token: token1 },
+        reconnection: false
       });
 
       client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       let connectedCount = 0;
@@ -62,8 +77,14 @@ describe('Chat Functionality', () => {
     });
 
     afterEach(() => {
-      if (client1) client1.disconnect();
-      if (client2) client2.disconnect();
+      if (client1) {
+        client1.emit('leave_game');
+        client1.disconnect();
+      }
+      if (client2) {
+        client2.emit('leave_game');
+        client2.disconnect();
+      }
     });
 
     it('should broadcast chat messages to both players in game', (done) => {
@@ -148,7 +169,8 @@ describe('Chat Functionality', () => {
       );
 
       const client3 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token3 }
+        auth: { token: token3 },
+        reconnection: false
       });
 
       client3.on('connect', () => {
@@ -197,7 +219,7 @@ describe('Chat Functionality', () => {
 
         // After messages sent, disconnect client2
         setTimeout(() => {
-          client2.disconnect();
+          simulateNetworkDrop(client2);
           
           // Reconnect client2
           setTimeout(() => {
@@ -233,7 +255,8 @@ describe('Chat Functionality', () => {
       );
 
       client = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token }
+        auth: { token },
+        reconnection: false
       });
 
       client.on('connect', done);
@@ -244,17 +267,17 @@ describe('Chat Functionality', () => {
     });
 
     it('should reject empty messages', (done) => {
+      const failTimer = setTimeout(() => {
+        done(new Error('Should reject empty message'));
+      }, 1000);
+
       client.emit('chat_message', { message: '' });
       
       client.on('error', (data: any) => {
+        clearTimeout(failTimer);
         expect(data.message).toContain('empty');
         done();
       });
-
-      // If no error after 1 second, test fails
-      setTimeout(() => {
-        done(new Error('Should reject empty message'));
-      }, 1000);
     });
 
     it('should trim whitespace from messages', (done) => {
@@ -270,7 +293,8 @@ describe('Chat Functionality', () => {
       );
 
       const client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       client2.on('connect', () => {

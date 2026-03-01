@@ -7,6 +7,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { io as ioc, Socket as ClientSocket } from 'socket.io-client';
 import jwt from 'jsonwebtoken';
 import { PokerServer } from '../server';
+import { redis } from '../redis';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-in-production';
 const TEST_PORT = 3001; // Different port for testing
@@ -23,7 +24,14 @@ describe('Socket.IO Authentication', () => {
   });
 
   afterAll((done) => {
-    serverInstance?.close(done);
+    serverInstance?.close(async () => {
+      try {
+        await redis.quit();
+      } catch {
+        // Ignore if already closed by another cleanup path.
+      }
+      done();
+    });
   });
 
   describe('JWT Authentication', () => {

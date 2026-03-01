@@ -6,10 +6,16 @@
 import { io as ioc, Socket as ClientSocket } from 'socket.io-client';
 import jwt from 'jsonwebtoken';
 import { PokerServer } from '../server';
+import { redis } from '../redis';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-in-production';
 const TEST_PORT = 3003; // Different port for testing
 const RECONNECT_TIMEOUT = 30000; // 30 seconds
+
+const simulateNetworkDrop = (client: ClientSocket): void => {
+  const socketWithEngine = client as ClientSocket & { io?: { engine?: { close?: () => void } } };
+  socketWithEngine.io?.engine?.close?.();
+};
 
 describe('Reconnection Logic', () => {
   let server: PokerServer;
@@ -22,7 +28,14 @@ describe('Reconnection Logic', () => {
   });
 
   afterAll((done) => {
-    serverInstance?.close(done);
+    serverInstance?.close(async () => {
+      try {
+        await redis.quit();
+      } catch {
+        // Ignore if already closed by another cleanup path.
+      }
+      done();
+    });
   });
 
   describe('Successful Reconnection', () => {
@@ -41,15 +54,18 @@ describe('Reconnection Logic', () => {
       );
 
       const client1 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token1 }
+        auth: { token: token1 },
+        reconnection: false
       });
 
       const client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       let gameId: string;
       let gameStarted = false;
+      let shouldReconnect = true;
 
       // Wait for both to connect
       let connectedCount = 0;
@@ -71,15 +87,17 @@ describe('Reconnection Logic', () => {
 
         // Disconnect client1
         setTimeout(() => {
-          client1.disconnect();
+          simulateNetworkDrop(client1);
         }, 500);
       });
 
       client1.on('disconnect', () => {
-        if (gameStarted) {
+        if (gameStarted && shouldReconnect) {
           // Reconnect within timeout (1 second)
           setTimeout(() => {
-            client1.connect();
+            if (shouldReconnect) {
+              client1.connect();
+            }
           }, 1000);
         }
       });
@@ -89,6 +107,7 @@ describe('Reconnection Logic', () => {
         expect(data.gameId).toBe(gameId);
         expect(data.gameState).toBeTruthy();
         
+        shouldReconnect = false;
         client1.disconnect();
         client2.disconnect();
         done();
@@ -110,15 +129,18 @@ describe('Reconnection Logic', () => {
       );
 
       const client1 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token1 }
+        auth: { token: token1 },
+        reconnection: false
       });
 
       const client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       let originalGameState: any;
       let gameStarted = false;
+      let shouldReconnect = true;
 
       let connectedCount = 0;
       const checkConnected = () => {
@@ -138,14 +160,16 @@ describe('Reconnection Logic', () => {
 
         // Disconnect after recording state
         setTimeout(() => {
-          client1.disconnect();
+          simulateNetworkDrop(client1);
         }, 500);
       });
 
       client1.on('disconnect', () => {
-        if (gameStarted) {
+        if (gameStarted && shouldReconnect) {
           setTimeout(() => {
-            client1.connect();
+            if (shouldReconnect) {
+              client1.connect();
+            }
           }, 1000);
         }
       });
@@ -158,6 +182,7 @@ describe('Reconnection Logic', () => {
         expect(restoredState.pot).toBe(originalGameState.pot);
         expect(restoredState.stage).toBe(originalGameState.stage);
         
+        shouldReconnect = false;
         client1.disconnect();
         client2.disconnect();
         done();
@@ -179,14 +204,17 @@ describe('Reconnection Logic', () => {
       );
 
       const client1 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token1 }
+        auth: { token: token1 },
+        reconnection: false
       });
 
       const client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       let gameStarted = false;
+      let shouldReconnect = true;
       const testMessage = 'Test message before disconnect';
 
       let connectedCount = 0;
@@ -209,14 +237,16 @@ describe('Reconnection Logic', () => {
         
         // Then disconnect client1
         setTimeout(() => {
-          client1.disconnect();
+          simulateNetworkDrop(client1);
         }, 500);
       });
 
       client1.on('disconnect', () => {
-        if (gameStarted) {
+        if (gameStarted && shouldReconnect) {
           setTimeout(() => {
-            client1.connect();
+            if (shouldReconnect) {
+              client1.connect();
+            }
           }, 1000);
         }
       });
@@ -229,6 +259,7 @@ describe('Reconnection Logic', () => {
         const found = data.messages.some((m: any) => m.message === testMessage);
         expect(found).toBe(true);
         
+        shouldReconnect = false;
         client1.disconnect();
         client2.disconnect();
         done();
@@ -250,14 +281,17 @@ describe('Reconnection Logic', () => {
       );
 
       const client1 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token1 }
+        auth: { token: token1 },
+        reconnection: false
       });
 
       const client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       let gameStarted = false;
+      let shouldReconnect = true;
 
       let connectedCount = 0;
       const checkConnected = () => {
@@ -274,14 +308,16 @@ describe('Reconnection Logic', () => {
       client1.on('game_started', () => {
         gameStarted = true;
         setTimeout(() => {
-          client1.disconnect();
+          simulateNetworkDrop(client1);
         }, 500);
       });
 
       client1.on('disconnect', () => {
-        if (gameStarted) {
+        if (gameStarted && shouldReconnect) {
           setTimeout(() => {
-            client1.connect();
+            if (shouldReconnect) {
+              client1.connect();
+            }
           }, 1000);
         }
       });
@@ -290,6 +326,7 @@ describe('Reconnection Logic', () => {
       client2.on('player_reconnected', (data: any) => {
         expect(data.playerName).toBe(`alice_${testId}`);
         
+        shouldReconnect = false;
         client1.disconnect();
         client2.disconnect();
         done();
@@ -310,7 +347,8 @@ describe('Reconnection Logic', () => {
       );
 
       const client = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token }
+        auth: { token },
+        reconnection: false
       });
 
       client.on('connect', () => {
@@ -336,15 +374,18 @@ describe('Reconnection Logic', () => {
       );
 
       const client1 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token1 }
+        auth: { token: token1 },
+        reconnection: false
       });
 
       const client2 = ioc(`http://localhost:${TEST_PORT}`, {
-        auth: { token: token2 }
+        auth: { token: token2 },
+        reconnection: false
       });
 
       let oldSocketId: string;
       let gameStarted = false;
+      let shouldReconnect = true;
 
       let connectedCount = 0;
       const checkConnected = () => {
@@ -363,14 +404,16 @@ describe('Reconnection Logic', () => {
         gameStarted = true;
 
         setTimeout(() => {
-          client1.disconnect();
+          simulateNetworkDrop(client1);
         }, 500);
       });
 
       client1.on('disconnect', () => {
-        if (gameStarted) {
+        if (gameStarted && shouldReconnect) {
           setTimeout(() => {
-            client1.connect();
+            if (shouldReconnect) {
+              client1.connect();
+            }
           }, 1000);
         }
       });
@@ -382,6 +425,7 @@ describe('Reconnection Logic', () => {
         expect(newSocketId).not.toBe(oldSocketId);
         expect(data.gameState).toBeTruthy();
         
+        shouldReconnect = false;
         client1.disconnect();
         client2.disconnect();
         done();

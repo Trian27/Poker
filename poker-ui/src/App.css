@@ -8,3 +8,26 @@
 * {
   box-sizing: border-box;
 }
+
+.learning-fab {
+  position: fixed;
+  right: 18px;
+  bottom: 62px;
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid rgba(30, 41, 59, 0.35);
+  background: rgba(255, 255, 255, 0.96);
+  color: #0f172a;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.15rem;
+  text-decoration: none;
+  z-index: 250;
+  box-shadow: 0 10px 22px rgba(15, 23, 42, 0.2);
+}
+
+.learning-fab:hover {
+  transform: translateY(-1px);
+}

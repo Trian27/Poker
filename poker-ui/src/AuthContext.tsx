@@ -1,32 +1,11 @@
 /**
  * Authentication context and provider
  */
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import type { ReactNode } from 'react';
 import type { User } from './types';
-import { authApi, clearApiAuthStorage, setApiAuthToken } from './api';
-
-interface AuthContextType {
-  user: User | null;
-  token: string | null;
-  login: (token: string, user: User) => void;
-  logout: () => void;
-  setToken: (token: string | null) => void;
-  setUser: (user: User) => void;
-  isAuthenticated: boolean;
-  isReady: boolean;
-  refreshUser: () => Promise<void>;
-}
-
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
-
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within AuthProvider');
-  }
-  return context;
-};
+import { authApi, clearApiAuthStorage, getApiAuthToken, setApiAuthToken } from './api';
+import { AuthContext } from './auth-context';
 
 interface AuthProviderProps {
   children: ReactNode;
@@ -62,7 +41,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [token, setTokenState] = useState<string | null>(null);
   const [isReady, setIsReady] = useState(false);
 
-  const refreshUser = async () => {
+  const refreshUser = useCallback(async () => {
     try {
       const userData = await authApi.getCurrentUser();
       const newUser: User = {
@@ -74,11 +53,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         is_banned: userData.is_banned,
       };
       setUser(newUser);
-      persistAuthForUser(token, newUser);
+      persistAuthForUser(getApiAuthToken(), newUser);
     } catch (err) {
       console.error('Failed to refresh user info:', err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     const storedToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
@@ -107,7 +86,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
       // Refresh user info if it seems incomplete (missing username or is_admin)
       if (!parsedUser.username || parsedUser.is_admin === undefined) {
-        setTimeout(() => refreshUser(), 100);
+        setTimeout(() => {
+          void refreshUser();
+        }, 100);
       }
     } catch (err) {
       console.error('Failed to parse stored auth session:', err);
@@ -115,7 +96,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       setApiAuthToken(null);
     }
     setIsReady(true);
-  }, []);
+  }, [refreshUser]);
 
   const login = (newToken: string, newUser: User) => {
     setTokenState(newToken);

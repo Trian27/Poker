@@ -34,6 +34,14 @@ interface ChatMessage {
   gameId?: string;
 }
 
+interface TableEmoteMessage {
+  id: string;
+  userId: number;
+  username: string;
+  emoji: string;
+  timestamp: number;
+}
+
 interface DisconnectedPlayer {
   playerInfo: ConnectedPlayer;
   gameId: string;
@@ -73,7 +81,9 @@ export class PokerServer {
   private tableReadiness: Map<string, TableReadiness> = new Map(); // gameId -> table readiness state
   private recentlyReconnected: Set<string> = new Set(); // playerId -> marker to avoid immediate reconnection loops
   private actionTimers: Map<string, NodeJS.Timeout> = new Map(); // gameId -> timeout handle
+  private disconnectCleanupTimers: Map<string, NodeJS.Timeout> = new Map(); // socketId -> reconnect timeout
   private showdownCardReveals: Map<string, Map<number, boolean>> = new Map(); // gameId -> userId -> shown
+  private apiDrivenUsersByGame: Map<string, Set<number>> = new Map(); // gameId -> userIds acting via agent API
   private readonly RECONNECT_TIMEOUT = 30000; // 30 seconds to reconnect
   private readonly HAND_RESULT_DELAY = 7000; // 7 seconds to show showdown results
   private server: any; // HTTP server instance
@@ -87,6 +97,10 @@ export class PokerServer {
     // Create HTTP server with Express
     const httpServer = require('http').createServer(this.app);
     this.server = httpServer;
+    httpServer.on('close', () => {
+      this.clearAllActionTimers();
+      this.clearAllDisconnectCleanupTimers();
+    });
     
     this.io = new Server(httpServer, {
       cors: {
@@ -216,31 +230,68 @@ export class PokerServer {
   /**
    * Check if a table should be deleted (non-permanent tables with no players)
    */
-  private async checkAndCleanupTable(gameId: string): Promise<void> {
+  private async purgeLocalTableRuntime(gameId: string): Promise<void> {
+    await GameStateStorage.deleteGameState(gameId);
+    this.clearActionTimer(gameId);
+    this.showdownCardReveals.delete(gameId);
+    this.apiDrivenUsersByGame.delete(gameId);
+    this.tableReadiness.delete(gameId);
+    this.io.in(gameId).socketsLeave(gameId);
+
+    for (const [playerId, mappedGameId] of Array.from(this.playerGameMap.entries())) {
+      if (mappedGameId === gameId) {
+        this.playerGameMap.delete(playerId);
+      }
+    }
+
+    for (const [socketId, playerInfo] of Array.from(this.connectedPlayers.entries())) {
+      if (playerInfo.gameId === gameId) {
+        this.connectedPlayers.set(socketId, {
+          ...playerInfo,
+          gameId: undefined
+        });
+      }
+    }
+
+    for (const [socketId, disconnectedInfo] of Array.from(this.disconnectedPlayers.entries())) {
+      if (disconnectedInfo.gameId === gameId) {
+        this.disconnectedPlayers.delete(socketId);
+      }
+    }
+  }
+
+  private async checkAndCleanupTable(gameId: string): Promise<boolean> {
     if (process.env.NODE_ENV === 'test') {
-      return; // Skip cleanup in tests
+      return false; // Skip cleanup in tests
     }
 
     try {
       // Extract table ID from gameId (format: table_123)
       const tableIdMatch = gameId.match(/^table_(\d+)$/);
-      if (!tableIdMatch) return;
+      if (!tableIdMatch) {
+        return false;
+      }
 
       const tableId = parseInt(tableIdMatch[1]);
 
-      // Check if table is empty (no seated players)
-      const tableState = this.tableReadiness.get(gameId);
-      if (tableState && tableState.seatedPlayers.size === 0) {
-        // Call FastAPI to check if table is permanent and delete if not
-        const response = await axios.post(`${FASTAPI_URL}/api/internal/tables/${tableId}/check-cleanup`);
-        
-        if (response.data.deleted) {
-          console.log(`🗑️  Non-permanent table ${tableId} deleted - no players remaining`);
-          this.tableReadiness.delete(gameId);
-        }
+      // Always ask auth-api; it is the source of truth for seat occupancy/permanence.
+      const response = await axios.post(`${FASTAPI_URL}/api/internal/tables/${tableId}/check-cleanup`);
+      const deleted = Boolean(response.data?.deleted);
+      const tableMissing = String(response.data?.message || '').toLowerCase().includes('not found');
+
+      if (deleted || tableMissing) {
+        await this.purgeLocalTableRuntime(gameId);
       }
+
+      if (deleted) {
+        console.log(`🗑️  Non-permanent table ${tableId} deleted - no players remaining`);
+      } else if (tableMissing) {
+        console.log(`🧹 Cleared stale local runtime for missing table ${tableId}`);
+      }
+      return deleted;
     } catch (error: any) {
       console.error(`⚠️  Failed to check table cleanup for ${gameId}:`, error.response?.data || error.message);
+      return false;
     }
   }
 
@@ -334,9 +385,7 @@ export class PokerServer {
           if (liveGameData) {
             try {
               const liveGame = Game.fromJSON(liveGameData);
-              this.io.to(socketId).emit('game_state_update', {
-                gameState: liveGame.getPlayerGameState(playerId)
-              });
+              this.emitPlayerState(socketId, gameId, playerId, liveGame);
               const revealState = this.showdownCardReveals.get(gameId);
               if (revealState) {
                 for (const [revealedUserId, show] of revealState.entries()) {
@@ -448,6 +497,7 @@ export class PokerServer {
       console.warn(`⚠️  Stale reconnection for ${user.username}. Expected ${gameId}, but player now in ${currentGameId}. Skipping.`);
       this.connectedPlayers.delete(oldSocketId);
       this.disconnectedPlayers.delete(oldSocketId);
+      this.clearDisconnectCleanupTimer(oldSocketId);
       return;
     }
 
@@ -466,6 +516,7 @@ export class PokerServer {
 
     // Remove from disconnected list
     this.disconnectedPlayers.delete(oldSocketId);
+    this.clearDisconnectCleanupTimer(oldSocketId);
 
     // Re-add to table readiness tracking
     for (const [gId, tableState] of this.tableReadiness.entries()) {
@@ -502,7 +553,8 @@ export class PokerServer {
     this.io.to(socket.id).emit('reconnected', {
       message: 'Successfully reconnected to game',
       gameId,
-      gameState: gameStateForPlayer
+      gameState: gameStateForPlayer,
+      botUserIds: this.getApiDrivenUserIds(gameId),
     });
 
     const chatMessages = (cachedChatMessages && cachedChatMessages.length > 0)
@@ -529,19 +581,16 @@ export class PokerServer {
    */
   private handleChatMessage(socket: AuthenticatedSocket, message: string, gameId?: string): void {
     const user = socket.data.user;
-    const playerInfo = this.connectedPlayers.get(socket.id);
-
-    if (!playerInfo) return;
-
-    // Validate message
-    const trimmedMessage = message.trim();
+    const trimmedMessage = String(message ?? '').trim();
     if (!trimmedMessage || trimmedMessage.length === 0) {
       socket.emit('error', { message: 'Cannot send empty message' });
       return;
     }
 
+    const playerInfo = this.connectedPlayers.get(socket.id);
+
     // Get the actual game ID if not provided
-    const actualGameId = gameId || this.playerGameMap.get(playerInfo.playerId);
+    const actualGameId = gameId || (playerInfo ? this.playerGameMap.get(playerInfo.playerId) : undefined);
     
     const chatMessage: ChatMessage = {
       id: `msg_${Date.now()}_${Math.random().toString(36).substring(7)}`,
@@ -572,6 +621,36 @@ export class PokerServer {
       // Send to just this socket if not in a game
       this.io.to(socket.id).emit('chat_message', chatMessage);
     }
+  }
+
+  private handleTableEmote(socket: AuthenticatedSocket, emoji: string): void {
+    const user = socket.data.user;
+    const playerInfo = this.connectedPlayers.get(socket.id);
+    if (!playerInfo) {
+      return;
+    }
+
+    const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
+    if (!gameId) {
+      this.io.to(socket.id).emit('error', { message: 'You are not in a game' });
+      return;
+    }
+
+    const normalizedEmoji = (emoji || '').trim();
+    if (!normalizedEmoji || normalizedEmoji.length > 16) {
+      this.io.to(socket.id).emit('error', { message: 'Invalid emote' });
+      return;
+    }
+
+    const emoteMessage: TableEmoteMessage = {
+      id: `emote_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      userId: user.id,
+      username: user.username,
+      emoji: normalizedEmoji,
+      timestamp: Date.now(),
+    };
+
+    this.io.to(gameId).emit('table_emote', emoteMessage);
   }
 
   private setupSocketHandlers(): void {
@@ -606,9 +685,7 @@ export class PokerServer {
           const gameData = await GameStateStorage.loadGameState(existingPlayer.gameId);
           if (gameData) {
             const game = Game.fromJSON(gameData);
-            this.io.to(socket.id).emit('game_state_update', {
-              gameState: game.getPlayerGameState(existingPlayer.playerId)
-            });
+            this.emitPlayerState(socket.id, existingPlayer.gameId, existingPlayer.playerId, game);
           }
           return;
         }
@@ -642,6 +719,10 @@ export class PokerServer {
 
       socket.on('chat_message', ({ message, gameId }: { message: string; gameId?: string }) => {
         this.handleChatMessage(socket, message, gameId);
+      });
+
+      socket.on('table_emote', ({ emoji }: { emoji: string }) => {
+        this.handleTableEmote(socket, emoji);
       });
 
       socket.on('leave_game', (payload?: { tableId?: number }) => {
@@ -865,20 +946,49 @@ export class PokerServer {
       const tableId = parseInt(gameId.split('_')[1]);
       
       // Get community_id from table readiness info
-      const tableState = this.tableReadiness.get(gameId);
+      let tableState = this.tableReadiness.get(gameId);
       if (!tableState) {
-        console.warn(`⚠️  No table state found for ${gameId}, skipping history recording`);
-        return;
+        tableState = {
+          gameId,
+          seatedPlayers: new Set(),
+          connectedPlayers: new Set(),
+          playerIds: new Map(),
+          gameStarted: false,
+        };
+        this.tableReadiness.set(gameId, tableState);
       }
       
-      // Get community_id from one of the connected players
-      let communityId: number | null = null;
-      let tableName = `Table ${tableId}`;
-      
-      for (const [, playerInfo] of this.connectedPlayers.entries()) {
-        if (playerInfo.gameId === gameId && playerInfo.communityId) {
-          communityId = playerInfo.communityId;
-          break;
+      // Prefer persisted table metadata.
+      let communityId: number | null = tableState.communityId ?? null;
+      let tableName = tableState.tableName || `Table ${tableId}`;
+
+      // Fallback to connected player metadata.
+      if (!communityId) {
+        for (const [, playerInfo] of this.connectedPlayers.entries()) {
+          if (playerInfo.gameId === gameId && playerInfo.communityId) {
+            communityId = playerInfo.communityId;
+            break;
+          }
+        }
+      }
+
+      // Final fallback: ask auth-api for table metadata.
+      if (!communityId || !tableState.tableName) {
+        try {
+          const tableResponse = await axios.get(`${FASTAPI_URL}/api/internal/tables/${tableId}`, { timeout: 5000 });
+          const resolvedCommunityId = Number(tableResponse.data?.community_id);
+          const resolvedTableName = String(tableResponse.data?.name || '').trim();
+
+          if (!communityId && Number.isFinite(resolvedCommunityId) && resolvedCommunityId > 0) {
+            communityId = resolvedCommunityId;
+            tableState.communityId = resolvedCommunityId;
+          }
+          if (resolvedTableName) {
+            tableName = resolvedTableName;
+            tableState.tableName = resolvedTableName;
+          }
+        } catch (error: any) {
+          console.warn(`⚠️  Failed to resolve table metadata for history (${gameId}):`, error.response?.data || error.message);
         }
       }
       
@@ -901,7 +1011,7 @@ export class PokerServer {
       });
       
       if (response.data.success) {
-        console.log(`📜 Hand history recorded: ${response.data.hand_id}`);
+        console.log(`📜 Hand history recorded: ${response.data.hand_id} (linked_sessions=${response.data.linked_sessions ?? 0})`);
       }
     } catch (error: any) {
       // Log but don't throw - we don't want to crash the game if history recording fails
@@ -938,6 +1048,79 @@ export class PokerServer {
   private extractUserIdFromPlayerId(playerId: string): number | null {
     const match = playerId.match(/^player_(\d+)_/);
     return match ? Number(match[1]) : null;
+  }
+
+  private resolvePlayerIdForUser(gameId: string, userId: number, game?: Game): string | undefined {
+    // Prefer connected socket mappings that are explicitly tied to this game.
+    for (const [, playerInfo] of this.connectedPlayers.entries()) {
+      if (playerInfo.userId !== userId) {
+        continue;
+      }
+      const mappedGameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
+      if (mappedGameId === gameId) {
+        return playerInfo.playerId;
+      }
+    }
+
+    // Fall back to table readiness map (rebuilt on seat/re-seat).
+    const readinessState = this.tableReadiness.get(gameId);
+    const readinessPlayerId = readinessState?.playerIds?.get(userId.toString());
+    if (readinessPlayerId) {
+      return readinessPlayerId;
+    }
+
+    // Fall back to player->game index.
+    for (const [playerId, mappedGameId] of this.playerGameMap.entries()) {
+      const mappedUserId = this.extractUserIdFromPlayerId(playerId);
+      if (mappedGameId === gameId && mappedUserId === userId) {
+        return playerId;
+      }
+    }
+
+    // Final fallback: inspect current game player list if available.
+    if (game) {
+      const player = game.getPlayers().find((entry) => this.extractUserIdFromPlayerId(entry.id) === userId);
+      if (player) {
+        return player.id;
+      }
+    }
+
+    return undefined;
+  }
+
+  private getApiDrivenUserIds(gameId: string): number[] {
+    const users = this.apiDrivenUsersByGame.get(gameId);
+    if (!users || users.size === 0) {
+      return [];
+    }
+    return Array.from(users.values());
+  }
+
+  private markUserAsApiDriven(gameId: string, userId: number): void {
+    let users = this.apiDrivenUsersByGame.get(gameId);
+    if (!users) {
+      users = new Set<number>();
+      this.apiDrivenUsersByGame.set(gameId, users);
+    }
+    users.add(userId);
+  }
+
+  private clearApiDrivenUser(gameId: string, userId: number): void {
+    const users = this.apiDrivenUsersByGame.get(gameId);
+    if (!users) {
+      return;
+    }
+    users.delete(userId);
+    if (users.size === 0) {
+      this.apiDrivenUsersByGame.delete(gameId);
+    }
+  }
+
+  private emitPlayerState(socketId: string, gameId: string, playerId: string, game: Game): void {
+    this.io.to(socketId).emit('game_state_update', {
+      gameState: game.getPlayerGameState(playerId),
+      botUserIds: this.getApiDrivenUserIds(gameId),
+    });
   }
 
   private getSocketIdsForUserInGame(userId: number, gameId: string): string[] {
@@ -996,6 +1179,7 @@ export class PokerServer {
       tableState?.seatedPlayers.delete(userIdStr);
       tableState?.connectedPlayers.delete(userIdStr);
       tableState?.playerIds?.delete(userIdStr);
+      this.clearApiDrivenUser(gameId, userId);
 
       await this.unseatPlayer(gameId, userId);
 
@@ -1077,6 +1261,7 @@ export class PokerServer {
       tableState?.seatedPlayers.delete(userIdStr);
       tableState?.connectedPlayers.delete(userIdStr);
       tableState?.playerIds?.delete(userIdStr);
+      this.clearApiDrivenUser(gameId, userId);
 
       await this.unseatPlayer(gameId, userId);
 
@@ -1116,6 +1301,7 @@ export class PokerServer {
 
     if (remainingPlayers === 0) {
       await GameStateStorage.deleteGameState(gameId);
+      this.apiDrivenUsersByGame.delete(gameId);
       if (tableState) {
         tableState.gameStarted = false;
       }
@@ -1183,6 +1369,7 @@ export class PokerServer {
         await GameStateStorage.deleteGameState(gameId);
         this.clearActionTimer(gameId);
         this.showdownCardReveals.delete(gameId);
+        this.apiDrivenUsersByGame.delete(gameId);
         if (tableState) {
           tableState.gameStarted = false;
         }
@@ -1243,9 +1430,7 @@ export class PokerServer {
       }
 
       for (const socketId of socketIds) {
-        this.io.to(socketId).emit('game_state_update', {
-          gameState: game.getPlayerGameState(player.id)
-        });
+        this.emitPlayerState(socketId, gameId, player.id, game);
       }
     }
   }
@@ -1276,6 +1461,28 @@ export class PokerServer {
       clearTimeout(existingTimer);
       this.actionTimers.delete(gameId);
     }
+  }
+
+  private clearAllActionTimers(): void {
+    for (const timer of this.actionTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.actionTimers.clear();
+  }
+
+  private clearDisconnectCleanupTimer(socketId: string): void {
+    const timer = this.disconnectCleanupTimers.get(socketId);
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectCleanupTimers.delete(socketId);
+    }
+  }
+
+  private clearAllDisconnectCleanupTimers(): void {
+    for (const timer of this.disconnectCleanupTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.disconnectCleanupTimers.clear();
   }
 
   /**
@@ -1339,6 +1546,8 @@ export class PokerServer {
   }
 
   private async handleLeaveGame(socketId: string, tableIdHint?: number, userHint?: AuthenticatedUser): Promise<void> {
+    this.clearDisconnectCleanupTimer(socketId);
+
     const playerInfo = this.connectedPlayers.get(socketId);
     if (!playerInfo) {
       if (!tableIdHint || !userHint) {
@@ -1356,6 +1565,7 @@ export class PokerServer {
 
         if (stalePlayer && game.removePlayer(stalePlayer.id)) {
           this.playerGameMap.delete(stalePlayer.id);
+          this.clearApiDrivenUser(fallbackGameId, fallbackUserId);
           const remainingPlayers = game.getPlayers().length;
 
           if (remainingPlayers > 0) {
@@ -1365,6 +1575,7 @@ export class PokerServer {
             await GameStateStorage.deleteGameState(fallbackGameId);
             this.clearActionTimer(fallbackGameId);
             this.showdownCardReveals.delete(fallbackGameId);
+            this.apiDrivenUsersByGame.delete(fallbackGameId);
           }
         }
       }
@@ -1377,6 +1588,7 @@ export class PokerServer {
 
     const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
     if (gameId) {
+      this.clearApiDrivenUser(gameId, playerInfo.userId);
       let remainingPlayers = 0;
       let gameStateUpdated = false;
 
@@ -1418,12 +1630,14 @@ export class PokerServer {
           await GameStateStorage.deleteGameState(gameId);
           this.clearActionTimer(gameId);
           this.showdownCardReveals.delete(gameId);
+          this.apiDrivenUsersByGame.delete(gameId);
           console.log(`🗑️  Game ${gameId} deleted - no players remaining`);
         }
       } else {
         // Missing state should still allow seat cleanup in the auth API.
         this.clearActionTimer(gameId);
         this.showdownCardReveals.delete(gameId);
+        this.apiDrivenUsersByGame.delete(gameId);
       }
 
       this.io.to(gameId).emit('player_left', {
@@ -1437,9 +1651,8 @@ export class PokerServer {
 
       // Unseat player from table in database for both leave and timeout cleanup.
       await this.unseatPlayer(gameId, playerInfo.userId);
-      if (remainingPlayers === 0) {
-        await this.checkAndCleanupTable(gameId);
-      } else if (gameStateUpdated) {
+      const tableDeleted = await this.checkAndCleanupTable(gameId);
+      if (!tableDeleted && remainingPlayers > 0 && gameStateUpdated) {
         await this.broadcastGameState(gameId);
       }
 
@@ -1473,6 +1686,7 @@ export class PokerServer {
     // Keep newer sockets for the same user intact (reconnection uses a different socketId).
     this.connectedPlayers.delete(socketId);
     this.disconnectedPlayers.delete(socketId);
+    this.clearDisconnectCleanupTimer(socketId);
     if (this.userIdToSocketId.get(playerInfo.userId) === socketId) {
       this.userIdToSocketId.delete(playerInfo.userId);
     }
@@ -1506,6 +1720,7 @@ export class PokerServer {
     }
 
     if (!playerInfo) {
+      this.clearDisconnectCleanupTimer(socketId);
       if (this.userIdToSocketId.get(user.id) === socketId) {
         this.userIdToSocketId.delete(user.id);
       }
@@ -1552,14 +1767,19 @@ export class PokerServer {
       });
 
       // Set timeout to actually remove player if they don't reconnect
-      setTimeout(() => {
+      this.clearDisconnectCleanupTimer(socketId);
+      const disconnectTimer = setTimeout(() => {
+        this.disconnectCleanupTimers.delete(socketId);
+
         // Check if player reconnected
         if (this.disconnectedPlayers.has(socketId)) {
           console.log(`⏰ ${user.username} did not reconnect in time, removing from game`);
           this.disconnectedPlayers.delete(socketId);
-          this.handleLeaveGame(socketId);
+          void this.handleLeaveGame(socketId);
         }
       }, this.RECONNECT_TIMEOUT);
+      disconnectTimer.unref?.();
+      this.disconnectCleanupTimers.set(socketId, disconnectTimer);
     } else {
       // Player not in game, immediate cleanup
       await this.handleLeaveGame(socketId);
@@ -1582,15 +1802,23 @@ export class PokerServer {
     this.app.post('/_internal/agent-action', async (req: Request, res: Response) => {
       try {
         const { userId, gameId, action, amount } = req.body;
+        const numericUserId = Number(userId);
+        const numericAmount = amount === undefined || amount === null ? undefined : Number(amount);
 
         // Validate request
-        if (!userId || !gameId || !action) {
+        if (!numericUserId || !gameId || !action) {
           return res.status(400).json({ 
             error: 'Missing required fields: userId, gameId, action' 
           });
         }
+        if (numericAmount !== undefined && !Number.isFinite(numericAmount)) {
+          return res.status(400).json({
+            error: 'Invalid amount'
+          });
+        }
 
-        console.log(`🤖 Agent action: User ${userId}, Game ${gameId}, Action: ${action}${amount ? ` ${amount}` : ''}`);
+        console.log(`🤖 Agent action: User ${numericUserId}, Game ${gameId}, Action: ${action}${amount ? ` ${amount}` : ''}`);
+        this.markUserAsApiDriven(gameId, numericUserId);
 
         // Load game from Redis
         const gameData = await GameStateStorage.loadGameState(gameId);
@@ -1600,42 +1828,14 @@ export class PokerServer {
 
         const game = Game.fromJSON(gameData);
 
-        // Find player by userId (need to get playerId from connectedPlayers or playerGameMap)
-        let playerId: string | undefined;
-        
-        // Check if user is connected via WebSocket
-        for (const [socketId, playerInfo] of this.connectedPlayers.entries()) {
-          if (playerInfo.userId === userId) {
-            playerId = playerInfo.playerId;
-            break;
-          }
-        }
-
-        // If not in connectedPlayers, check playerGameMap
-        if (!playerId) {
-          for (const [pid, gid] of this.playerGameMap.entries()) {
-            if (gid === gameId) {
-              // Check if this player matches the userId
-              const players = game.getPlayers();
-              for (const player of players) {
-                if (player.id === pid) {
-                  // We found a player in this game, but we need to verify userId
-                  // For now, use the first player in the game (agent bots)
-                  playerId = pid;
-                  break;
-                }
-              }
-              if (playerId) break;
-            }
-          }
-        }
+        const playerId = this.resolvePlayerIdForUser(gameId, numericUserId, game);
 
         if (!playerId) {
           return res.status(404).json({ error: 'Player not found in game' });
         }
 
         // Perform the action
-        const result = game.handleAction(playerId, action as any, amount);
+        const result = game.handleAction(playerId, action as any, numericAmount);
 
         if (!result.valid) {
           if (result.timeBankExhausted && result.exhaustedPlayerId) {
@@ -1669,7 +1869,8 @@ export class PokerServer {
         const playerGameState = game.getPlayerGameState(playerId);
         res.json({
           success: true,
-          gameState: playerGameState
+          gameState: playerGameState,
+          botUserIds: this.getApiDrivenUserIds(gameId),
         });
 
       } catch (error: any) {
@@ -1690,6 +1891,11 @@ export class PokerServer {
         if (!userId) {
           return res.status(400).json({ error: 'Missing userId query parameter' });
         }
+        const numericUserId = Number(userId);
+        if (!numericUserId) {
+          return res.status(400).json({ error: 'Invalid userId query parameter' });
+        }
+        this.markUserAsApiDriven(gameId, numericUserId);
 
         // Load game from Redis
         const gameData = await GameStateStorage.loadGameState(gameId);
@@ -1699,22 +1905,7 @@ export class PokerServer {
 
         const game = Game.fromJSON(gameData);
 
-        // Find player by userId
-        let playerId: string | undefined;
-        for (const [socketId, playerInfo] of this.connectedPlayers.entries()) {
-          if (playerInfo.userId === Number(userId)) {
-            playerId = playerInfo.playerId;
-            break;
-          }
-        }
-
-        // If not found in connectedPlayers, use first player in game (for agent bots)
-        if (!playerId) {
-          const players = game.getPlayers();
-          if (players.length > 0) {
-            playerId = players[0].id;
-          }
-        }
+        const playerId = this.resolvePlayerIdForUser(gameId, numericUserId, game);
 
         if (!playerId) {
           return res.status(404).json({ error: 'Player not found in game' });
@@ -1723,7 +1914,8 @@ export class PokerServer {
         // Return player-specific game state
         const playerGameState = game.getPlayerGameState(playerId);
         res.json({
-          gameState: playerGameState
+          gameState: playerGameState,
+          botUserIds: this.getApiDrivenUserIds(gameId),
         });
 
       } catch (error: any) {
@@ -1836,8 +2028,7 @@ export class PokerServer {
             const currentSocket = this.io.sockets.sockets.get(currentSocketId);
             if (currentSocket) {
               currentSocket.join(gameId);
-              const playerState = game.getPlayerGameState(existingPlayer.id);
-              currentSocket.emit('game_state_update', { gameState: playerState });
+              this.emitPlayerState(currentSocketId, gameId, existingPlayer.id, game);
             }
           }
 
@@ -1871,9 +2062,25 @@ export class PokerServer {
           });
         }
 
+        const gameStageBeforeSeat = game.getStage();
+        let waitingForBigBlind = false;
+        let waitReason: string | null = null;
+        if (gameStageBeforeSeat !== 'waiting' && gameStageBeforeSeat !== 'complete' && gameStageBeforeSeat !== 'showdown') {
+          const joinCheck = game.canPlayerJoinAtSeat(seat_number);
+          waitingForBigBlind = !joinCheck.canJoin;
+          if (waitingForBigBlind) {
+            waitReason = joinCheck.reason;
+          }
+        }
+
         // Add player to game
         game.addPlayer(player);
-        console.log(`✅ Player ${username} added to game at seat ${seat_number}. Total players: ${game.getPlayers().length}`);        // Save game state to Redis
+        console.log(`✅ Player ${username} added to game at seat ${seat_number}. Total players: ${game.getPlayers().length}`);
+        if (waitingForBigBlind) {
+          console.log(`🕒 ${username} seated and queued until big blind`);
+        }
+
+        // Save game state to Redis
         await GameStateStorage.saveGameState(gameId, game.toJSON());
 
         // Map player to game for future lookups
@@ -1909,8 +2116,7 @@ export class PokerServer {
           if (playerInfo.gameId === gameId) {
             const socket = this.io.sockets.sockets.get(socketId);
             if (socket) {
-              const playerState = game.getPlayerGameState(playerInfo.playerId);
-              socket.emit('game_state_update', { gameState: playerState });
+              this.emitPlayerState(socketId, gameId, playerInfo.playerId, game);
             }
           }
         }
@@ -1925,11 +2131,15 @@ export class PokerServer {
 
         res.json({ 
           success: true,
-          message: `Player ${username} seated successfully`,
+          message: waitingForBigBlind
+            ? `Player ${username} seated. You are queued until your big blind arrives.`
+            : `Player ${username} seated successfully`,
           game_id: gameId,
           player_id: playerId,
           players_count: currentPlayerCount,
-          max_seats: maxSeats
+          max_seats: maxSeats,
+          waiting_for_big_blind: waitingForBigBlind,
+          waiting_reason: waitReason
         });
 
       } catch (error: any) {

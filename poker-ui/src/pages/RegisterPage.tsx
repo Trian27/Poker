@@ -3,9 +3,10 @@
  */
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { useAuth } from '../AuthContext';
+import { useAuth } from '../auth-context';
 import { authApi } from '../api';
 import './AuthPages.css';
+import { getApiErrorMessage } from "../utils/error";
 
 export const RegisterPage: React.FC = () => {
   const [username, setUsername] = useState('');
@@ -56,8 +57,8 @@ export const RegisterPage: React.FC = () => {
         login(loginResponse.access_token, response);
         navigate('/dashboard');
       }
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Registration failed. Please try again.');
+    } catch (err: unknown) {
+      setError(getApiErrorMessage(err, 'Registration failed. Please try again.'));
     } finally {
       setLoading(false);
     }
@@ -92,8 +93,8 @@ export const RegisterPage: React.FC = () => {
       } else {
         setError('Verification failed. Please try again.');
       }
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Invalid verification code');
+    } catch (err: unknown) {
+      setError(getApiErrorMessage(err, 'Invalid verification code'));
     } finally {
       setLoading(false);
     }
@@ -106,8 +107,8 @@ export const RegisterPage: React.FC = () => {
     try {
       await authApi.resendVerification(pendingEmail);
       setSuccess('Verification code resent to your email');
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to resend code');
+    } catch (err: unknown) {
+      setError(getApiErrorMessage(err, 'Failed to resend code'));
     } finally {
       setLoading(false);
     }

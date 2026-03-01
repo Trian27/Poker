@@ -38,9 +38,11 @@ class ActionRequest(BaseModel):
 class ActionResponse(BaseModel):
     success: bool
     gameState: dict
+    botUserIds: Optional[list[int]] = None
 
 class GameStateResponse(BaseModel):
     gameState: dict
+    botUserIds: Optional[list[int]] = None
 
 class ErrorResponse(BaseModel):
     error: str

@@ -1,17 +1,90 @@
 /**
  * Game Table page - real-time poker game interface with chat and reconnection
  */
-import React, { useMemo, useRef, useState, useEffect, type CSSProperties } from 'react';
+import React, { useCallback, useMemo, useRef, useState, useEffect, type CSSProperties } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { io, Socket } from 'socket.io-client';
-import { useAuth } from '../AuthContext';
+import { useAuth } from '../auth-context';
 import { ActionTimer } from '../components/ActionTimer';
-import { tablesApi } from '../api';
-import type { GameState, GameAction, Card, ChatMessage, HandResult } from '../types';
+import RulesScrollHelp from '../components/RulesScrollHelp';
+import { tablesApi, skinsApi, playerNotesApi } from '../api';
+import type { GameState, GameAction, Card, ChatMessage, HandResult, TableSeat } from '../types';
+import { getApiErrorMessage } from '../utils/error';
+import { suppressAutoRejoinForMs } from '../utils/activeSeatRejoin';
 import './GameTable.css';
 
 const GAME_SERVER_URL = import.meta.env.VITE_GAME_SERVER_URL || 'http://localhost:3000';
 const ACTIVE_ACTION_PHASES = new Set(['preflop', 'flop', 'turn', 'river']);
+const QUICK_EMOTES = ['😀', '😂', '😎', '🤔', '😬', '😢', '😡', '👏', '🔥', '🍀'];
+
+interface TableEmoteEvent {
+  id: string;
+  userId: number;
+  username: string;
+  emoji: string;
+  timestamp: number;
+}
+
+interface AppliedTableTheme {
+  cardFront: string | null;
+  cardBack: string | null;
+  tableFelt: string | null;
+  tableBackground: string | null;
+}
+
+interface TableLayoutTuning {
+  seatRadiusXPercent: number;
+  seatRadiusYPercent: number;
+  seatCardOffsetPx: number;
+}
+
+const EMPTY_TABLE_THEME: AppliedTableTheme = {
+  cardFront: null,
+  cardBack: null,
+  tableFelt: null,
+  tableBackground: null,
+};
+
+const DEFAULT_TABLE_LAYOUT_TUNING: TableLayoutTuning = {
+  seatRadiusXPercent: 50,
+  seatRadiusYPercent: 50,
+  seatCardOffsetPx: 78,
+};
+
+type UnknownRecord = Record<string, unknown>;
+
+interface OwnedSkinEntry {
+  is_equipped?: boolean;
+  skin?: {
+    category?: string;
+    design_spec?: {
+      asset_manifest?: unknown;
+    };
+  };
+}
+
+const asRecord = (value: unknown): UnknownRecord => {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+  return value as UnknownRecord;
+};
+
+const normalizePhase = (rawPhase: unknown): GameState['phase'] => {
+  const value = rawPhase === 'complete' ? 'finished' : rawPhase;
+  if (
+    value === 'waiting'
+    || value === 'preflop'
+    || value === 'flop'
+    || value === 'turn'
+    || value === 'river'
+    || value === 'showdown'
+    || value === 'finished'
+  ) {
+    return value;
+  }
+  return 'waiting';
+};
 
 export const GameTablePage: React.FC = () => {
   const params = useParams<{ tableId?: string; communityId?: string }>();
@@ -33,9 +106,20 @@ export const GameTablePage: React.FC = () => {
   const [animatedCommunityIndexes, setAnimatedCommunityIndexes] = useState<number[]>([]);
   const [animatedHoleCardIndexes, setAnimatedHoleCardIndexes] = useState<number[]>([]);
   const [actionMeterNowMs, setActionMeterNowMs] = useState<number>(Date.now());
+  const [activeEmotes, setActiveEmotes] = useState<TableEmoteEvent[]>([]);
+  const [tableTheme, setTableTheme] = useState<AppliedTableTheme>(EMPTY_TABLE_THEME);
+  const [tableLayoutTuning, setTableLayoutTuning] = useState<TableLayoutTuning>(DEFAULT_TABLE_LAYOUT_TUNING);
+  const [tableSeatCapacity, setTableSeatCapacity] = useState<number>(8);
+  const [noteTargetPlayer, setNoteTargetPlayer] = useState<GameState['players'][number] | null>(null);
+  const [noteText, setNoteText] = useState('');
+  const [noteLoading, setNoteLoading] = useState(false);
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteError, setNoteError] = useState('');
+  const [noteInfo, setNoteInfo] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
   const handResultTimeoutRef = useRef<number | null>(null);
   const handResultCountdownRef = useRef<number | null>(null);
+  const botUserIdsRef = useRef<number[]>([]);
   const actionMeterSyncRef = useRef<{
     syncedAtMs: number;
     turnPlayerId: number | null;
@@ -49,14 +133,18 @@ export const GameTablePage: React.FC = () => {
   });
   const previousCommunityCountRef = useRef(0);
   const previousHoleCardCountRef = useRef(0);
+  const gameContainerRef = useRef<HTMLDivElement | null>(null);
+  const tableStageRef = useRef<HTMLElement | null>(null);
+  const gameTableRef = useRef<HTMLDivElement | null>(null);
 
   const { user, token } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const tableId = Number(tableIdParam);
+  const currentUserId = user?.id ?? null;
   const expectedGameId = Number.isFinite(tableId) ? `table_${tableId}` : undefined;
 
-  const extractUserId = (playerId: unknown): number | null => {
+  const extractUserId = useCallback((playerId: unknown): number | null => {
     if (typeof playerId === 'number' && Number.isFinite(playerId)) {
       return playerId;
     }
@@ -75,73 +163,126 @@ export const GameTablePage: React.FC = () => {
     }
 
     return null;
-  };
+  }, []);
 
-  const normalizeCards = (cards: unknown): Card[] => {
+  const toCssImageValue = useCallback((rawValue: unknown): string | null => {
+    if (typeof rawValue !== 'string') {
+      return null;
+    }
+    const trimmed = rawValue.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const normalized = trimmed.toLowerCase();
+    if (
+      !normalized.startsWith('https://')
+      && !normalized.startsWith('http://')
+      && !normalized.startsWith('/')
+      && !normalized.startsWith('data:image/')
+    ) {
+      return null;
+    }
+    const escaped = trimmed.replace(/"/g, '\\"');
+    return `url("${escaped}")`;
+  }, []);
+
+  const extractSkinManifestValue = useCallback((manifest: unknown, keys: string[]): string | null => {
+    if (!manifest || typeof manifest !== 'object') {
+      return null;
+    }
+    const values = manifest as Record<string, unknown>;
+    for (const key of keys) {
+      const cssValue = toCssImageValue(values[key]);
+      if (cssValue) {
+        return cssValue;
+      }
+    }
+    return null;
+  }, [toCssImageValue]);
+
+  const normalizeCards = useCallback((cards: unknown): Card[] => {
     if (!Array.isArray(cards)) {
       return [];
     }
     return cards
       .filter((card): card is Card => Boolean(card) && typeof card === 'object' && 'rank' in card && 'suit' in card)
       .map((card) => ({ rank: String(card.rank), suit: String(card.suit) } as Card));
-  };
+  }, []);
 
-  const normalizeHandResult = (rawHandResult: any): HandResult | null => {
-    if (!rawHandResult || !Array.isArray(rawHandResult.winners)) {
+  const normalizeHandResult = useCallback((rawHandResult: unknown): HandResult | null => {
+    const handResultRecord = asRecord(rawHandResult);
+    const rawWinners = Array.isArray(handResultRecord.winners) ? handResultRecord.winners : null;
+    if (!rawWinners) {
       return null;
     }
 
     return {
-      totalPot: Number(rawHandResult.totalPot ?? 0),
-      endedByFold: Boolean(rawHandResult.endedByFold),
-      winners: rawHandResult.winners.map((winner: any) => ({
-        playerId: String(winner.playerId ?? ''),
-        userId: winner.userId === null || winner.userId === undefined ? null : Number(winner.userId),
-        username: String(winner.username ?? 'Unknown'),
-        amount: Number(winner.amount ?? 0),
-        handDescription: String(winner.handDescription ?? ''),
-        bestHandCards: normalizeCards(winner.bestHandCards),
-        holeCards: normalizeCards(winner.holeCards),
-      })),
-      players: Array.isArray(rawHandResult.players)
-        ? rawHandResult.players.map((player: any) => ({
-            playerId: String(player.playerId ?? ''),
-            userId: player.userId === null || player.userId === undefined ? null : Number(player.userId),
-            username: String(player.username ?? 'Unknown'),
-            folded: Boolean(player.folded),
-            isWinner: Boolean(player.isWinner),
-            holeCards: normalizeCards(player.holeCards),
-          }))
+      totalPot: Number(handResultRecord.totalPot ?? 0),
+      endedByFold: Boolean(handResultRecord.endedByFold),
+      winners: rawWinners.map((winnerValue) => {
+        const winner = asRecord(winnerValue);
+        return {
+          playerId: String(winner.playerId ?? ''),
+          userId: winner.userId === null || winner.userId === undefined ? null : Number(winner.userId),
+          username: String(winner.username ?? 'Unknown'),
+          amount: Number(winner.amount ?? 0),
+          handDescription: String(winner.handDescription ?? ''),
+          bestHandCards: normalizeCards(winner.bestHandCards),
+          holeCards: normalizeCards(winner.holeCards),
+        };
+      }),
+      players: Array.isArray(handResultRecord.players)
+        ? handResultRecord.players.map((playerValue) => {
+            const player = asRecord(playerValue);
+            return {
+              playerId: String(player.playerId ?? ''),
+              userId: player.userId === null || player.userId === undefined ? null : Number(player.userId),
+              username: String(player.username ?? 'Unknown'),
+              folded: Boolean(player.folded),
+              isWinner: Boolean(player.isWinner),
+              holeCards: normalizeCards(player.holeCards),
+            };
+          })
         : [],
     };
-  };
+  }, [normalizeCards]);
 
-  const normalizeGameState = (rawState: any): GameState => {
-    const rawPlayers = Array.isArray(rawState?.players) ? rawState.players : [];
-    const normalizedPlayers: GameState['players'] = rawPlayers.map((player: any, index: number): GameState['players'][number] => {
-      const parsedId = extractUserId(player?.id);
+  const normalizeGameState = useCallback((rawState: unknown, latestBotUserIds: number[] = []): GameState => {
+    const state = asRecord(rawState);
+    const config = asRecord(state.config);
+    const botSet = new Set(latestBotUserIds.filter((value) => Number.isFinite(value)));
+    const rawPlayers = Array.isArray(state.players) ? state.players : [];
+    const normalizedPlayers: GameState['players'] = rawPlayers.map((playerValue, index): GameState['players'][number] => {
+      const player = asRecord(playerValue);
+      const parsedId = extractUserId(player.id);
+      const resolvedId = parsedId ?? index + 1;
 
       return {
-        id: parsedId ?? index + 1,
-        username: player?.username ?? player?.name ?? `Player ${index + 1}`,
-        stack: Number(player?.stack ?? 0),
-        currentBet: Number(player?.currentBet ?? player?.bet ?? 0),
-        seatNumber: Number.isFinite(Number(player?.seatNumber)) ? Number(player?.seatNumber) : undefined,
-        timeBankMs: Number.isFinite(Number(player?.timeBankMs)) ? Number(player?.timeBankMs) : undefined,
-        timeBankSeconds: Number.isFinite(Number(player?.timeBankSeconds)) ? Number(player?.timeBankSeconds) : undefined,
-        hasFolded: Boolean(player?.hasFolded ?? false),
-        isAllIn: Boolean(player?.isAllIn ?? false),
+        id: resolvedId,
+        username: String(player.username ?? player.name ?? `Player ${index + 1}`),
+        stack: Number(player.stack ?? 0),
+        currentBet: Number(player.currentBet ?? player.bet ?? 0),
+        seatNumber: Number.isFinite(Number(player.seatNumber)) ? Number(player.seatNumber) : undefined,
+        profileImageUrl: typeof player.profileImageUrl === 'string'
+          ? player.profileImageUrl
+          : (typeof player.avatarUrl === 'string' ? player.avatarUrl : null),
+        timeBankMs: Number.isFinite(Number(player.timeBankMs)) ? Number(player.timeBankMs) : undefined,
+        timeBankSeconds: Number.isFinite(Number(player.timeBankSeconds)) ? Number(player.timeBankSeconds) : undefined,
+        hasFolded: Boolean(player.hasFolded ?? false),
+        isAllIn: Boolean(player.isAllIn ?? false),
+        isApiBot: botSet.has(resolvedId),
+        waitingForBigBlind: Boolean(player.waitingForBigBlind ?? false),
         hand: undefined as Card[] | undefined,
       };
     });
 
-    const currentPlayerIndex = Number(rawState?.currentPlayerIndex);
-    const dealerIndex = Number(rawState?.dealerIndex ?? rawState?.dealerPosition ?? -1);
-    const smallBlindIndex = Number(rawState?.smallBlindIndex ?? -1);
-    const bigBlindIndex = Number(rawState?.bigBlindIndex ?? -1);
+    const currentPlayerIndex = Number(state.currentPlayerIndex);
+    const dealerIndex = Number(state.dealerIndex ?? state.dealerPosition ?? -1);
+    const smallBlindIndex = Number(state.smallBlindIndex ?? -1);
+    const bigBlindIndex = Number(state.bigBlindIndex ?? -1);
 
     let currentTurnPlayerId: number | null = null;
-    const rawCurrentTurnPlayerId = rawState?.currentTurnPlayerId;
+    const rawCurrentTurnPlayerId = state.currentTurnPlayerId;
 
     if (rawCurrentTurnPlayerId !== undefined && rawCurrentTurnPlayerId !== null) {
       currentTurnPlayerId = extractUserId(rawCurrentTurnPlayerId);
@@ -153,49 +294,67 @@ export const GameTablePage: React.FC = () => {
       currentTurnPlayerId = normalizedPlayers[currentPlayerIndex].id;
     }
 
-    const myCards: Card[] = normalizeCards(rawState?.myCards);
-    if (user) {
-      const me = normalizedPlayers.find((player: GameState['players'][number]) => player.id === user.id);
+    const myCards: Card[] = normalizeCards(state.myCards);
+    if (currentUserId !== null) {
+      const me = normalizedPlayers.find((player: GameState['players'][number]) => player.id === currentUserId);
       if (me) {
         me.hand = myCards;
       }
     }
 
-    const rawPhase = rawState?.phase ?? rawState?.stage ?? 'waiting';
-    const phase = rawPhase === 'complete' ? 'finished' : rawPhase;
-
+    const phase = normalizePhase(state.phase ?? state.stage ?? 'waiting');
     const currentTurnPlayerIdForPhase = ACTIVE_ACTION_PHASES.has(phase) ? currentTurnPlayerId : null;
+    const sidePots = Array.isArray(state.sidePots)
+      ? state.sidePots
+          .map((sidePotValue, index) => {
+            const sidePot = asRecord(sidePotValue);
+            const eligiblePlayerIds = Array.isArray(sidePot.eligiblePlayerIds)
+              ? sidePot.eligiblePlayerIds
+                  .map((id: unknown) => extractUserId(id))
+                  .filter((id: number | null): id is number => id !== null)
+              : [];
+            return {
+              index: Number(sidePot.index ?? (index + 1)),
+              amount: Number(sidePot.amount ?? 0),
+              eligiblePlayerIds,
+            };
+          })
+          .filter((sidePot: { amount: number }) => sidePot.amount > 0)
+      : [];
 
     return {
-      gameId: rawState?.gameId ?? `table_${Number.isFinite(tableId) ? tableId : 0}`,
+      gameId: typeof state.gameId === 'string'
+        ? state.gameId
+        : `table_${Number.isFinite(tableId) ? tableId : 0}`,
       communityId: Number.isFinite(tableId) ? tableId : 0,
       players: normalizedPlayers,
-      communityCards: normalizeCards(rawState?.communityCards),
-      pot: Number(rawState?.pot ?? 0),
+      communityCards: normalizeCards(state.communityCards),
+      pot: Number(state.pot ?? 0),
+      sidePots,
       currentTurnPlayerId: currentTurnPlayerIdForPhase,
       phase,
-      minBet: Number(rawState?.minBet ?? rawState?.currentBet ?? rawState?.bigBlind ?? 0),
-      minRaiseSize: Number(rawState?.minRaiseSize ?? rawState?.bigBlind ?? 0),
+      minBet: Number(state.minBet ?? state.currentBet ?? state.bigBlind ?? 0),
+      minRaiseSize: Number(state.minRaiseSize ?? state.bigBlind ?? 0),
       dealerPosition: dealerIndex,
       dealerPlayerId: dealerIndex >= 0 && dealerIndex < normalizedPlayers.length ? normalizedPlayers[dealerIndex].id : null,
-      smallBlind: Number(rawState?.smallBlind ?? rawState?.config?.smallBlind ?? 0),
+      smallBlind: Number(state.smallBlind ?? config.smallBlind ?? 0),
       smallBlindPlayerId: smallBlindIndex >= 0 && smallBlindIndex < normalizedPlayers.length ? normalizedPlayers[smallBlindIndex].id : null,
-      bigBlind: Number(rawState?.bigBlind ?? rawState?.config?.bigBlind ?? 0),
+      bigBlind: Number(state.bigBlind ?? config.bigBlind ?? 0),
       bigBlindPlayerId: bigBlindIndex >= 0 && bigBlindIndex < normalizedPlayers.length ? normalizedPlayers[bigBlindIndex].id : null,
-      lastHandResult: normalizeHandResult(rawState?.lastHandResult),
-      actionTimeoutSeconds: Number(rawState?.actionTimeoutSeconds ?? 30),
-      remainingActionTime: Number(rawState?.remainingActionTime ?? 0),
-      remainingReserveTime: Number(rawState?.remainingReserveTime ?? 0),
+      lastHandResult: normalizeHandResult(state.lastHandResult),
+      actionTimeoutSeconds: Number(state.actionTimeoutSeconds ?? 30),
+      remainingActionTime: Number(state.remainingActionTime ?? 0),
+      remainingReserveTime: Number(state.remainingReserveTime ?? 0),
     };
-  };
+  }, [extractUserId, normalizeCards, normalizeHandResult, tableId, currentUserId]);
 
-  const backToCommunity = () => {
+  const backToCommunity = useCallback(() => {
     if (resolvedCommunityId) {
-      navigate(`/community/${resolvedCommunityId}`);
+      navigate(`/community/${resolvedCommunityId}`, { replace: true });
     } else {
-      navigate('/dashboard');
+      navigate('/dashboard', { replace: true });
     }
-  };
+  }, [resolvedCommunityId, navigate]);
 
   useEffect(() => {
     if (!tableIdParam) {
@@ -239,6 +398,80 @@ export const GameTablePage: React.FC = () => {
   }, [tableIdParam, location.search]);
 
   useEffect(() => {
+    if (!Number.isFinite(tableId) || tableId <= 0 || !token) {
+      return;
+    }
+
+    let cancelled = false;
+
+    tablesApi.getSeats(tableId)
+      .then((seatsData: TableSeat[]) => {
+        if (cancelled || !Array.isArray(seatsData) || seatsData.length === 0) {
+          return;
+        }
+
+        const maxSeatNumber = seatsData.reduce((maxSeat, seat) => {
+          const seatNumber = Number(seat?.seat_number);
+          if (!Number.isFinite(seatNumber) || seatNumber <= 0) {
+            return maxSeat;
+          }
+          return Math.max(maxSeat, Math.floor(seatNumber));
+        }, 0);
+
+        if (maxSeatNumber >= 2) {
+          setTableSeatCapacity(maxSeatNumber);
+        }
+      })
+      .catch(() => {
+        // Seat count is best-effort for layout mapping. Keep fallback if unavailable.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tableId, token]);
+
+  useEffect(() => {
+    if (currentUserId === null) {
+      setTableTheme(EMPTY_TABLE_THEME);
+      return;
+    }
+
+    let cancelled = false;
+
+    skinsApi.getMySkins()
+      .then((ownedSkins) => {
+        if (cancelled || !Array.isArray(ownedSkins)) {
+          return;
+        }
+
+        const normalizedOwnedSkins = ownedSkins as OwnedSkinEntry[];
+        const equippedSkins = normalizedOwnedSkins.filter((entry) => Boolean(entry?.is_equipped));
+        const equippedCardSkin = equippedSkins.find((entry) => entry?.skin?.category === 'cards');
+        const equippedTableSkin = equippedSkins.find((entry) => entry?.skin?.category === 'table');
+
+        const cardManifest = equippedCardSkin?.skin?.design_spec?.asset_manifest;
+        const tableManifest = equippedTableSkin?.skin?.design_spec?.asset_manifest;
+
+        setTableTheme({
+          cardFront: extractSkinManifestValue(cardManifest, ['card_front', 'cards_front', 'front']),
+          cardBack: extractSkinManifestValue(cardManifest, ['card_back', 'cards_back', 'back']),
+          tableFelt: extractSkinManifestValue(tableManifest, ['table_felt', 'felt']),
+          tableBackground: extractSkinManifestValue(tableManifest, ['table_background', 'background']),
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTableTheme(EMPTY_TABLE_THEME);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUserId, extractSkinManifestValue]);
+
+  useEffect(() => {
     if (!token || !tableIdParam) return;
 
     const newSocket = io(GAME_SERVER_URL, {
@@ -262,8 +495,10 @@ export const GameTablePage: React.FC = () => {
       setReconnecting(true);
     });
 
-    newSocket.on('reconnected', ({ gameState: restoredState }: { message: string; gameState: GameState }) => {
-      setGameState(normalizeGameState(restoredState));
+    newSocket.on('reconnected', ({ gameState: restoredState, botUserIds: latestBotUserIds }: { message: string; gameState: GameState; botUserIds?: number[] }) => {
+      const normalizedBotUsers = Array.isArray(latestBotUserIds) ? latestBotUserIds.map((value) => Number(value)).filter((value) => Number.isFinite(value)) : [];
+      botUserIdsRef.current = normalizedBotUsers;
+      setGameState(normalizeGameState(restoredState, normalizedBotUsers));
       setReconnecting(false);
       setError('');
     });
@@ -319,7 +554,7 @@ export const GameTablePage: React.FC = () => {
       if (gameId && expectedGameId && gameId !== expectedGameId) {
         return;
       }
-      if (typeof userId === 'number' && user && userId !== user.id) {
+      if (typeof userId === 'number' && currentUserId !== null && userId !== currentUserId) {
         return;
       }
       setBustMessage(message || 'You were removed from the table.');
@@ -343,8 +578,12 @@ export const GameTablePage: React.FC = () => {
       setTimeout(() => setError(''), 3000);
     });
 
-    newSocket.on('game_state_update', ({ gameState: newGameState }: { gameState: GameState }) => {
-      const normalizedState = normalizeGameState(newGameState);
+    newSocket.on('game_state_update', ({ gameState: newGameState, botUserIds: latestBotUserIds }: { gameState: GameState; botUserIds?: number[] }) => {
+      const normalizedBotUsers = Array.isArray(latestBotUserIds) ? latestBotUserIds.map((value) => Number(value)).filter((value) => Number.isFinite(value)) : [];
+      if (Array.isArray(latestBotUserIds)) {
+        botUserIdsRef.current = normalizedBotUsers;
+      }
+      const normalizedState = normalizeGameState(newGameState, botUserIdsRef.current);
       setGameState(normalizedState);
       if (normalizedState.phase !== 'finished' && normalizedState.lastHandResult == null) {
         if (handResultTimeoutRef.current !== null) {
@@ -369,6 +608,19 @@ export const GameTablePage: React.FC = () => {
       setChatMessages(messages);
     });
 
+    newSocket.on('table_emote', (emote: TableEmoteEvent) => {
+      if (!emote || typeof emote.userId !== 'number' || typeof emote.emoji !== 'string') {
+        return;
+      }
+      setActiveEmotes((previous) => {
+        const filtered = previous.filter((item) => item.userId !== emote.userId);
+        return [...filtered, emote];
+      });
+      window.setTimeout(() => {
+        setActiveEmotes((previous) => previous.filter((item) => item.id !== emote.id));
+      }, 2400);
+    });
+
     newSocket.on('error', ({ message }: { message: string }) => {
       setError(message);
     });
@@ -390,7 +642,7 @@ export const GameTablePage: React.FC = () => {
       }
       newSocket.close();
     };
-  }, [token, tableIdParam, user?.id]);
+  }, [token, tableIdParam, expectedGameId, currentUserId, normalizeGameState, normalizeHandResult, backToCommunity]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -494,6 +746,13 @@ export const GameTablePage: React.FC = () => {
     setChatInput('');
   };
 
+  const sendEmote = (emoji: string) => {
+    if (!socket || !connected) {
+      return;
+    }
+    socket.emit('table_emote', { emoji });
+  };
+
   const handleFold = () => sendAction({ action: 'fold' });
   const handleCheck = () => sendAction({ action: 'check' });
   const handleCall = () => sendAction({ action: 'call' });
@@ -509,7 +768,63 @@ export const GameTablePage: React.FC = () => {
 
   const handleAllIn = () => sendAction({ action: 'all-in' });
 
-  const handleLeaveGame = () => {
+  const openPlayerNotesPanel = async (player: GameState['players'][number]) => {
+    setNoteTargetPlayer(player);
+    setNoteError('');
+    setNoteInfo('');
+    setNoteText('');
+
+    if (!user || player.id === user.id) {
+      return;
+    }
+
+    setNoteLoading(true);
+    try {
+      const note = await playerNotesApi.get(player.id);
+      setNoteText(typeof note?.notes === 'string' ? note.notes : '');
+    } catch (err: unknown) {
+      setNoteError(getApiErrorMessage(err, 'Failed to load notes for this player.'));
+    } finally {
+      setNoteLoading(false);
+    }
+  };
+
+  const closePlayerNotesPanel = () => {
+    setNoteTargetPlayer(null);
+    setNoteText('');
+    setNoteLoading(false);
+    setNoteSaving(false);
+    setNoteError('');
+    setNoteInfo('');
+  };
+
+  const savePlayerNotes = async () => {
+    if (!noteTargetPlayer || !user || noteTargetPlayer.id === user.id) {
+      return;
+    }
+
+    setNoteSaving(true);
+    setNoteError('');
+    setNoteInfo('');
+    try {
+      await playerNotesApi.upsert(noteTargetPlayer.id, noteText);
+      setNoteInfo('Notes saved.');
+    } catch (err: unknown) {
+      setNoteError(getApiErrorMessage(err, 'Failed to save notes.'));
+    } finally {
+      setNoteSaving(false);
+    }
+  };
+
+  const handleLeaveGame = async () => {
+    suppressAutoRejoinForMs();
+    if (Number.isFinite(tableId)) {
+      try {
+        await tablesApi.leave(tableId);
+      } catch (err) {
+        console.warn('Failed to leave table via API fallback:', getApiErrorMessage(err, 'Leave fallback failed'));
+      }
+    }
     if (socket) {
       socket.emit('leave_game', Number.isFinite(tableId) ? { tableId } : undefined);
       socket.close();
@@ -517,11 +832,17 @@ export const GameTablePage: React.FC = () => {
     backToCommunity();
   };
 
-  const getSeatLayout = (seatIndex: number, totalSeats: number) => {
-    const normalizedSeats = Math.max(totalSeats, 2);
-    const angle = Math.PI / 2 - (seatIndex / normalizedSeats) * (Math.PI * 2);
-    const radiusXPercent = 42;
-    const radiusYPercent = 36;
+  const getSeatLayout = (seatNumber: number | undefined, totalSeats: number, fallbackIndex: number) => {
+    const normalizedSeats = Math.max(2, Math.floor(totalSeats));
+    const fallbackSeatNumber = fallbackIndex + 1;
+    const parsedSeatNumber = Number(seatNumber);
+    const safeSeatNumber = Number.isFinite(parsedSeatNumber) && parsedSeatNumber > 0
+      ? Math.floor(parsedSeatNumber)
+      : fallbackSeatNumber;
+    const zeroBasedSeat = ((safeSeatNumber - 1) % normalizedSeats + normalizedSeats) % normalizedSeats;
+    const angle = (zeroBasedSeat / normalizedSeats) * (Math.PI * 2) - Math.PI / 2;
+    const radiusXPercent = tableLayoutTuning.seatRadiusXPercent;
+    const radiusYPercent = tableLayoutTuning.seatRadiusYPercent;
 
     return {
       angle,
@@ -547,7 +868,7 @@ export const GameTablePage: React.FC = () => {
     return (
       <div
         key={`${card.rank}-${card.suit}-${index}`}
-        className={`playing-card ${isRed ? 'red' : 'black'} ${className || ''}`}
+        className={`playing-card ${isRed ? 'red' : 'black'} ${tableTheme.cardFront ? 'card-front-themed' : ''} ${className || ''}`}
         style={animationDelayMs > 0 ? { animationDelay: `${animationDelayMs}ms` } : undefined}
       >
         <div className="card-corner top">
@@ -563,12 +884,21 @@ export const GameTablePage: React.FC = () => {
     );
   };
   const renderFaceDownCard = (key: string, className?: string) => (
-    <div key={key} className={`playing-card card-back ${className || ''}`} />
+    <div
+      key={key}
+      className={`playing-card card-back ${tableTheme.cardBack ? 'card-back-themed' : ''} ${className || ''}`}
+    />
   );
 
   const currentPlayer = getCurrentPlayer();
+  const hasGameState = gameState !== null;
   const isActionPhase = Boolean(gameState && ACTIVE_ACTION_PHASES.has(gameState.phase));
-  const canAct = isActionPhase && isMyTurn() && !!currentPlayer && !currentPlayer.hasFolded && !currentPlayer.isAllIn;
+  const canAct = isActionPhase
+    && isMyTurn()
+    && !!currentPlayer
+    && !currentPlayer.waitingForBigBlind
+    && !currentPlayer.hasFolded
+    && !currentPlayer.isAllIn;
   const canCheckNow = canCheck();
   const highestBet = Math.max(0, ...(gameState?.players || []).map((player) => player.currentBet));
   const callAmount = currentPlayer ? Math.max(0, highestBet - currentPlayer.currentBet) : 0;
@@ -576,16 +906,46 @@ export const GameTablePage: React.FC = () => {
     if (!gameState) {
       return [] as GameState['players'];
     }
-    const players = gameState.players;
-    if (!user) {
-      return players;
+    return [...gameState.players].sort((a, b) => {
+      const aSeat = Number.isFinite(Number(a.seatNumber)) ? Number(a.seatNumber) : Number.MAX_SAFE_INTEGER;
+      const bSeat = Number.isFinite(Number(b.seatNumber)) ? Number(b.seatNumber) : Number.MAX_SAFE_INTEGER;
+      if (aSeat !== bSeat) {
+        return aSeat - bSeat;
+      }
+      return a.id - b.id;
+    });
+  }, [gameState]);
+  const currentTurnPlayer = useMemo(() => {
+    if (!gameState || gameState.currentTurnPlayerId === null) {
+      return null;
     }
-    const myIndex = players.findIndex((player) => player.id === user.id);
-    if (myIndex < 0) {
-      return players;
+    return orderedPlayers.find((player) => player.id === gameState.currentTurnPlayerId) || null;
+  }, [gameState, orderedPlayers]);
+  const timerWaitingLabel = useMemo(() => {
+    if (!gameState || orderedPlayers.length <= 1) {
+      return 'Waiting for other players to join';
     }
-    return players.map((_, idx) => players[(myIndex + idx) % players.length]);
-  }, [gameState, user]);
+    if (currentTurnPlayer) {
+      return `${currentTurnPlayer.username}'s turn to move`;
+    }
+    return 'Waiting for other players to join';
+  }, [gameState, orderedPlayers.length, currentTurnPlayer]);
+  const seatSlotsForLayout = useMemo(() => {
+    const maxSeatFromPlayers = orderedPlayers.reduce((maxSeat, player) => {
+      const seatNumber = Number(player.seatNumber);
+      if (!Number.isFinite(seatNumber) || seatNumber <= 0) {
+        return maxSeat;
+      }
+      return Math.max(maxSeat, Math.floor(seatNumber));
+    }, 0);
+
+    return Math.max(
+      2,
+      Number.isFinite(tableSeatCapacity) ? Math.floor(tableSeatCapacity) : 0,
+      maxSeatFromPlayers,
+      orderedPlayers.length
+    );
+  }, [orderedPlayers, tableSeatCapacity]);
 
   const minRaiseSize = Math.max(1, Math.ceil(gameState?.minRaiseSize || gameState?.minBet || gameState?.bigBlind || 1));
   const quickBetPresets = useMemo(() => {
@@ -623,7 +983,7 @@ export const GameTablePage: React.FC = () => {
     });
 
     return byUserId;
-  }, [handResult]);
+  }, [handResult, extractUserId]);
   const currentPlayerReveal = useMemo(() => {
     if (!currentPlayer || !handResult) {
       return null;
@@ -641,12 +1001,135 @@ export const GameTablePage: React.FC = () => {
     const names = handResult.winners.map((winner) => winner.username).join(', ');
     return `Winners: ${names} - Split pot`;
   }, [handResult]);
-  const hideBottomHandCards = Boolean(
-    handResult &&
-    currentPlayer &&
-    revealedShowdownHandsByUserId[currentPlayer.id] &&
-    currentPlayerReveal?.holeCards.length
-  );
+  const emoteByUserId = useMemo(() => {
+    const map = new Map<number, string>();
+    activeEmotes.forEach((emote) => {
+      map.set(emote.userId, emote.emoji);
+    });
+    return map;
+  }, [activeEmotes]);
+
+  const tableThemeStyles = useMemo(() => {
+    const styles: CSSProperties = {};
+    if (tableTheme.tableBackground) {
+      (styles as Record<string, string>)['--table-background-image'] = tableTheme.tableBackground;
+    }
+    if (tableTheme.tableFelt) {
+      (styles as Record<string, string>)['--table-felt-image'] = tableTheme.tableFelt;
+    }
+    if (tableTheme.cardFront) {
+      (styles as Record<string, string>)['--card-front-image'] = tableTheme.cardFront;
+    }
+    if (tableTheme.cardBack) {
+      (styles as Record<string, string>)['--card-back-image'] = tableTheme.cardBack;
+    }
+    return styles;
+  }, [tableTheme]);
+
+  useEffect(() => {
+    const container = gameContainerRef.current;
+    const tableStage = tableStageRef.current;
+    if (!container || !tableStage) {
+      return;
+    }
+
+    const readCssPixelValue = (styles: CSSStyleDeclaration, name: string, fallback: number) => {
+      const rawValue = styles.getPropertyValue(name);
+      const parsed = Number.parseFloat((rawValue || '').trim());
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+
+    const readCssUnitValue = (styles: CSSStyleDeclaration, name: string, fallback: number) => {
+      const rawValue = styles.getPropertyValue(name);
+      const parsed = Number.parseFloat((rawValue || '').trim());
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+
+    const syncLayoutTuning = () => {
+      const styles = getComputedStyle(container);
+      const stageRect = tableStage.getBoundingClientRect();
+      if (stageRect.width <= 0 || stageRect.height <= 0) {
+        return;
+      }
+
+      const circleSize = readCssPixelValue(styles, '--player-circle-size', 108);
+      const pocketCardHeight = readCssPixelValue(styles, '--pocket-card-height', 44);
+      const hiddenPocketRatio = Math.max(0, Math.min(1, readCssUnitValue(styles, '--pocket-card-hidden-ratio', 0.25)));
+      const pocketCardLift = readCssPixelValue(styles, '--pocket-card-extra-lift', 2);
+
+      const cardVisibleAboveCircle = pocketCardHeight * Math.max(0.2, 1 - hiddenPocketRatio);
+      const pocketCardProtrusion = (circleSize * 0.5) + cardVisibleAboveCircle + pocketCardLift;
+      const safeTop = pocketCardProtrusion + 16;
+      const safeBottom = (circleSize * 0.55) + 12;
+      const safeHorizontal = (circleSize * 0.56) + 12;
+      const availableWidth = Math.max(220, stageRect.width - (safeHorizontal * 2));
+      const availableHeight = Math.max(180, stageRect.height - safeTop - safeBottom);
+      const stageAspect = stageRect.width / Math.max(1, stageRect.height);
+      const targetAspect = Math.max(1.72, Math.min(2.35, stageAspect * 1.18));
+
+      let tableWidth = availableWidth;
+      let tableHeight = tableWidth / targetAspect;
+
+      if (tableHeight > availableHeight) {
+        tableHeight = availableHeight;
+        tableWidth = tableHeight * targetAspect;
+      }
+
+      tableWidth = Math.max(Math.min(220, availableWidth), Math.min(availableWidth, Math.floor(tableWidth)));
+      tableHeight = Math.max(Math.min(180, availableHeight), Math.min(availableHeight, Math.floor(tableHeight)));
+      const verticalCenterBias = Math.round(Math.max(0, (safeTop - safeBottom) * 0.42));
+
+      container.style.setProperty('--dynamic-table-width', `${tableWidth}px`);
+      container.style.setProperty('--dynamic-table-height', `${tableHeight}px`);
+      container.style.setProperty('--dynamic-table-shift-y', `${verticalCenterBias}px`);
+
+      const nextTuning: TableLayoutTuning = {
+        seatRadiusXPercent: 50,
+        seatRadiusYPercent: 50,
+        seatCardOffsetPx: Math.max(48, Math.min(tableWidth, tableHeight) * 0.17),
+      };
+
+      setTableLayoutTuning((previous) => {
+        if (
+          Math.abs(previous.seatRadiusXPercent - nextTuning.seatRadiusXPercent) < 0.01
+          && Math.abs(previous.seatRadiusYPercent - nextTuning.seatRadiusYPercent) < 0.01
+          && Math.abs(previous.seatCardOffsetPx - nextTuning.seatCardOffsetPx) < 0.01
+        ) {
+          return previous;
+        }
+        return nextTuning;
+      });
+    };
+
+    syncLayoutTuning();
+
+    const onWindowResize = () => {
+      syncLayoutTuning();
+    };
+
+    window.addEventListener('resize', onWindowResize);
+    window.addEventListener('orientationchange', onWindowResize);
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => {
+        syncLayoutTuning();
+      });
+      observer.observe(tableStage);
+      observer.observe(container);
+    }
+
+    return () => {
+      window.removeEventListener('resize', onWindowResize);
+      window.removeEventListener('orientationchange', onWindowResize);
+      if (observer) {
+        observer.disconnect();
+      }
+      container.style.removeProperty('--dynamic-table-width');
+      container.style.removeProperty('--dynamic-table-height');
+      container.style.removeProperty('--dynamic-table-shift-y');
+    };
+  }, [connected, hasGameState]);
 
   useEffect(() => {
     if (!gameState || !isActionPhase || gameState.currentTurnPlayerId === null) {
@@ -711,7 +1194,7 @@ export const GameTablePage: React.FC = () => {
 
   if (!connected) {
     return (
-      <div className="game-container">
+      <div className="game-container" style={tableThemeStyles} ref={gameContainerRef}>
         <div className="connecting-overlay">
           <div className="spinner"></div>
           <p>Connecting to game server...</p>
@@ -726,7 +1209,7 @@ export const GameTablePage: React.FC = () => {
 
   if (!gameState) {
     return (
-      <div className="game-container">
+      <div className="game-container" style={tableThemeStyles} ref={gameContainerRef}>
         <div className="waiting-overlay">
           <h2>Waiting for game to start...</h2>
           <p>Please wait while other players join.</p>
@@ -739,7 +1222,7 @@ export const GameTablePage: React.FC = () => {
   }
 
   return (
-    <div className="game-container">
+    <div className="game-container" style={tableThemeStyles} ref={gameContainerRef}>
       <div className="game-header">
         <h2>Poker Table</h2>
         <div className="game-info">
@@ -747,9 +1230,12 @@ export const GameTablePage: React.FC = () => {
           <span>Pot: {gameState.pot}</span>
           <span>Blinds: {gameState.smallBlind}/{gameState.bigBlind}</span>
         </div>
-        <button onClick={handleLeaveGame} className="btn-leave">
-          Leave
-        </button>
+        <div className="game-header-actions">
+          <RulesScrollHelp variant="game" />
+          <button onClick={handleLeaveGame} className="btn-leave">
+            Leave
+          </button>
+        </div>
       </div>
 
       {error && <div className="error-banner">{error}</div>}
@@ -763,12 +1249,20 @@ export const GameTablePage: React.FC = () => {
       </div>
 
       <div className="game-layout">
-        <section className="table-stage">
-          <div className="game-table">
+        <section className="table-stage" ref={tableStageRef}>
+          <div className="game-table" ref={gameTableRef}>
             <div className="table-center">
               <div className="pot-display">
-                <div className="pot-amount">{gameState.pot}</div>
-                <div className="pot-label">Pot</div>
+                <div className="pot-line">Total Pot: ${gameState.pot}</div>
+                {(gameState.sidePots || []).length > 0 && (
+                  <div className="side-pot-list">
+                    {(gameState.sidePots || []).map((sidePot) => (
+                      <div key={`side-pot-${sidePot.index}`} className="side-pot-chip">
+                        Side Pot {Math.max(1, sidePot.index - 1)}: ${sidePot.amount}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="community-cards">
                 <div className="cards-container">
@@ -793,7 +1287,7 @@ export const GameTablePage: React.FC = () => {
                 const isCurrentUser = player.id === currentPlayer?.id;
                 const isActiveTurn = gameState.currentTurnPlayerId === player.id;
                 const revealData = handResult ? handResultPlayersByUserId.get(player.id) : undefined;
-                const seatLayout = getSeatLayout(index, orderedPlayers.length);
+                const seatLayout = getSeatLayout(player.seatNumber, seatSlotsForLayout, index);
                 const showRevealedCards = Boolean(
                   handResult &&
                   (
@@ -806,48 +1300,98 @@ export const GameTablePage: React.FC = () => {
                 const showFaceDownCards = Boolean(
                   !isCurrentUser &&
                   !showRevealedCards &&
+                  !player.waitingForBigBlind &&
                   !player.hasFolded &&
                   isActionPhase
                 );
+                const showOwnPocketCards = Boolean(
+                  isCurrentUser &&
+                  !showRevealedCards &&
+                  !player.waitingForBigBlind &&
+                  !player.hasFolded &&
+                  Array.isArray(player.hand) &&
+                  player.hand.length > 0
+                );
+                const revealedPocketCards = showRevealedCards && revealData ? revealData.holeCards : null;
+                const visiblePocketCards = showOwnPocketCards
+                  ? player.hand || null
+                  : (revealedPocketCards && revealedPocketCards.length > 0 ? revealedPocketCards : null);
+                const showSeatPocketCards = showFaceDownCards || Boolean(visiblePocketCards && visiblePocketCards.length > 0);
+                const betOffsetPx = Math.max(52, tableLayoutTuning.seatCardOffsetPx * 0.62);
                 const roleBadges: string[] = [];
 
                 if (gameState.dealerPlayerId === player.id) roleBadges.push('D');
                 if (gameState.smallBlindPlayerId === player.id) roleBadges.push('SB');
                 if (gameState.bigBlindPlayerId === player.id) roleBadges.push('BB');
+                if (player.isApiBot) roleBadges.push('BOT');
 
                 return (
                   <div
                     key={player.id}
-                    className={`player-seat ${isCurrentUser ? 'current-user' : ''} ${isActiveTurn ? 'active-turn' : ''} ${player.hasFolded ? 'folded' : ''} ${showRevealedCards ? 'revealed-hand' : ''}`}
+                    className={`player-seat ${isCurrentUser ? 'current-user' : ''} ${isActiveTurn ? 'active-turn' : ''} ${player.hasFolded ? 'folded' : ''} ${player.waitingForBigBlind ? 'waiting-big-blind' : ''} ${showRevealedCards ? 'revealed-hand' : ''}`}
                     style={{ left: `${seatLayout.leftPercent}%`, top: `${seatLayout.topPercent}%` }}
                   >
-                    {showFaceDownCards && (
+                    {emoteByUserId.get(player.id) && (
+                      <div className="seat-emote-bubble">{emoteByUserId.get(player.id)}</div>
+                    )}
+                    {player.currentBet > 0 && (
                       <div
-                        className="seat-facedown-cards"
+                        className="seat-bet-chip"
                         style={{
-                          '--card-offset-x': `${Math.cos(seatLayout.angle) * 126}px`,
-                          '--card-offset-y': `${Math.sin(seatLayout.angle) * 126}px`,
+                          '--bet-offset-x': `${Math.cos(seatLayout.angle) * -betOffsetPx}px`,
+                          '--bet-offset-y': `${Math.sin(seatLayout.angle) * -betOffsetPx}px`,
                         } as CSSProperties}
                       >
-                        {renderFaceDownCard(`${player.id}-fd1`, 'seat-facedown-card')}
-                        {renderFaceDownCard(`${player.id}-fd2`, 'seat-facedown-card')}
+                        ${player.currentBet}
                       </div>
                     )}
-                    <div className="player-circle" style={getActiveTurnMeterStyle(player.id)}>
-                      {showRevealedCards && revealData && (
-                        <div className="player-circle-revealed-cards">
-                          {revealData.holeCards.map((card, cardIndex) =>
-                            renderCard(card, cardIndex, 'seat-reveal-card')
+                    {showSeatPocketCards && (
+                      <div className="seat-pocket-cards" aria-hidden="true">
+                        {visiblePocketCards && visiblePocketCards.length > 0
+                          ? visiblePocketCards.map((card, cardIndex) =>
+                              renderCard(
+                                card,
+                                cardIndex,
+                                `seat-pocket-card ${showOwnPocketCards && animatedHoleCardIndexes.includes(cardIndex) ? 'deal-in' : ''}`,
+                                showOwnPocketCards && animatedHoleCardIndexes.includes(cardIndex) ? cardIndex * 220 : 0
+                              )
+                            )
+                          : (
+                            <>
+                              {renderFaceDownCard(`${player.id}-fd1`, 'seat-pocket-card seat-pocket-card-back')}
+                              {renderFaceDownCard(`${player.id}-fd2`, 'seat-pocket-card seat-pocket-card-back')}
+                            </>
                           )}
-                        </div>
-                      )}
+                      </div>
+                    )}
+                    <div
+                      className="player-circle"
+                      style={getActiveTurnMeterStyle(player.id)}
+                      onClick={() => openPlayerNotesPanel(player)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          openPlayerNotesPanel(player);
+                        }
+                      }}
+                      aria-label={`Open note panel for ${player.username}`}
+                    >
+                      <div className="player-avatar-shell">
+                        {player.profileImageUrl ? (
+                          <img className="player-avatar-image" src={player.profileImageUrl} alt={`${player.username} avatar`} />
+                        ) : (
+                          <span className="player-avatar-placeholder" aria-hidden="true" />
+                        )}
+                      </div>
                       <div className="player-name">{player.username}</div>
-                      <div className="player-stack">{player.stack}</div>
-                      <div className="player-bet">Bet {player.currentBet}</div>
+                      <div className="player-stack">${player.stack}</div>
                       <div className="player-badges">
                         {roleBadges.map((badge) => (
-                          <span key={badge} className="seat-role-badge">{badge}</span>
+                          <span key={badge} className={`seat-role-badge ${badge === 'BOT' ? 'bot' : ''}`}>{badge}</span>
                         ))}
+                        {player.waitingForBigBlind && <span className="status-badge waiting">WAIT BB</span>}
                         {player.isAllIn && <span className="status-badge allin">ALL IN</span>}
                         {player.hasFolded && <span className="status-badge folded">FOLDED</span>}
                         {isActiveTurn && <span className="status-badge active">TURN</span>}
@@ -861,45 +1405,24 @@ export const GameTablePage: React.FC = () => {
         </section>
 
         <section className="bottom-panel">
-          {currentPlayer?.hand && currentPlayer.hand.length > 0 && (
-            <div className="player-hand">
-              <div className={`cards-container ${hideBottomHandCards ? 'hidden-hand-cards' : ''}`}>
-                {currentPlayer.hand.map((card, index) =>
-                  renderCard(
-                    card,
-                    index,
-                    animatedHoleCardIndexes.includes(index) ? 'deal-in' : '',
-                    animatedHoleCardIndexes.includes(index) ? index * 220 : 0
-                  )
-                )}
-              </div>
-              <div className="player-hand-controls-slot">
-                {handResult && currentPlayerReveal && currentPlayerReveal.holeCards.length > 0 && (
-                  <button
-                    type="button"
-                    className="btn-toggle-own-show"
-                    onClick={() => {
-                      if (!socket || !connected || !currentPlayer) {
-                        return;
-                      }
-                      socket.emit('show_hand_choice', {
-                        show: !Boolean(revealedShowdownHandsByUserId[currentPlayer.id]),
-                      });
-                    }}
-                  >
-                    {currentPlayer && revealedShowdownHandsByUserId[currentPlayer.id] ? 'Hide My Cards' : 'Show My Cards'}
-                  </button>
-                )}
-              </div>
-            </div>
-          )}
-
-          <ActionTimer
-            turnSeconds={gameState.actionTimeoutSeconds}
-            remainingTurnSeconds={gameState.remainingActionTime}
-            reserveSeconds={currentPlayer?.timeBankSeconds}
-            isMyTurn={isMyTurn()}
-          />
+          <div className="post-hand-controls-slot">
+            {handResult && currentPlayerReveal && currentPlayerReveal.holeCards.length > 0 && (
+              <button
+                type="button"
+                className="btn-toggle-own-show"
+                onClick={() => {
+                  if (!socket || !connected || !currentPlayer) {
+                    return;
+                  }
+                  socket.emit('show_hand_choice', {
+                    show: !revealedShowdownHandsByUserId[currentPlayer.id],
+                  });
+                }}
+              >
+                {currentPlayer && revealedShowdownHandsByUserId[currentPlayer.id] ? 'Hide My Cards' : 'Show My Cards'}
+              </button>
+            )}
+          </div>
 
           <div className="action-area">
             {canAct && (
@@ -964,15 +1487,9 @@ export const GameTablePage: React.FC = () => {
               </div>
             )}
 
-            {!!currentPlayer && !canAct && !currentPlayer.hasFolded && !bustMessage && isActionPhase && (
+            {!!currentPlayer && currentPlayer.waitingForBigBlind && !bustMessage && (
               <div className="waiting-turn">
-                <p>Waiting for other players...</p>
-              </div>
-            )}
-
-            {!!currentPlayer && !canAct && !currentPlayer.hasFolded && !bustMessage && !isActionPhase && (
-              <div className="waiting-turn">
-                <p>Hand complete. Waiting for next hand...</p>
+                <p>Seated. Waiting until your big blind to enter.</p>
               </div>
             )}
 
@@ -982,8 +1499,72 @@ export const GameTablePage: React.FC = () => {
               </div>
             )}
           </div>
+
+          <div className="emote-row">
+            {QUICK_EMOTES.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                className="btn-emote"
+                onClick={() => sendEmote(emoji)}
+                title={`Send ${emoji}`}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+
+          <ActionTimer
+            turnSeconds={gameState.actionTimeoutSeconds}
+            remainingTurnSeconds={gameState.remainingActionTime}
+            reserveSeconds={currentPlayer?.timeBankSeconds}
+            isMyTurn={isMyTurn()}
+            waitingLabel={timerWaitingLabel}
+          />
         </section>
       </div>
+
+      {noteTargetPlayer && (
+        <div className="player-note-overlay" onClick={closePlayerNotesPanel}>
+          <div className="player-note-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="player-note-header">
+              <h4>{noteTargetPlayer.username}</h4>
+              <button type="button" className="player-note-close" onClick={closePlayerNotesPanel}>
+                Close
+              </button>
+            </div>
+
+            {noteTargetPlayer.id === user?.id ? (
+              <div className="player-note-self-hint">Notes are available only for other players.</div>
+            ) : (
+              <>
+                <div className="player-note-subtitle">Private notes saved across all tables and communities.</div>
+                <textarea
+                  className="player-note-textarea"
+                  value={noteText}
+                  onChange={(event) => setNoteText(event.target.value)}
+                  placeholder={`Add reads on ${noteTargetPlayer.username}...`}
+                  maxLength={2000}
+                  disabled={noteLoading || noteSaving}
+                />
+                <div className="player-note-footer">
+                  <button
+                    type="button"
+                    className="player-note-save"
+                    disabled={noteLoading || noteSaving}
+                    onClick={savePlayerNotes}
+                  >
+                    {noteSaving ? 'Saving...' : 'Save Notes'}
+                  </button>
+                </div>
+                {noteLoading && <div className="player-note-info">Loading notes...</div>}
+                {noteError && <div className="player-note-error">{noteError}</div>}
+                {noteInfo && <div className="player-note-info">{noteInfo}</div>}
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className={`chat-panel ${chatMinimized ? 'minimized' : ''}`}>
         <div className="chat-header">

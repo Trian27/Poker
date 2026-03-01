@@ -45,7 +45,8 @@ describe('Redis Integration', () => {
       expect(loadedData).toBeTruthy();
 
       // Verify structure
-      expect(loadedData.config).toEqual(config);
+      expect(loadedData.config).toMatchObject(config);
+      expect(loadedData.config.reserveTimeSeconds).toBeGreaterThan(0);
       expect(loadedData.players).toHaveLength(2);
       expect(loadedData.pot).toBeGreaterThan(0);
     });

@@ -1,15 +1,62 @@
 .community-lobby {
   max-width: 1400px;
+  width: 100%;
   margin: 0 auto;
-  padding: 2rem;
+  padding: clamp(1rem, 2.4vw, 2rem);
 }
 
 .lobby-header {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   color: white;
-  padding: 2rem;
+  padding: clamp(1rem, 2.2vw, 2rem);
   border-radius: 12px;
   margin-bottom: 2rem;
+}
+
+.lobby-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.lobby-user-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.community-inbox-btn {
+  position: relative;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  border-radius: 8px;
+  padding: 0.55rem 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.community-inbox-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.community-inbox-btn .badge {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .back-button {
@@ -19,7 +66,7 @@
   padding: 0.5rem 1rem;
   border-radius: 6px;
   cursor: pointer;
-  margin-bottom: 1rem;
+  margin-bottom: 0;
   font-size: 0.9rem;
 }
 
@@ -29,7 +76,7 @@
 
 .lobby-header h1 {
   margin: 0 0 0.5rem 0;
-  font-size: 2.5rem;
+  font-size: clamp(1.45rem, 4.8vw, 2.5rem);
 }
 
 .lobby-header p {
@@ -77,6 +124,8 @@
   margin-bottom: 2rem;
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .create-table-button {
@@ -101,6 +150,21 @@
   cursor: not-allowed;
 }
 
+.delete-community-button {
+  background: #dc2626;
+  color: #fff;
+  border: none;
+  padding: 0.75rem 1.2rem;
+  border-radius: 8px;
+  font-size: 0.95rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.delete-community-button:hover {
+  background: #b91c1c;
+}
+
 .tables-section h2 {
   margin-bottom: 1.5rem;
   color: #333;
@@ -116,7 +180,7 @@
 
 .tables-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 1.5rem;
 }
 
@@ -190,26 +254,56 @@
   font-weight: 600;
 }
 
-.status-badge {
+.community-status-badge {
   padding: 0.25rem 0.75rem;
   border-radius: 12px;
   font-size: 0.85rem;
   font-weight: 600;
 }
 
-.status-badge.waiting {
+.community-status-badge.waiting {
   background: #e3f2fd;
   color: #1976d2;
 }
 
-.status-badge.playing {
+.community-status-badge.playing {
   background: #e8f5e9;
   color: #4caf50;
 }
 
-.status-badge.finished {
+.community-status-badge.finished {
   background: #f5f5f5;
   color: #999;
+}
+
+.community-status-badge.scheduled {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.community-status-badge.waiting_for_players {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.community-status-badge.awaiting_confirmations {
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+.community-status-badge.running {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.community-status-badge.completed {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+
+.community-status-badge.canceled {
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 .join-button {
@@ -235,6 +329,20 @@
   cursor: not-allowed;
 }
 
+.join-button.secondary {
+  background: #334155;
+}
+
+.join-button.secondary:hover:not(:disabled) {
+  box-shadow: 0 4px 12px rgba(51, 65, 85, 0.35);
+}
+
+.tournament-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
 /* Modal Styles */
 .modal-overlay {
   position: fixed;
@@ -247,6 +355,7 @@
   align-items: center;
   justify-content: center;
   z-index: 1000;
+  padding: 14px;
 }
 
 .modal-content {
@@ -255,7 +364,7 @@
   padding: 2rem;
   max-width: 500px;
   width: 90%;
-  max-height: 90vh;
+  max-height: 90svh;
   overflow-y: auto;
 }
 
@@ -399,7 +508,8 @@
 /* Seat Selection Styles */
 .seat-selection-modal .modal-content {
   max-width: 800px;
-  max-height: 90vh;
+  width: min(800px, 96vw);
+  max-height: 90svh;
   overflow-y: auto;
 }
 
@@ -423,16 +533,19 @@
 .poker-table-visual {
   display: flex;
   justify-content: center;
-  padding: 2rem 1rem;
+  padding: 1.4rem 0.9rem;
+  overflow-x: auto;
+  overflow-y: visible;
 }
 
 .table-felt {
   position: relative;
-  width: 600px;
-  height: 400px;
+  width: min(600px, 92vw);
+  aspect-ratio: 3 / 2;
+  height: auto;
   background: linear-gradient(135deg, #1e7d1e 0%, #166d16 100%);
-  border-radius: 200px;
-  border: 12px solid #8b4513;
+  border-radius: 999px;
+  border: clamp(8px, 1.7vw, 12px) solid #8b4513;
   box-shadow: 
     inset 0 4px 20px rgba(0, 0, 0, 0.3),
     0 8px 30px rgba(0, 0, 0, 0.4);
@@ -445,8 +558,8 @@
 
 .seat-button {
   position: relative;
-  width: 90px;
-  height: 90px;
+  width: clamp(66px, 10vw, 90px);
+  height: clamp(66px, 10vw, 90px);
   border-radius: 50%;
   border: 3px solid #ddd;
   background: white;
@@ -473,9 +586,22 @@
 }
 
 .seat-button.occupied {
-  background: #f5f5f5;
-  border-color: #ccc;
+  background: #e5e7eb;
+  border-color: #9ca3af;
   cursor: not-allowed;
+}
+
+.seat-button.occupied:disabled {
+  opacity: 1;
+}
+
+.seat-button.occupied .seat-player-name {
+  color: #111827;
+  font-weight: 700;
+}
+
+.seat-button.occupied .seat-player-avatar {
+  color: #1f2937;
 }
 
 .seat-button.yours {
@@ -492,7 +618,7 @@
 }
 
 .seat-button:disabled {
-  opacity: 0.7;
+  opacity: 0.85;
 }
 
 .seat-number {
@@ -520,16 +646,16 @@
   gap: 0.3rem;
 }
 
-.player-avatar {
-  font-size: 2rem;
+.seat-player-avatar {
+  font-size: clamp(1.3rem, 3.6vw, 2rem);
 }
 
-.player-name {
-  font-size: 0.75rem;
+.seat-player-name {
+  font-size: clamp(0.62rem, 1.6vw, 0.75rem);
   font-weight: 600;
   color: #555;
   text-align: center;
-  max-width: 70px;
+  max-width: 85%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -545,6 +671,114 @@
   color: white;
 }
 
+.community-inbox-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.58);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: 20px;
+}
+
+.community-review-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1200;
+  padding: 14px;
+}
+
+.community-review-modal {
+  background: #fff;
+  border-radius: 12px;
+  padding: 1.5rem;
+  width: min(520px, 100%);
+  max-height: 90svh;
+  overflow-y: auto;
+}
+
+.community-inbox-modal {
+  width: min(760px, 100%);
+  max-height: 84vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 12px;
+  padding: 1.25rem;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+
+.community-inbox-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.9rem;
+}
+
+.community-inbox-header h2 {
+  margin: 0;
+  color: #1f2937;
+}
+
+.community-inbox-empty {
+  margin: 0.5rem 0;
+  color: #6b7280;
+}
+
+.community-inbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.community-inbox-message {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 0.75rem;
+  cursor: pointer;
+}
+
+.community-inbox-message.unread {
+  border-color: #60a5fa;
+  background: #eff6ff;
+}
+
+.community-inbox-title-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: baseline;
+}
+
+.community-inbox-title-row span {
+  color: #64748b;
+  font-size: 0.8rem;
+}
+
+.community-inbox-message p {
+  margin: 0.35rem 0 0.45rem;
+  color: #374151;
+}
+
+.community-inbox-from {
+  font-size: 0.8rem;
+  color: #64748b;
+}
+
+.community-inbox-message .message-actions {
+  margin-top: 0.55rem;
+}
+
+.community-inbox-message .action-taken {
+  margin-top: 0.55rem;
+  font-size: 0.82rem;
+  color: #1e40af;
+}
+
 .seat-selected-info {
   text-align: center;
   padding: 1rem;
@@ -556,40 +790,209 @@
 }
 
 /* Responsive adjustments */
+@media (max-width: 1024px) {
+  .community-lobby {
+    padding: 1.2rem;
+  }
+
+  .tables-grid {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  }
+
+  .table-card {
+    padding: 1.1rem;
+  }
+}
+
 @media (max-width: 768px) {
-  .poker-table-visual {
-    padding: 1rem 0.5rem;
+  .community-lobby {
+    padding: 0.95rem;
   }
-  
-  .table-felt {
+
+  .lobby-header {
+    margin-bottom: 1.2rem;
+    border-radius: 10px;
+  }
+
+  .lobby-header-top {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .lobby-user-actions {
     width: 100%;
-    max-width: 500px;
-    height: 350px;
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
-  
-  .seat-button {
-    width: 70px;
-    height: 70px;
-    font-size: 0.75rem;
+
+  .wallet-balance {
+    font-size: 1.03rem;
+    padding: 0.8rem 0.9rem;
   }
-  
+
+  .wallet-balance strong {
+    font-size: 1.2rem;
+  }
+
+  .lobby-actions {
+    justify-content: stretch;
+    flex-direction: column;
+  }
+
+  .create-table-button {
+    width: 100%;
+  }
+
+  .delete-community-button {
+    width: 100%;
+  }
+
+  .tables-grid {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  .table-header {
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .table-header h3 {
+    font-size: 1.08rem;
+  }
+
+  .form-row {
+    grid-template-columns: 1fr;
+  }
+
+  .modal-content {
+    width: 100%;
+    padding: 1rem;
+  }
+
+  .modal-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .modal-actions button {
+    width: 100%;
+  }
+
+  .poker-table-visual {
+    padding: 0.9rem 0.45rem;
+  }
+
+  .table-felt {
+    width: min(520px, 96vw);
+  }
+
   .seat-number {
     width: 20px;
     height: 20px;
-    font-size: 0.7rem;
+    font-size: 0.69rem;
   }
-  
-  .player-avatar {
-    font-size: 1.5rem;
-  }
-  
-  .player-name {
-    font-size: 0.65rem;
-    max-width: 55px;
-  }
-  
+
   .seat-empty {
-    font-size: 2rem;
+    font-size: clamp(1.8rem, 6vw, 2.2rem);
+  }
+}
+
+@media (max-width: 560px) {
+  .community-lobby {
+    padding: 0.7rem;
+  }
+
+  .lobby-header {
+    padding: 0.9rem;
+  }
+
+  .lobby-header p {
+    margin-bottom: 0.8rem;
+    font-size: 0.9rem;
+  }
+
+  .community-inbox-btn,
+  .back-button {
+    font-size: 0.84rem;
+    padding: 0.45rem 0.7rem;
+  }
+
+  .table-card {
+    padding: 0.92rem;
+  }
+
+  .join-button,
+  .join-button.secondary {
+    font-size: 0.92rem;
+    padding: 0.64rem;
+  }
+
+  .info-row {
+    gap: 8px;
+    align-items: flex-start;
+  }
+
+  .info-row strong {
+    text-align: right;
+  }
+
+  .community-inbox-overlay {
+    padding: 10px;
+  }
+
+  .community-inbox-modal {
+    padding: 0.9rem;
+    max-height: 90svh;
+  }
+
+  .community-inbox-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.4rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .lobby-header h1 {
+    font-size: 1.28rem;
+  }
+
+  .wallet-balance {
+    width: 100%;
+    text-align: center;
+  }
+
+  .table-felt {
+    width: 96vw;
+  }
+
+  .seat-button {
+    border-width: 2px;
+    padding: 0.35rem;
+  }
+
+  .seat-player {
+    gap: 0.18rem;
+  }
+
+  .seat-number {
+    top: -6px;
+  }
+}
+
+@media (max-height: 700px) {
+  .seat-selection-modal .modal-content {
+    max-height: 84svh;
+  }
+
+  .seat-selection {
+    margin: 1rem 0;
+  }
+
+  .poker-table-visual {
+    padding-top: 0.7rem;
+    padding-bottom: 0.7rem;
   }
 }
 

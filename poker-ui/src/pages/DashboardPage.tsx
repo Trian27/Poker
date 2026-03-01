@@ -2,12 +2,16 @@
  * Dashboard/Lobby page - shows leagues, communities, wallets, inbox
  */
 import React, { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { useAuth } from '../AuthContext';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../auth-context';
 import { communitiesApi, walletsApi, leaguesApi, inboxApi, tablesApi } from '../api';
 import type { Community, Wallet, League, InboxMessage, AdminUser } from '../types';
 import UserMenu from '../components/UserMenu';
 import './Dashboard.css';
+import { getApiErrorMessage } from "../utils/error";
+import { isAutoRejoinSuppressed, shouldRunReloadAutoRejoinCheck } from '../utils/activeSeatRejoin';
+
+const UNREAD_COUNT_STORAGE_KEY = 'poker-inbox-unread-count';
 
 export const DashboardPage: React.FC = () => {
   const REFRESH_INTERVAL_MS = 5000;
@@ -62,6 +66,7 @@ export const DashboardPage: React.FC = () => {
   
   const { user } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const loadData = useCallback(async (showLoader: boolean = false) => {
     try {
@@ -79,8 +84,8 @@ export const DashboardPage: React.FC = () => {
       setCommunities(communitiesData);
       setWallets(walletsData);
       setLeagues(leaguesData);
-    } catch (err: any) {
-      const message = err.response?.data?.detail || 'Failed to load data';
+    } catch (err: unknown) {
+      const message = getApiErrorMessage(err, 'Failed to load data');
       if (showLoader) {
         setError(message);
       } else {
@@ -96,9 +101,24 @@ export const DashboardPage: React.FC = () => {
   const loadUnreadCount = useCallback(async () => {
     try {
       const data = await inboxApi.getUnreadCount();
-      setUnreadCount(data.unread_count);
+      const nextCount = Number(data.unread_count || 0);
+      setUnreadCount(nextCount);
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(UNREAD_COUNT_STORAGE_KEY, String(nextCount));
+      }
+      window.dispatchEvent(new CustomEvent('inbox-unread-updated', { detail: { count: nextCount } }));
     } catch (err) {
       console.error('Failed to load unread count:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const cachedCount = Number(window.localStorage.getItem(UNREAD_COUNT_STORAGE_KEY));
+    if (Number.isFinite(cachedCount) && cachedCount >= 0) {
+      setUnreadCount(cachedCount);
     }
   }, []);
 
@@ -111,11 +131,15 @@ export const DashboardPage: React.FC = () => {
     let cancelled = false;
 
     const tryAutoRejoinOnReload = async () => {
+      if (!shouldRunReloadAutoRejoinCheck()) {
+        return;
+      }
+
       const navigationEntries = performance.getEntriesByType('navigation');
       const navigationEntry = navigationEntries[0] as PerformanceNavigationTiming | undefined;
       const isReload = navigationEntry?.type === 'reload';
 
-      if (!isReload) {
+      if (!isReload || isAutoRejoinSuppressed()) {
         return;
       }
 
@@ -167,20 +191,46 @@ export const DashboardPage: React.FC = () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [loadData, loadUnreadCount]);
+
+  useEffect(() => {
+    const onUnreadUpdate = (event: Event) => {
+      const customEvent = event as CustomEvent<{ count?: number }>;
+      const nextCount = Number(customEvent.detail?.count);
+      if (Number.isFinite(nextCount)) {
+        setUnreadCount(nextCount);
+      }
+    };
+    const onStorageUpdate = (event: StorageEvent) => {
+      if (event.key !== UNREAD_COUNT_STORAGE_KEY || event.newValue === null) {
+        return;
+      }
+      const nextCount = Number(event.newValue);
+      if (Number.isFinite(nextCount) && nextCount >= 0) {
+        setUnreadCount(nextCount);
+      }
+    };
+
+    window.addEventListener('inbox-unread-updated', onUnreadUpdate as EventListener);
+    window.addEventListener('storage', onStorageUpdate);
+    return () => {
+      window.removeEventListener('inbox-unread-updated', onUnreadUpdate as EventListener);
+      window.removeEventListener('storage', onStorageUpdate);
+    };
+  }, []);
   
   // Auto-expand leagues when loaded
   useEffect(() => {
     if (leagues.length > 0 && expandedLeagues.size === 0) {
       setExpandedLeagues(new Set(leagues.map(l => l.id)));
     }
-  }, [leagues]);
+  }, [leagues, expandedLeagues.size]);
 
   const loadInbox = async () => {
     try {
       const messages = await inboxApi.getMessages();
       setInboxMessages(messages);
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to load inbox');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to load inbox'));
     }
   };
 
@@ -223,8 +273,8 @@ export const DashboardPage: React.FC = () => {
       setLeagueAdmins(data.admins || []);
       setSelectedLeague(league);
       setShowLeagueSettingsModal(true);
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to load league settings');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to load league settings'));
     }
   };
 
@@ -238,8 +288,8 @@ export const DashboardPage: React.FC = () => {
       setCommunityAdmins(data.admins || []);
       setSelectedCommunity(community);
       setShowCommunitySettingsModal(true);
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to load community settings');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to load community settings'));
     }
   };
 
@@ -274,8 +324,8 @@ export const DashboardPage: React.FC = () => {
       setLeagueAdmins(data.admins || []);
       setLeagueAdminInvite('');
       alert('League admin invited successfully');
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to invite league admin');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to invite league admin'));
     }
   };
 
@@ -288,6 +338,16 @@ export const DashboardPage: React.FC = () => {
     !!user &&
     !!selectedCommunity &&
     (communityCommissioner?.id === user.id || communityAdmins.some((admin) => admin.id === user.id));
+
+  const canDeleteSelectedLeague =
+    !!user &&
+    !!selectedLeague &&
+    (Boolean(user.is_admin) || selectedLeague.owner_id === user.id);
+
+  const canDeleteSelectedCommunity =
+    !!user &&
+    !!selectedCommunity &&
+    (Boolean(user.is_admin) || selectedCommunity.commissioner_id === user.id || communityCommissioner?.id === user.id);
 
   const inviteCommunityAdmin = async () => {
     if (!selectedCommunity) return;
@@ -304,8 +364,52 @@ export const DashboardPage: React.FC = () => {
       setCommunityAdmins(data.admins || []);
       setCommunityAdminInvite('');
       alert('Community admin invited successfully');
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to invite community admin');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to invite community admin'));
+    }
+  };
+
+  const deleteSelectedLeague = async () => {
+    if (!selectedLeague || !canDeleteSelectedLeague) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete league "${selectedLeague.name}"? This deletes all of its communities and tables.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await leaguesApi.delete(selectedLeague.id);
+      closeLeagueSettings();
+      await loadData(true);
+      alert('League deleted successfully.');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to delete league'));
+    }
+  };
+
+  const deleteSelectedCommunity = async () => {
+    if (!selectedCommunity || !canDeleteSelectedCommunity) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete community "${selectedCommunity.name}"? This deletes its tables and wallets.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await communitiesApi.delete(selectedCommunity.id);
+      closeCommunitySettings();
+      await loadData(true);
+      alert('Community deleted successfully.');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to delete community'));
     }
   };
   
@@ -339,8 +443,8 @@ export const DashboardPage: React.FC = () => {
       alert('Join request submitted! The commissioner will review it.');
       setShowJoinRequestModal(false);
       setJoinRequestMessage('');
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to submit request');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to submit request'));
     }
   };
 
@@ -352,8 +456,8 @@ export const DashboardPage: React.FC = () => {
       alert('League join request submitted!');
       closeLeagueJoinModal();
       await loadData();
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to submit league join request');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to submit league join request'));
     }
   };
 
@@ -391,8 +495,8 @@ export const DashboardPage: React.FC = () => {
       setCreateCommunityForLeague(null);
       await loadData();
       alert('Community created successfully! You are the commissioner.');
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to create community');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to create community'));
     }
   };
 
@@ -408,13 +512,14 @@ export const DashboardPage: React.FC = () => {
       // Expand the new league
       setExpandedLeagues(prev => new Set([...prev, newLeague.id]));
       alert('League created successfully!');
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to create league');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to create league'));
     }
   };
 
   const openInbox = async () => {
     await loadInbox();
+    await loadUnreadCount();
     setShowInboxModal(true);
   };
 
@@ -423,8 +528,8 @@ export const DashboardPage: React.FC = () => {
       await inboxApi.markAsRead(messageId);
       await loadInbox();
       await loadUnreadCount();
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to mark as read');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to mark as read'));
     }
   };
 
@@ -456,8 +561,8 @@ export const DashboardPage: React.FC = () => {
       await loadInbox();
       await loadUnreadCount();
       alert(`Request ${action === 'approve' ? 'approved' : 'denied'} successfully!`);
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to process action');
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to process action'));
     }
   };
 
@@ -494,6 +599,20 @@ export const DashboardPage: React.FC = () => {
       )}
 
       {error && <div className="error-message">{error}</div>}
+
+      <section className="platform-tools">
+        <button
+          className="btn-secondary"
+          onClick={() => navigate('/learning', { state: { from: `${location.pathname}${location.search}` } })}
+        >
+          📘 Learning
+        </button>
+        <button className="btn-secondary" onClick={() => navigate('/messages')}>Direct Messages</button>
+        <button className="btn-secondary" onClick={() => navigate('/marketplace')}>Marketplace</button>
+        <button className="btn-secondary" onClick={() => navigate('/skins')}>My Skins</button>
+        <button className="btn-secondary" onClick={() => navigate('/tournaments')}>Tournaments</button>
+        <button className="btn-secondary" onClick={() => navigate('/feedback')}>Feedback / Bugs</button>
+      </section>
 
       <main className="dashboard-main">
         <section className="leagues-section">
@@ -834,6 +953,11 @@ export const DashboardPage: React.FC = () => {
                 <p className="settings-note">Only league owners or admins can invite new admins.</p>
               )}
               <div className="modal-actions">
+                {canDeleteSelectedLeague && (
+                  <button type="button" onClick={deleteSelectedLeague} className="btn-danger">
+                    Delete League
+                  </button>
+                )}
                 <button type="button" onClick={closeLeagueSettings} className="btn-secondary">
                   Close
                 </button>
@@ -903,6 +1027,11 @@ export const DashboardPage: React.FC = () => {
                 <p className="settings-note">Only community commissioners or admins can invite new admins.</p>
               )}
               <div className="modal-actions">
+                {canDeleteSelectedCommunity && (
+                  <button type="button" onClick={deleteSelectedCommunity} className="btn-danger">
+                    Delete Community
+                  </button>
+                )}
                 <button type="button" onClick={closeCommunitySettings} className="btn-secondary">
                   Close
                 </button>
@@ -968,6 +1097,40 @@ export const DashboardPage: React.FC = () => {
                       </span>
                     </div>
                     <p className="message-content">{message.content}</p>
+                    {message.message_type.startsWith('skin_submission') && (
+                      <div className="message-skin-meta">
+                        {typeof message.metadata?.reference_image_url === 'string' && (
+                          <img
+                            src={message.metadata.reference_image_url}
+                            alt="Skin submission reference"
+                            className="message-preview-image"
+                          />
+                        )}
+                        {typeof message.metadata?.admin_rendered_image_url === 'string' && (
+                          <img
+                            src={message.metadata.admin_rendered_image_url}
+                            alt="Admin rendered skin preview"
+                            className="message-preview-image"
+                          />
+                        )}
+                        {message.metadata?.proposed_price_gold_coins !== undefined && (
+                          <div className="message-meta-line">
+                            Proposed Price: {String(message.metadata.proposed_price_gold_coins)} GC
+                          </div>
+                        )}
+                        {typeof message.metadata?.admin_comment === 'string' && message.metadata.admin_comment.trim().length > 0 && (
+                          <div className="message-meta-line">
+                            Admin Comment: {message.metadata.admin_comment}
+                          </div>
+                        )}
+                        {Boolean(message.metadata?.proposed_design_spec) && (
+                          <details className="message-json-details">
+                            <summary>Proposed JSON</summary>
+                            <pre>{JSON.stringify(message.metadata?.proposed_design_spec ?? {}, null, 2)}</pre>
+                          </details>
+                        )}
+                      </div>
+                    )}
                     <div className="message-from">From: {message.sender_username || 'System'}</div>
                     
                     {message.is_actionable && !message.action_taken && (

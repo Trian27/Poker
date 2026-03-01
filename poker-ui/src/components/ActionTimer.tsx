@@ -9,13 +9,15 @@ interface ActionTimerProps {
   remainingTurnSeconds?: number;
   reserveSeconds?: number;
   isMyTurn: boolean;
+  waitingLabel?: string;
 }
 
 export const ActionTimer: React.FC<ActionTimerProps> = ({ 
   turnSeconds,
   remainingTurnSeconds: initialTurnRemaining,
   reserveSeconds: initialReserveSeconds,
-  isMyTurn 
+  isMyTurn,
+  waitingLabel
 }) => {
   const [remainingTurnSeconds, setRemainingTurnSeconds] = useState(initialTurnRemaining || 0);
   const [remainingReserveSeconds, setRemainingReserveSeconds] = useState(initialReserveSeconds || 0);
@@ -75,7 +77,7 @@ export const ActionTimer: React.FC<ActionTimerProps> = ({
             <span className="timer-value">{Math.max(0, Math.ceil(activeSeconds))}s</span>
           </>
         ) : (
-          <span className="timer-label">Waiting for other players...</span>
+          <span className="timer-label">{waitingLabel || 'Waiting for other players...'}</span>
         )}
       </div>
     </div>

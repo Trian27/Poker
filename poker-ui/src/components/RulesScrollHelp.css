@@ -1,0 +1,114 @@
+.rules-scroll-help {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.rules-scroll-help.is-floating {
+  position: fixed;
+  right: 18px;
+  bottom: 16px;
+  z-index: 250;
+}
+
+.rules-scroll-trigger {
+  border: 1px solid rgba(15, 23, 42, 0.35);
+  background: rgba(255, 255, 255, 0.95);
+  color: #0f172a;
+  width: 38px;
+  height: 38px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 1.15rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.18);
+}
+
+.rules-scroll-trigger:hover {
+  transform: translateY(-1px);
+}
+
+.rules-scroll-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: min(380px, calc(100vw - 26px));
+  max-height: min(72vh, 560px);
+  overflow-y: auto;
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.26);
+  padding: 12px 12px 10px;
+  z-index: 260;
+}
+
+.rules-scroll-help.is-floating .rules-scroll-panel {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
+.rules-scroll-panel.game-variant {
+  width: min(350px, calc(100vw - 26px));
+}
+
+.rules-scroll-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.rules-scroll-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.rules-scroll-close {
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #0f172a;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.rules-scroll-close:hover {
+  background: #e2e8f0;
+}
+
+.rules-scroll-note {
+  font-size: 0.8rem;
+  color: #475569;
+  margin: 6px 0 6px;
+  font-weight: 600;
+}
+
+.rules-scroll-list,
+.rules-scroll-links {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 0.84rem;
+}
+
+.rules-scroll-links a {
+  color: #1d4ed8;
+}
+
+@media (max-width: 700px) {
+  .rules-scroll-help.is-floating {
+    right: 12px;
+    bottom: 10px;
+  }
+}
