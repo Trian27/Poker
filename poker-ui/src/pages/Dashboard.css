@@ -24,14 +24,12 @@
   align-items: center;
   flex: 1;
   justify-content: center;
-  /* ADD: Ensure the wrapper fills the header height */
   height: 100%; 
 }
 
 .header-nav {
   display: flex;
   gap: 0;
-  /* ADD: Ensure the nav list fills the wrapper */
   height: 100%; 
 }
 
@@ -39,9 +37,8 @@
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  /* CHANGE: Full height to touch top and bottom */
   height: 100%; 
-  padding: 0 20px; /* Use padding for side-to-side spacing only */
+  padding: 0 20px; 
   border-radius: 0;
   background: transparent;
   color: rgba(255,255,255,0.98);
@@ -52,11 +49,9 @@
 
 .header-nav-item:hover {
   background: rgba(0,0,0,0.22);
-  /* OPTIONAL: Removing translateY often looks cleaner for full-height hovers */
   transform: none; 
 }
 
-/* vertical dividers between header nav items */
 .header-nav-item + .header-nav-item {
   border-left: 1px solid rgba(255,255,255,0.08);
 }
@@ -152,37 +147,50 @@
   gap: 12px;
 }
 
+/* Base Button Styles */
 .btn-primary,
 .btn-secondary {
-  flex: 1;
-  padding: 12px 20px;
-  border: none;
-  border-radius: 8px;
-  font-size: 1rem;
+  /* REMOVED: flex: 1; (This was causing the stretching) */
+  padding: 10px 24px;
+  border-radius: 10px;
+  font-size: 0.95rem;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
+/* Primary (Green) */
 .btn-primary {
   background: linear-gradient(135deg, #10b981 0%, #059669 100%);
   color: white;
+  border: none;
+  box-shadow: 0 4px 15px rgba(16, 185, 129, 0.2);
+  width: max-content; /* This ensures the button only wraps the text */
+  margin-top: 20px;   /* Adds specific breathing room below the title */
+  padding: 12px 32px; /* A bit wider padding makes centered buttons look more premium */
 }
 
 .btn-primary:hover {
   transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
+  box-shadow: 0 8px 25px rgba(16, 185, 129, 0.4);
+  filter: brightness(1.1);
 }
 
+/* Secondary (Outline/Glass) */
+/* Changed from white/purple to a cleaner glass look for a dark UI */
 .btn-secondary {
-  background: white;
-  color: #667eea;
-  border: 2px solid #667eea;
+  background: rgba(255, 255, 255, 0.05);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  backdrop-filter: blur(5px);
 }
 
 .btn-secondary:hover {
-  background: #667eea;
-  color: white;
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.4);
 }
 
 .dashboard-container .btn-secondary {
@@ -246,9 +254,12 @@
 /* Section Header with action button */
 .section-header {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 30px;
+  flex-direction: column; 
+  align-items: center;    /* This centers the children ... */
+  justify-content: center;
+  text-align: center;
+  padding: 0px 20px 40px;     
+  margin-bottom: 40px;
 }
 
 .section-header h2 {
@@ -555,8 +566,10 @@
 /* League styles */
 .leagues-section h2 {
   color: white;
-  margin-bottom: 30px;
-  font-size: 1.8rem;
+  margin: 0; 
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.5px;
 }
 
 .leagues-list {
