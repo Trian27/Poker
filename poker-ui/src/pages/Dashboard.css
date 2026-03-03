@@ -7,12 +7,62 @@
 .dashboard-header {
   background: rgba(255, 255, 255, 0.1);
   backdrop-filter: blur(10px);
-  padding: 20px 40px;
+  /* CHANGE: Vertical padding to 0, horizontal stays 56px */
+  padding: 0 56px; 
   display: flex;
   justify-content: space-between;
   align-items: center;
+  /* CHANGE: Define a height for the header */
+  height: 80px; 
   border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+  position: relative;
+  box-shadow: 0 -8px 20px rgba(0,0,0,0.12), 0 18px 48px rgba(0,0,0,0.5);
 }
+
+.header-nav-wrapper {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  justify-content: center;
+  /* ADD: Ensure the wrapper fills the header height */
+  height: 100%; 
+}
+
+.header-nav {
+  display: flex;
+  gap: 0;
+  /* ADD: Ensure the nav list fills the wrapper */
+  height: 100%; 
+}
+
+.header-nav-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  /* CHANGE: Full height to touch top and bottom */
+  height: 100%; 
+  padding: 0 20px; /* Use padding for side-to-side spacing only */
+  border-radius: 0;
+  background: transparent;
+  color: rgba(255,255,255,0.98);
+  border: none;
+  cursor: pointer;
+  transition: background 0.12s, transform 0.12s;
+}
+
+.header-nav-item:hover {
+  background: rgba(0,0,0,0.22);
+  /* OPTIONAL: Removing translateY often looks cleaner for full-height hovers */
+  transform: none; 
+}
+
+/* vertical dividers between header nav items */
+.header-nav-item + .header-nav-item {
+  border-left: 1px solid rgba(255,255,255,0.08);
+}
+
+.nav-icon { font-size: 0.95rem; }
+.nav-label { font-weight: 700; font-size: 1rem; }
 
 .dashboard-header h1 {
   color: white;
@@ -639,6 +689,50 @@
   padding: 12px 0 4px;
 }
 
+/* Modern pill-style platform nav */
+.platform-nav {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.platform-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.08);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.06);
+  cursor: pointer;
+  font-weight: 600;
+  transition: transform 0.12s, background 0.12s, box-shadow 0.12s;
+}
+
+.platform-item:hover {
+  transform: translateY(-2px);
+  background: rgba(255,255,255,0.12);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+}
+
+.platform-item:focus-visible {
+  outline: 3px solid rgba(99,102,241,0.22);
+  outline-offset: 2px;
+}
+
+.platform-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+}
+
+.platform-label {
+  display: inline-block;
+}
+
 @media (max-width: 1100px) {
   .dashboard-header {
     padding: 16px 24px;
@@ -664,6 +758,10 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 12px;
+  }
+
+  .header-separator {
+    display: none;
   }
 
   .user-info {
@@ -743,6 +841,12 @@
   .platform-tools {
     grid-template-columns: 1fr;
     padding: 10px 12px 0;
+  }
+
+  .header-nav {
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 6px;
   }
 
   .dashboard-main {

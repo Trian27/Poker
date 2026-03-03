@@ -583,7 +583,39 @@ export const DashboardPage: React.FC = () => {
   return (
     <div className="dashboard-container">
       <header className="dashboard-header">
-        <h1>🃏 Poker Platform</h1>
+        <div className="header-left">
+          <h1 className="logo">🃏 Poker Platform</h1>
+        </div>
+
+        <div className="header-separator" aria-hidden />
+
+        <div className="header-nav-wrapper">
+          <nav className="header-nav" aria-label="Platform navigation in header">
+            {[
+              { to: '/learning', label: 'Learning', icon: '📘' },
+              { to: '/messages', label: 'Messages', icon: '✉️' },
+              { to: '/marketplace', label: 'Marketplace', icon: '🛒' },
+              { to: '/skins', label: 'Skins', icon: '🎨' },
+              { to: '/tournaments', label: 'Tournaments', icon: '🏆' },
+              { to: '/feedback', label: 'Feedback', icon: '🐞' },
+            ].map((item) => (
+              <button
+                key={item.to}
+                className="header-nav-item"
+                onClick={() =>
+                  item.to === '/learning'
+                    ? navigate(item.to, { state: { from: `${location.pathname}${location.search}` } })
+                    : navigate(item.to)
+                }
+                aria-label={item.label}
+              >
+                <span className="nav-icon" aria-hidden>{item.icon}</span>
+                <span className="nav-label">{item.label}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+
         <div className="user-info">
           <button onClick={openInbox} className="btn-icon inbox-btn">
             📬 Inbox {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
@@ -599,20 +631,6 @@ export const DashboardPage: React.FC = () => {
       )}
 
       {error && <div className="error-message">{error}</div>}
-
-      <section className="platform-tools">
-        <button
-          className="btn-secondary"
-          onClick={() => navigate('/learning', { state: { from: `${location.pathname}${location.search}` } })}
-        >
-          📘 Learning
-        </button>
-        <button className="btn-secondary" onClick={() => navigate('/messages')}>Direct Messages</button>
-        <button className="btn-secondary" onClick={() => navigate('/marketplace')}>Marketplace</button>
-        <button className="btn-secondary" onClick={() => navigate('/skins')}>My Skins</button>
-        <button className="btn-secondary" onClick={() => navigate('/tournaments')}>Tournaments</button>
-        <button className="btn-secondary" onClick={() => navigate('/feedback')}>Feedback / Bugs</button>
-      </section>
 
       <main className="dashboard-main">
         <section className="leagues-section">
