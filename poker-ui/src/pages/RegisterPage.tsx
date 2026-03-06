@@ -7,6 +7,7 @@ import { useAuth } from '../auth-context';
 import { authApi } from '../api';
 import './AuthPages.css';
 import { getApiErrorMessage } from "../utils/error";
+import { consumePostSignupTutorialPending, markDormstacksSeen } from '../utils/visitorState';
 
 export const RegisterPage: React.FC = () => {
   const [username, setUsername] = useState('');
@@ -24,6 +25,12 @@ export const RegisterPage: React.FC = () => {
   
   const navigate = useNavigate();
   const { login } = useAuth();
+  const brandHeading = (
+    <h1 className="brand-title">
+      <img src="/assets/brand-book-embossed.svg" alt="" className="brand-logo-icon" />
+      <span>DormStacks</span>
+    </h1>
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,7 +62,9 @@ export const RegisterPage: React.FC = () => {
         // Dev mode: user created immediately, log in
         const loginResponse = await authApi.login(username, password);
         login(loginResponse.access_token, response);
-        navigate('/dashboard');
+        markDormstacksSeen();
+        const shouldShowTutorial = consumePostSignupTutorialPending();
+        navigate(shouldShowTutorial ? '/tutorial' : '/dashboard');
       }
     } catch (err: unknown) {
       setError(getApiErrorMessage(err, 'Registration failed. Please try again.'));
@@ -89,7 +98,9 @@ export const RegisterPage: React.FC = () => {
           is_admin: false
         };
         login(response.access_token, userInfo);
-        navigate('/dashboard');
+        markDormstacksSeen();
+        const shouldShowTutorial = consumePostSignupTutorialPending();
+        navigate(shouldShowTutorial ? '/tutorial' : '/dashboard');
       } else {
         setError('Verification failed. Please try again.');
       }
@@ -119,7 +130,7 @@ export const RegisterPage: React.FC = () => {
     return (
       <div className="auth-container">
         <div className="auth-card">
-          <h1>🃏 Poker Platform</h1>
+          {brandHeading}
           <h2>Verify Your Email</h2>
           
           <p className="verification-info">
@@ -182,7 +193,7 @@ export const RegisterPage: React.FC = () => {
   return (
     <div className="auth-container">
       <div className="auth-card">
-        <h1>🃏 Poker Platform</h1>
+        {brandHeading}
         <h2>Register</h2>
         
         <form onSubmit={handleSubmit}>

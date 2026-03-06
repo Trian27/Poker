@@ -442,7 +442,7 @@ export const SkinsPage: React.FC = () => {
                   <img
                     src={submission.reference_image_url}
                     alt={`${submission.name} concept`}
-                    style={{ width: '100%', borderRadius: 8, marginTop: 8, border: '1px solid #dbeafe' }}
+                    style={{ width: '100%', borderRadius: 0, marginTop: 8, border: '1px solid #dbeafe' }}
                   />
                 )}
                 {submission.submitter_notes && (
@@ -458,7 +458,7 @@ export const SkinsPage: React.FC = () => {
                       <img
                         src={submission.admin_rendered_image_url}
                         alt={`${submission.name} admin render`}
-                        style={{ width: '100%', borderRadius: 8, marginTop: 8, border: '1px solid #dbeafe' }}
+                        style={{ width: '100%', borderRadius: 0, marginTop: 8, border: '1px solid #dbeafe' }}
                       />
                     )}
                     {submission.admin_comment && (
@@ -590,7 +590,7 @@ export const SkinsPage: React.FC = () => {
                         <img
                           src={submission.reference_image_url}
                           alt={`${submission.name} concept`}
-                          style={{ width: '100%', borderRadius: 8, marginTop: 8, border: '1px solid #dbeafe' }}
+                          style={{ width: '100%', borderRadius: 0, marginTop: 8, border: '1px solid #dbeafe' }}
                         />
                       )}
                       {submission.submitter_notes && <p style={{ marginTop: 8 }}>{submission.submitter_notes}</p>}
@@ -659,7 +659,7 @@ export const SkinsPage: React.FC = () => {
                   <img
                     src={item.preview_url}
                     alt={`${item.name} preview`}
-                    style={{ width: '100%', borderRadius: 8, border: '1px solid #dbeafe' }}
+                    style={{ width: '100%', borderRadius: 0, border: '1px solid #dbeafe' }}
                   />
                 )}
               </div>

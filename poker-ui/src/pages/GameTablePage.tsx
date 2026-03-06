@@ -143,6 +143,10 @@ export const GameTablePage: React.FC = () => {
   const tableId = Number(tableIdParam);
   const currentUserId = user?.id ?? null;
   const expectedGameId = Number.isFinite(tableId) ? `table_${tableId}` : undefined;
+  const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
+  const spectateRequested = queryParams.get('spectate') === '1';
+  const [spectatorMode, setSpectatorMode] = useState<boolean>(spectateRequested);
+  const [spectatorHasSeat, setSpectatorHasSeat] = useState(false);
 
   const extractUserId = useCallback((playerId: unknown): number | null => {
     if (typeof playerId === 'number' && Number.isFinite(playerId)) {
@@ -357,6 +361,13 @@ export const GameTablePage: React.FC = () => {
   }, [resolvedCommunityId, navigate]);
 
   useEffect(() => {
+    setSpectatorMode(spectateRequested);
+    if (!spectateRequested) {
+      setSpectatorHasSeat(false);
+    }
+  }, [spectateRequested]);
+
+  useEffect(() => {
     if (!tableIdParam) {
       setResolvedCommunityId(null);
       return;
@@ -475,7 +486,11 @@ export const GameTablePage: React.FC = () => {
     if (!token || !tableIdParam) return;
 
     const newSocket = io(GAME_SERVER_URL, {
-      auth: { token },
+      auth: {
+        token,
+        spectator: spectateRequested,
+        tableId: Number.isFinite(tableId) ? tableId : undefined,
+      },
       transports: ['websocket', 'polling'],
     });
 
@@ -483,6 +498,9 @@ export const GameTablePage: React.FC = () => {
       setConnected(true);
       setReconnecting(false);
       setError('');
+      if (spectateRequested && Number.isFinite(tableId)) {
+        newSocket.emit('spectate_table', { tableId });
+      }
     });
 
     newSocket.on('connect_error', () => {
@@ -501,6 +519,11 @@ export const GameTablePage: React.FC = () => {
       setGameState(normalizeGameState(restoredState, normalizedBotUsers));
       setReconnecting(false);
       setError('');
+    });
+
+    newSocket.on('spectator_mode', ({ enabled, hasSeat }: { enabled?: boolean; hasSeat?: boolean }) => {
+      setSpectatorMode(Boolean(enabled));
+      setSpectatorHasSeat(Boolean(hasSeat));
     });
 
     newSocket.on('hand_complete', (result: HandResult) => {
@@ -642,7 +665,7 @@ export const GameTablePage: React.FC = () => {
       }
       newSocket.close();
     };
-  }, [token, tableIdParam, expectedGameId, currentUserId, normalizeGameState, normalizeHandResult, backToCommunity]);
+  }, [token, tableIdParam, tableId, spectateRequested, expectedGameId, currentUserId, normalizeGameState, normalizeHandResult, backToCommunity]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -690,6 +713,9 @@ export const GameTablePage: React.FC = () => {
   };
 
   const isMyTurn = () => {
+    if (spectatorMode) {
+      return false;
+    }
     const currentPlayer = getCurrentPlayer();
     if (!gameState || !currentPlayer) {
       return false;
@@ -708,6 +734,10 @@ export const GameTablePage: React.FC = () => {
   };
 
   const sendAction = (gameAction: GameAction) => {
+    if (spectatorMode) {
+      setError('Spectator mode is read-only');
+      return;
+    }
     if (!socket || !connected) {
       setError('Not connected to game server');
       return;
@@ -818,7 +848,7 @@ export const GameTablePage: React.FC = () => {
 
   const handleLeaveGame = async () => {
     suppressAutoRejoinForMs();
-    if (Number.isFinite(tableId)) {
+    if (!spectatorMode && Number.isFinite(tableId)) {
       try {
         await tablesApi.leave(tableId);
       } catch (err) {
@@ -826,7 +856,7 @@ export const GameTablePage: React.FC = () => {
       }
     }
     if (socket) {
-      socket.emit('leave_game', Number.isFinite(tableId) ? { tableId } : undefined);
+      socket.emit('leave_game', !spectatorMode && Number.isFinite(tableId) ? { tableId } : undefined);
       socket.close();
     }
     backToCommunity();
@@ -1211,10 +1241,10 @@ export const GameTablePage: React.FC = () => {
     return (
       <div className="game-container" style={tableThemeStyles} ref={gameContainerRef}>
         <div className="waiting-overlay">
-          <h2>Waiting for game to start...</h2>
-          <p>Please wait while other players join.</p>
+          <h2>{spectatorMode ? 'Starting spectator mode...' : 'Waiting for game to start...'}</h2>
+          <p>{spectatorMode ? 'Waiting for live table state.' : 'Please wait while other players join.'}</p>
           <button onClick={handleLeaveGame} className="btn-secondary">
-            Leave Game
+            {spectatorMode ? 'Back to Community' : 'Leave Game'}
           </button>
         </div>
       </div>
@@ -1231,6 +1261,11 @@ export const GameTablePage: React.FC = () => {
           <span>Blinds: {gameState.smallBlind}/{gameState.bigBlind}</span>
         </div>
         <div className="game-header-actions">
+          {spectatorMode && (
+            <span className="spectator-badge">
+              Spectating{spectatorHasSeat ? ' (your cards visible)' : ''}
+            </span>
+          )}
           <RulesScrollHelp variant="game" />
           <button onClick={handleLeaveGame} className="btn-leave">
             Leave
@@ -1414,10 +1449,14 @@ export const GameTablePage: React.FC = () => {
                   if (!socket || !connected || !currentPlayer) {
                     return;
                   }
+                  if (spectatorMode) {
+                    return;
+                  }
                   socket.emit('show_hand_choice', {
                     show: !revealedShowdownHandsByUserId[currentPlayer.id],
                   });
                 }}
+                disabled={spectatorMode}
               >
                 {currentPlayer && revealedShowdownHandsByUserId[currentPlayer.id] ? 'Hide My Cards' : 'Show My Cards'}
               </button>
@@ -1483,7 +1522,7 @@ export const GameTablePage: React.FC = () => {
 
             {!currentPlayer && (
               <div className="waiting-turn">
-                <p>Syncing your seat...</p>
+                <p>{spectatorMode ? 'Spectating table' : 'Syncing your seat...'}</p>
               </div>
             )}
 

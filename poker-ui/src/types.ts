@@ -52,6 +52,23 @@ export interface Wallet {
   created_at: string;
 }
 
+export interface CommunityWalletSummary {
+  user_id: number;
+  username: string;
+  balance: number | string;
+}
+
+export interface CommunityWalletAdjustResponse {
+  success: boolean;
+  user_id: number;
+  community_id: number;
+  operation: 'set' | 'add' | 'subtract';
+  amount: number | string;
+  previous_balance: number | string;
+  new_balance: number | string;
+  message: string;
+}
+
 export interface Table {
   id: number;
   community_id: number;
@@ -93,6 +110,7 @@ export interface CreateTableRequest {
   small_blind: number;
   big_blind: number;
   buy_in: number;
+  is_permanent?: boolean;
   agents_allowed?: boolean;
   tournament_start_time?: string;
   tournament_starting_stack?: number;
@@ -159,6 +177,14 @@ export interface TableSeat {
   user_id: number | null;
   username: string | null;
   occupied_at: string | null;
+}
+
+export interface ActiveSeatStatus {
+  active: boolean;
+  table_id?: number;
+  community_id?: number;
+  seat_number?: number;
+  occupied_at?: string | null;
 }
 
 // Game-related types (for Socket.IO communication)

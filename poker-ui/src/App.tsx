@@ -6,6 +6,7 @@ import { AuthProvider } from './AuthContext';
 import { ProtectedRoute } from './ProtectedRoute';
 import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
+import { WelcomeGatePage } from './pages/WelcomeGatePage';
 import { DashboardPage } from './pages/DashboardPage';
 import CommunityLobbyPage from './pages/CommunityLobbyPage';
 import { GameTablePage } from './pages/GameTablePage';
@@ -15,21 +16,36 @@ import { MessagesPage } from './pages/MessagesPage';
 import { TournamentsPage } from './pages/TournamentsPage';
 import { FeedbackPage } from './pages/FeedbackPage';
 import { LearningPage } from './pages/LearningPage';
+import { TutorialPage } from './pages/TutorialPage';
 import RulesScrollHelp from './components/RulesScrollHelp';
 import './App.css';
 
 function AppRoutes() {
   const location = useLocation();
   const isInGame = location.pathname.startsWith('/game/');
-  const showMenuRules = !isInGame && location.pathname !== '/login' && location.pathname !== '/register';
+  const hideGlobalFloatingUi = (
+    location.pathname === '/'
+    || location.pathname === '/login'
+    || location.pathname === '/register'
+    || location.pathname === '/tutorial'
+  );
+  const showMenuRules = !isInGame && !hideGlobalFloatingUi;
   const showLearningButton = showMenuRules && location.pathname !== '/learning';
 
   return (
     <>
       <Routes>
-        <Route path="/" element={<Navigate to="/login" replace />} />
+        <Route path="/" element={<WelcomeGatePage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
+        <Route
+          path="/tutorial"
+          element={
+            <ProtectedRoute>
+              <TutorialPage />
+            </ProtectedRoute>
+          }
+        />
         <Route
           path="/dashboard"
           element={

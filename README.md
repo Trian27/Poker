@@ -114,6 +114,9 @@ For architectural decisions and design patterns, see [TECHNICAL_DECISIONS.md](TE
 ### Testing Status
 For testing coverage and status, see [TESTING_STATUS.md](TESTING_STATUS.md).
 
+### Operations Runbook
+For maintenance safety checks (including DB target verification before cleanup), see [OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md).
+
 ## Contributing
 1. Fork the repository.
 2. Create a feature branch.

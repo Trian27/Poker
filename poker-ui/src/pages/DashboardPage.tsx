@@ -5,8 +5,9 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../auth-context';
 import { communitiesApi, walletsApi, leaguesApi, inboxApi, tablesApi } from '../api';
-import type { Community, Wallet, League, InboxMessage, AdminUser } from '../types';
+import type { Community, Wallet, League, InboxMessage, AdminUser, ActiveSeatStatus } from '../types';
 import UserMenu from '../components/UserMenu';
+import CommunitySettingsModal from '../components/CommunitySettingsModal';
 import './Dashboard.css';
 import { getApiErrorMessage } from "../utils/error";
 import { isAutoRejoinSuppressed, shouldRunReloadAutoRejoinCheck } from '../utils/activeSeatRejoin';
@@ -21,9 +22,11 @@ export const DashboardPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [isRejoiningTable, setIsRejoiningTable] = useState(false);
+  const [activeSeat, setActiveSeat] = useState<ActiveSeatStatus | null>(null);
   
   // Expanded leagues state
   const [expandedLeagues, setExpandedLeagues] = useState<Set<number>>(new Set());
+  const [hasInitializedLeagueExpansion, setHasInitializedLeagueExpansion] = useState(false);
   
   // Modal states
   const [showCreateCommunityModal, setShowCreateCommunityModal] = useState(false);
@@ -51,13 +54,10 @@ export const DashboardPage: React.FC = () => {
   const [joinRequestMessage, setJoinRequestMessage] = useState('');
   const [leagueJoinMessage, setLeagueJoinMessage] = useState('');
   const [leagueAdminInvite, setLeagueAdminInvite] = useState('');
-  const [communityAdminInvite, setCommunityAdminInvite] = useState('');
 
   // Admin list state
   const [leagueAdmins, setLeagueAdmins] = useState<AdminUser[]>([]);
   const [leagueOwner, setLeagueOwner] = useState<AdminUser | null>(null);
-  const [communityAdmins, setCommunityAdmins] = useState<AdminUser[]>([]);
-  const [communityCommissioner, setCommunityCommissioner] = useState<AdminUser | null>(null);
   
   // Review modal state
   const [showReviewModal, setShowReviewModal] = useState(false);
@@ -127,6 +127,20 @@ export const DashboardPage: React.FC = () => {
     loadUnreadCount();
   }, [loadData, loadUnreadCount]);
 
+  const loadActiveSeat = useCallback(async () => {
+    try {
+      const seat = await tablesApi.getMyActiveSeat();
+      if (seat?.active && seat.table_id) {
+        setActiveSeat(seat);
+      } else {
+        setActiveSeat(null);
+      }
+    } catch (err) {
+      console.error('Failed to load active seat:', err);
+      setActiveSeat(null);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -168,8 +182,12 @@ export const DashboardPage: React.FC = () => {
   }, [navigate]);
 
   useEffect(() => {
+    void loadActiveSeat();
+  }, [loadActiveSeat]);
+
+  useEffect(() => {
     const refreshDashboardState = async () => {
-      await Promise.all([loadData(false), loadUnreadCount()]);
+      await Promise.all([loadData(false), loadUnreadCount(), loadActiveSeat()]);
     };
 
     const intervalId = window.setInterval(refreshDashboardState, REFRESH_INTERVAL_MS);
@@ -190,7 +208,7 @@ export const DashboardPage: React.FC = () => {
       window.removeEventListener('focus', onWindowFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [loadData, loadUnreadCount]);
+  }, [loadData, loadUnreadCount, loadActiveSeat]);
 
   useEffect(() => {
     const onUnreadUpdate = (event: Event) => {
@@ -220,10 +238,11 @@ export const DashboardPage: React.FC = () => {
   
   // Auto-expand leagues when loaded
   useEffect(() => {
-    if (leagues.length > 0 && expandedLeagues.size === 0) {
+    if (!hasInitializedLeagueExpansion && leagues.length > 0) {
       setExpandedLeagues(new Set(leagues.map(l => l.id)));
+      setHasInitializedLeagueExpansion(true);
     }
-  }, [leagues, expandedLeagues.size]);
+  }, [leagues, hasInitializedLeagueExpansion]);
 
   const loadInbox = async () => {
     try {
@@ -237,6 +256,17 @@ export const DashboardPage: React.FC = () => {
   const handleJoinGame = (communityId: number) => {
     navigate(`/community/${communityId}`);
   };
+
+  const handleRejoinActiveTable = () => {
+    if (!activeSeat?.active || !activeSeat.table_id) {
+      return;
+    }
+    const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
+    navigate(`/game/${activeSeat.table_id}${communityParam}`);
+  };
+
+  const idsEqual = (left?: number | null, right?: number | null): boolean =>
+    Number.isFinite(Number(left)) && Number.isFinite(Number(right)) && Number(left) === Number(right);
 
   const getWalletBalance = (communityId: number): string => {
     const wallet = wallets.find(w => w.community_id === communityId);
@@ -254,7 +284,7 @@ export const DashboardPage: React.FC = () => {
 
   const isLeagueMember = (league: League): boolean => {
     if (!user) return false;
-    if (league.owner_id === user.id) {
+    if (idsEqual(league.owner_id, user.id)) {
       return true;
     }
     if (league.is_member !== undefined && league.is_member !== null) {
@@ -264,33 +294,24 @@ export const DashboardPage: React.FC = () => {
   };
 
   const openLeagueSettings = async (league: League) => {
+    setSelectedLeague(league);
+    setShowLeagueSettingsModal(true);
+    setLeagueAdmins([]);
+    setLeagueOwner(null);
+    setLeagueAdminInvite('');
+
     try {
-      setLeagueAdmins([]);
-      setLeagueOwner(null);
-      setLeagueAdminInvite('');
       const data = await leaguesApi.getAdmins(league.id);
       setLeagueOwner(data.owner || null);
       setLeagueAdmins(data.admins || []);
-      setSelectedLeague(league);
-      setShowLeagueSettingsModal(true);
     } catch (err: unknown) {
-      alert(getApiErrorMessage(err, 'Failed to load league settings'));
+      console.error('Failed to load league settings metadata:', err);
     }
   };
 
-  const openCommunitySettings = async (community: Community) => {
-    try {
-      setCommunityAdmins([]);
-      setCommunityCommissioner(null);
-      setCommunityAdminInvite('');
-      const data = await communitiesApi.getAdmins(community.id);
-      setCommunityCommissioner(data.commissioner || null);
-      setCommunityAdmins(data.admins || []);
-      setSelectedCommunity(community);
-      setShowCommunitySettingsModal(true);
-    } catch (err: unknown) {
-      alert(getApiErrorMessage(err, 'Failed to load community settings'));
-    }
+  const openCommunitySettings = (community: Community) => {
+    setSelectedCommunity(community);
+    setShowCommunitySettingsModal(true);
   };
 
   const closeLeagueSettings = () => {
@@ -304,9 +325,6 @@ export const DashboardPage: React.FC = () => {
   const closeCommunitySettings = () => {
     setShowCommunitySettingsModal(false);
     setSelectedCommunity(null);
-    setCommunityAdmins([]);
-    setCommunityCommissioner(null);
-    setCommunityAdminInvite('');
   };
 
   const inviteLeagueAdmin = async () => {
@@ -332,42 +350,12 @@ export const DashboardPage: React.FC = () => {
   const canInviteLeagueAdmins =
     !!user &&
     !!selectedLeague &&
-    (selectedLeague.owner_id === user.id || leagueAdmins.some((admin) => admin.id === user.id));
-
-  const canInviteCommunityAdmins =
-    !!user &&
-    !!selectedCommunity &&
-    (communityCommissioner?.id === user.id || communityAdmins.some((admin) => admin.id === user.id));
+    (idsEqual(selectedLeague.owner_id, user.id) || idsEqual(leagueOwner?.id, user.id) || leagueAdmins.some((admin) => idsEqual(admin.id, user.id)));
 
   const canDeleteSelectedLeague =
     !!user &&
     !!selectedLeague &&
-    (Boolean(user.is_admin) || selectedLeague.owner_id === user.id);
-
-  const canDeleteSelectedCommunity =
-    !!user &&
-    !!selectedCommunity &&
-    (Boolean(user.is_admin) || selectedCommunity.commissioner_id === user.id || communityCommissioner?.id === user.id);
-
-  const inviteCommunityAdmin = async () => {
-    if (!selectedCommunity) return;
-    const trimmed = communityAdminInvite.trim();
-    if (!trimmed) {
-      alert('Enter a username or email');
-      return;
-    }
-    try {
-      const payload = trimmed.includes('@') ? { email: trimmed } : { username: trimmed };
-      await communitiesApi.inviteAdmin(selectedCommunity.id, payload);
-      const data = await communitiesApi.getAdmins(selectedCommunity.id);
-      setCommunityCommissioner(data.commissioner || null);
-      setCommunityAdmins(data.admins || []);
-      setCommunityAdminInvite('');
-      alert('Community admin invited successfully');
-    } catch (err: unknown) {
-      alert(getApiErrorMessage(err, 'Failed to invite community admin'));
-    }
-  };
+    (Boolean(user.is_admin) || idsEqual(selectedLeague.owner_id, user.id) || idsEqual(leagueOwner?.id, user.id));
 
   const deleteSelectedLeague = async () => {
     if (!selectedLeague || !canDeleteSelectedLeague) {
@@ -391,27 +379,6 @@ export const DashboardPage: React.FC = () => {
     }
   };
 
-  const deleteSelectedCommunity = async () => {
-    if (!selectedCommunity || !canDeleteSelectedCommunity) {
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `Delete community "${selectedCommunity.name}"? This deletes its tables and wallets.`
-    );
-    if (!confirmed) {
-      return;
-    }
-
-    try {
-      await communitiesApi.delete(selectedCommunity.id);
-      closeCommunitySettings();
-      await loadData(true);
-      alert('Community deleted successfully.');
-    } catch (err: unknown) {
-      alert(getApiErrorMessage(err, 'Failed to delete community'));
-    }
-  };
   
   const toggleLeague = (leagueId: number) => {
     const newExpanded = new Set(expandedLeagues);
@@ -584,10 +551,11 @@ export const DashboardPage: React.FC = () => {
     <div className="dashboard-container">
       <header className="dashboard-header">
         <div className="header-left">
-          <h1 className="logo">🃏 Poker Platform</h1>
+          <h1 className="logo">
+            <img src="/assets/brand-book-embossed.svg" alt="" className="brand-logo-icon" />
+            <span>DormStacks</span>
+          </h1>
         </div>
-
-        <div className="header-separator" aria-hidden />
 
         <div className="header-nav-wrapper">
           <nav className="header-nav" aria-label="Platform navigation in header">
@@ -618,7 +586,9 @@ export const DashboardPage: React.FC = () => {
 
         <div className="user-info">
           <button onClick={openInbox} className="btn-icon inbox-btn">
-            📬 Inbox {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
+            <span className="inbox-label">Inbox</span>
+            <span className="inbox-icon" aria-hidden>📬</span>
+            {unreadCount > 0 && <span className="badge">{unreadCount}</span>}
           </button>
           <UserMenu username={user?.username || 'User'} />
         </div>
@@ -627,6 +597,14 @@ export const DashboardPage: React.FC = () => {
       {isRejoiningTable && (
         <div className="rejoin-banner">
           Rejoining your active table...
+        </div>
+      )}
+
+      {!isRejoiningTable && activeSeat?.active && activeSeat.table_id && (
+        <div className="rejoin-banner dashboard-rejoin-banner">
+          <button type="button" className="btn-primary" onClick={handleRejoinActiveTable}>
+            Rejoin Active Table (Table #{activeSeat.table_id}{activeSeat.seat_number ? `, Seat ${activeSeat.seat_number}` : ''})
+          </button>
         </div>
       )}
 
@@ -646,7 +624,7 @@ export const DashboardPage: React.FC = () => {
           
           {leagues.length === 0 ? (
             <p className="empty-state">
-              "No leagues available. Create one to get started!"
+              No leagues available. Create one to get started!
             </p>
           ) : (
             <div className="leagues-list">
@@ -760,7 +738,7 @@ export const DashboardPage: React.FC = () => {
                                           Request to Join
                                         </button>
                                       )}
-                                      {(hasWallet(community.id) || community.commissioner_id === user?.id) && (
+                                      {(hasWallet(community.id) || idsEqual(community.commissioner_id, user?.id)) && (
                                         <button
                                           onClick={() => openCommunitySettings(community)}
                                           className="btn-secondary"
@@ -950,7 +928,7 @@ export const DashboardPage: React.FC = () => {
             </div>
 
             <form
-              className="settings-section"
+              className="settings-section invite-admin-section"
               onSubmit={(e) => {
                 e.preventDefault();
                 inviteLeagueAdmin();
@@ -970,97 +948,42 @@ export const DashboardPage: React.FC = () => {
               {!canInviteLeagueAdmins && (
                 <p className="settings-note">Only league owners or admins can invite new admins.</p>
               )}
-              <div className="modal-actions">
-                {canDeleteSelectedLeague && (
-                  <button type="button" onClick={deleteSelectedLeague} className="btn-danger">
-                    Delete League
-                  </button>
-                )}
-                <button type="button" onClick={closeLeagueSettings} className="btn-secondary">
-                  Close
-                </button>
+              <div className="modal-actions league-settings-invite-actions">
                 <button type="submit" className="btn-primary" disabled={!canInviteLeagueAdmins}>
                   Invite
                 </button>
               </div>
             </form>
-          </div>
-        </div>
-      )}
 
-      {/* Community Settings Modal */}
-      {showCommunitySettingsModal && selectedCommunity && (
-        <div className="modal-overlay" onClick={closeCommunitySettings}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h2>Community Settings</h2>
-            <p className="modal-subtitle">{selectedCommunity.name}</p>
-
-            <div className="settings-section">
-              <h3>Admins</h3>
-              {communityCommissioner ? (
-                <div className="admin-row">
-                  <span className="admin-role">Commissioner</span>
-                  <span className="admin-user">
-                    {communityCommissioner.username} ({communityCommissioner.email})
-                  </span>
-                </div>
-              ) : (
-                <p className="settings-empty">No commissioner assigned.</p>
-              )}
-              {communityAdmins.length > 0 ? (
-                <div className="admin-list">
-                  {communityAdmins.map((admin) => (
-                    <div key={admin.id} className="admin-row">
-                      <span className="admin-role">Admin</span>
-                      <span className="admin-user">
-                        {admin.username} ({admin.email})
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="settings-empty">No additional admins yet.</p>
-              )}
-            </div>
-
-            <form
-              className="settings-section"
-              onSubmit={(e) => {
-                e.preventDefault();
-                inviteCommunityAdmin();
-              }}
-            >
-              <h3>Invite Admin</h3>
-              <div className="form-group">
-                <label>Username or Email</label>
-                <input
-                  type="text"
-                  value={communityAdminInvite}
-                  onChange={(e) => setCommunityAdminInvite(e.target.value)}
-                  placeholder="username or email"
-                  disabled={!canInviteCommunityAdmins}
-                />
-              </div>
-              {!canInviteCommunityAdmins && (
-                <p className="settings-note">Only community commissioners or admins can invite new admins.</p>
-              )}
-              <div className="modal-actions">
-                {canDeleteSelectedCommunity && (
-                  <button type="button" onClick={deleteSelectedCommunity} className="btn-danger">
-                    Delete Community
+            <div className="settings-footer-actions">
+              {canDeleteSelectedLeague ? (
+                <div className="settings-section danger-zone settings-footer-danger">
+                  <button type="button" onClick={deleteSelectedLeague} className="btn-danger">
+                    Delete League
                   </button>
-                )}
-                <button type="button" onClick={closeCommunitySettings} className="btn-secondary">
-                  Close
-                </button>
-                <button type="submit" className="btn-primary" disabled={!canInviteCommunityAdmins}>
-                  Invite
-                </button>
-              </div>
-            </form>
+                </div>
+              ) : (
+                <div />
+              )}
+              <button type="button" onClick={closeLeagueSettings} className="btn-secondary settings-close-button">
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}
+
+      <CommunitySettingsModal
+        isOpen={showCommunitySettingsModal}
+        community={selectedCommunity}
+        user={user}
+        onClose={closeCommunitySettings}
+        onDeleted={async () => {
+          closeCommunitySettings();
+          await loadData(true);
+          alert('Community deleted successfully.');
+        }}
+      />
 
       {/* Join Request Modal */}
       {showJoinRequestModal && selectedCommunity && (

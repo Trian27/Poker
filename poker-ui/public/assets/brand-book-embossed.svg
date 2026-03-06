@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="coverLeft" x1="12" y1="10" x2="30" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#88B558"/>
+      <stop offset="1" stop-color="#587E33"/>
+    </linearGradient>
+    <linearGradient id="coverRight" x1="34" y1="10" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#79A24D"/>
+      <stop offset="1" stop-color="#4E6F2E"/>
+    </linearGradient>
+    <linearGradient id="spine" x1="30" y1="8" x2="34" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6B9442"/>
+      <stop offset="1" stop-color="#3F5C25"/>
+    </linearGradient>
+    <filter id="shadow" x="4" y="5" width="56" height="56" filterUnits="userSpaceOnUse">
+      <feOffset dy="2"/>
+      <feGaussianBlur stdDeviation="2.5"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.08 0 0 0 0 0.15 0 0 0 0 0.09 0 0 0 0.35 0"/>
+      <feBlend in2="SourceGraphic" result="shape"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <rect x="10" y="8" width="20" height="46" rx="4" fill="url(#coverLeft)" stroke="#2E4A1C" stroke-width="1.5"/>
+    <rect x="34" y="8" width="20" height="46" rx="4" fill="url(#coverRight)" stroke="#2E4A1C" stroke-width="1.5"/>
+    <rect x="30" y="8" width="4" height="46" rx="1.5" fill="url(#spine)"/>
+
+    <path d="M14 15C19 13 23 13 28 15V44C23 42 19 42 14 44V15Z" fill="white" fill-opacity="0.08"/>
+    <path d="M36 15C41 13 45 13 50 15V44C45 42 41 42 36 44V15Z" fill="white" fill-opacity="0.08"/>
+
+    <path d="M16 20H24" stroke="rgba(255,255,255,0.55)" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M16 24H22" stroke="rgba(255,255,255,0.4)" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M40 20H48" stroke="rgba(255,255,255,0.55)" stroke-width="1.3" stroke-linecap="round"/>
+    <path d="M40 24H46" stroke="rgba(255,255,255,0.4)" stroke-width="1.2" stroke-linecap="round"/>
+  </g>
+</svg>

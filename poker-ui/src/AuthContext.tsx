@@ -13,6 +13,8 @@ interface AuthProviderProps {
 
 const TOKEN_STORAGE_KEY = 'token';
 const USER_STORAGE_KEY = 'user';
+const SESSION_EXPIRY_STORAGE_KEY = 'auth_session_expires_at';
+const PERSISTENT_SESSION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const clearPersistedAuth = () => {
   if (typeof window === 'undefined') {
@@ -20,9 +22,26 @@ const clearPersistedAuth = () => {
   }
   window.localStorage.removeItem(TOKEN_STORAGE_KEY);
   window.localStorage.removeItem(USER_STORAGE_KEY);
+  window.localStorage.removeItem(SESSION_EXPIRY_STORAGE_KEY);
 };
 
-const persistAuthForUser = (token: string | null, user: User | null) => {
+const readPersistedExpiry = (): number | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  const rawValue = window.localStorage.getItem(SESSION_EXPIRY_STORAGE_KEY);
+  if (!rawValue) {
+    return null;
+  }
+  const parsed = Number(rawValue);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const persistAuthForUser = (
+  token: string | null,
+  user: User | null,
+  options?: { refreshExpiry?: boolean }
+) => {
   if (typeof window === 'undefined') {
     return;
   }
@@ -34,6 +53,17 @@ const persistAuthForUser = (token: string | null, user: User | null) => {
 
   window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
   window.localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
+  if (options?.refreshExpiry) {
+    window.localStorage.setItem(
+      SESSION_EXPIRY_STORAGE_KEY,
+      String(Date.now() + PERSISTENT_SESSION_MS)
+    );
+  } else if (!window.localStorage.getItem(SESSION_EXPIRY_STORAGE_KEY)) {
+    window.localStorage.setItem(
+      SESSION_EXPIRY_STORAGE_KEY,
+      String(Date.now() + PERSISTENT_SESSION_MS)
+    );
+  }
 };
 
 export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
@@ -62,8 +92,10 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   useEffect(() => {
     const storedToken = window.localStorage.getItem(TOKEN_STORAGE_KEY);
     const storedUser = window.localStorage.getItem(USER_STORAGE_KEY);
+    const storedExpiry = readPersistedExpiry();
 
-    if (!storedToken || !storedUser) {
+    if (!storedToken || !storedUser || !storedExpiry || Date.now() >= storedExpiry) {
+      clearPersistedAuth();
       setApiAuthToken(null);
       setIsReady(true);
       return;
@@ -98,11 +130,16 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     setIsReady(true);
   }, [refreshUser]);
 
-  const login = (newToken: string, newUser: User) => {
+  const login = (newToken: string, newUser: User, options?: { persist?: boolean }) => {
     setTokenState(newToken);
     setApiAuthToken(newToken);
     setUser(newUser);
-    persistAuthForUser(newToken, newUser);
+    const shouldPersist = options?.persist ?? true;
+    if (shouldPersist) {
+      persistAuthForUser(newToken, newUser, { refreshExpiry: true });
+    } else {
+      clearPersistedAuth();
+    }
   };
 
   const logout = () => {

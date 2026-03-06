@@ -1,6 +1,7 @@
 # Multi-stage build for React UI
 # Stage 1: Build the React application
-FROM node:18-alpine AS builder
+# Vite 7 requires Node 20.19+ (or 22.12+)
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 

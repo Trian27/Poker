@@ -23,6 +23,8 @@ import socketio
 import argparse
 import sys
 import time
+import re
+import os
 from typing import Optional, Tuple
 
 class WebSocketPokerAgent:
@@ -30,11 +32,20 @@ class WebSocketPokerAgent:
     Real-time poker agent using WebSocket connection to game server.
     """
     
-    def __init__(self, token: str, game_id: str, user_id: int, server_url: str = "http://localhost:3000"):
+    def __init__(
+        self,
+        token: str,
+        game_id: str,
+        user_id: int,
+        server_url: str = "http://localhost:3000",
+        action_delay_seconds: float = 0.0
+    ):
         self.token = token
         self.game_id = game_id
         self.user_id = user_id
         self.server_url = server_url
+        self.table_id = self._extract_table_id(game_id)
+        self.action_delay_seconds = max(0.0, action_delay_seconds)
         self.my_player_id: Optional[str] = None
         self.connected = False
         self.game_started = False
@@ -73,6 +84,10 @@ class WebSocketPokerAgent:
             Called when game state changes.
             This is the core event - we receive updates in real-time.
             """
+            payload_game_id = data.get('gameId')
+            if payload_game_id and payload_game_id != self.game_id:
+                return
+
             game_state = data.get('gameState', {})
             
             if not self.game_started:
@@ -121,10 +136,22 @@ class WebSocketPokerAgent:
     def identify_my_player(self, game_state: dict):
         """
         Identify which player in the game is us.
-        We can see our own hole cards (they have suit/rank).
+        Prefer deterministic user-id matching from player ids.
+        Fall back to the legacy "visible hole cards" heuristic.
         """
         players = game_state.get('players', [])
-        
+
+        # Primary strategy: match player_<userId>_<ts> id pattern against our user id.
+        for player in players:
+            player_id = str(player.get('id', ''))
+            if player_id.startswith(f'player_{self.user_id}_'):
+                self.my_player_id = player_id
+                player_name = player.get('name', 'Unknown')
+                stack = player.get('stack', 0)
+                print(f"🆔 Identified myself by user id: {player_name} (ID: {self.my_player_id}, Stack: {stack})")
+                return
+
+        # Fallback for legacy payload shapes.
         for player in players:
             hole_cards = player.get('holeCards', [])
             
@@ -136,7 +163,7 @@ class WebSocketPokerAgent:
                     self.my_player_id = player.get('id')
                     player_name = player.get('name', 'Unknown')
                     stack = player.get('stack', 0)
-                    print(f"🆔 Identified myself: {player_name} (ID: {self.my_player_id}, Stack: {stack})")
+                    print(f"🆔 Identified myself by hole cards: {player_name} (ID: {self.my_player_id}, Stack: {stack})")
                     return
     
     def is_my_turn(self, game_state: dict) -> bool:
@@ -179,13 +206,13 @@ class WebSocketPokerAgent:
         
         if not my_player:
             print("❌ Could not find my player info!")
-            self.sio.emit('game_action', {'type': 'fold'})
+            self.sio.emit('game_action', {'action': 'fold'})
             return
         
         # Get my situation
         my_stack = my_player.get('stack', 0)
         my_current_bet = my_player.get('currentBet', 0)
-        my_hole_cards = my_player.get('holeCards', [])
+        my_hole_cards = game_state.get('myCards', [])
         amount_to_call = current_bet - my_current_bet
         
         # Log situation
@@ -209,10 +236,14 @@ class WebSocketPokerAgent:
         )
         
         # Emit the action
-        action_data = {'type': action_type}
+        action_data = {'action': action_type}
         if amount is not None:
             action_data['amount'] = amount
-        
+
+        if self.action_delay_seconds > 0:
+            print(f"⏱️  Test delay: waiting {self.action_delay_seconds:.1f}s before action...")
+            time.sleep(self.action_delay_seconds)
+
         print(f"🎲 Taking action: {action_type}" + (f" (amount: {amount})" if amount else ""))
         self.sio.emit('game_action', action_data)
     
@@ -277,13 +308,22 @@ class WebSocketPokerAgent:
             print(f"🤖 WebSocket Poker Agent starting...")
             print(f"   Server: {self.server_url}")
             print(f"   Game ID: {self.game_id}")
+            if self.table_id is not None:
+                print(f"   Table ID: {self.table_id}")
             print(f"   User ID: {self.user_id}")
             print(f"\n🔌 Connecting...")
-            
+
             # Connect with JWT authentication
+            auth_payload = {
+                'token': self.token,
+                'gameId': self.game_id,
+            }
+            if self.table_id is not None:
+                auth_payload['tableId'] = self.table_id
+
             self.sio.connect(
                 self.server_url,
-                auth={'token': self.token},
+                auth=auth_payload,
                 wait_timeout=10
             )
             
@@ -306,6 +346,13 @@ class WebSocketPokerAgent:
             traceback.print_exc()
             sys.exit(1)
 
+    @staticmethod
+    def _extract_table_id(game_id: str) -> Optional[int]:
+        match = re.match(r'^table_(\d+)$', game_id.strip())
+        if not match:
+            return None
+        return int(match.group(1))
+
 def main():
     """Parse arguments and start the agent"""
     parser = argparse.ArgumentParser(description='WebSocket Poker Agent Bot')
@@ -313,6 +360,12 @@ def main():
     parser.add_argument('--game-id', required=True, help='Game/table ID to join')
     parser.add_argument('--user-id', required=True, type=int, help='Your user ID')
     parser.add_argument('--server', default='http://localhost:3000', help='Game server URL (default: http://localhost:3000)')
+    parser.add_argument(
+        '--action-delay-seconds',
+        type=float,
+        default=float(os.getenv('POKER_BOT_ACTION_DELAY_SECONDS', '0')),
+        help='Optional delay before each action (testing/spectate aid). Default: 0'
+    )
     
     args = parser.parse_args()
     
@@ -321,7 +374,8 @@ def main():
         token=args.token,
         game_id=args.game_id,
         user_id=args.user_id,
-        server_url=args.server
+        server_url=args.server,
+        action_delay_seconds=args.action_delay_seconds
     )
     
     agent.connect_and_play()

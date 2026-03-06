@@ -1,7 +1,7 @@
 """
 Main FastAPI application with all routes
 """
-from fastapi import FastAPI, Depends, HTTPException, status, Body, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Body, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import or_, and_, func
@@ -26,7 +26,7 @@ from .schemas import (
     AdminInviteRequest, AdminUserResponse, BanStatusRequest, CurrencyUpdateRequest,
     LeagueCreate, LeagueResponse,
     CommunityBase, CommunityCreate, CommunityResponse,
-    WalletCreate, WalletResponse,
+    WalletCreate, WalletResponse, CommunityWalletSummaryResponse, CommunityWalletAdjustRequest, CommunityWalletAdjustResponse,
     TableCreate, TableResponse, TableJoinRequest, SeatPlayerRequest, TableSeatResponse,
     WalletOperation, WalletOperationResponse,
     TokenVerifyRequest, TokenVerifyResponse,
@@ -56,8 +56,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import random
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+UI_CLIENT_HEADER_NAME = "X-Dormstacks-UI"
+UI_CLIENT_HEADER_VALUE = "web"
+UI_ALLOWED_ORIGINS = {origin.rstrip("/").lower() for origin in settings.CORS_ORIGINS}
 
 # Security scheme for JWT Bearer tokens (optional so query params can be used)
 security = HTTPBearer(auto_error=False)
@@ -258,6 +262,48 @@ def _ensure_not_banned(user: User) -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your account has been banned"
+        )
+
+
+def _extract_origin_from_referer(referer: str | None) -> str | None:
+    if not referer:
+        return None
+    parsed = urlparse(referer.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def _require_ui_create_request(
+    request: Request,
+    ui_client: str | None = Header(default=None, alias=UI_CLIENT_HEADER_NAME),
+) -> None:
+    """
+    Gate create endpoints to requests that originate from the official web UI.
+    """
+    if ui_client != UI_CLIENT_HEADER_VALUE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Creation via direct API clients is disabled. Use the web UI."
+        )
+
+    request_origin = request.headers.get("origin")
+    normalized_origin = request_origin.strip().rstrip("/").lower() if request_origin else None
+    if not normalized_origin:
+        normalized_origin = _extract_origin_from_referer(request.headers.get("referer"))
+
+    if not normalized_origin or normalized_origin not in UI_ALLOWED_ORIGINS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Creation requests must come from an approved UI origin."
+        )
+
+    # Browsers include these automatically for fetch/XHR. If present and clearly cross-site, reject.
+    sec_fetch_site = (request.headers.get("sec-fetch-site") or "").lower()
+    if sec_fetch_site and sec_fetch_site not in {"same-origin", "same-site", "none"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Creation requests must come from the web UI."
         )
 
 
@@ -1453,6 +1499,7 @@ def set_community_currency(
 @app.post("/api/leagues", response_model=LeagueResponse, status_code=status.HTTP_201_CREATED)
 def create_league(
     league_data: LeagueCreate,
+    _: None = Depends(_require_ui_create_request),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1829,6 +1876,7 @@ def invite_league_admin(
 @app.post("/api/communities", response_model=CommunityResponse, status_code=status.HTTP_201_CREATED)
 def create_community(
     community_data: CommunityCreate,
+    _: None = Depends(_require_ui_create_request),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2128,6 +2176,138 @@ def get_my_wallets(
     return wallets
 
 
+@app.get("/api/communities/{community_id}/wallets", response_model=list[CommunityWalletSummaryResponse])
+def get_community_wallets(
+    community_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    List wallets in a community (commissioner/global-admin only).
+    """
+    user_id = current_user.get("user_id")
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+
+    if not (_is_global_admin(db, user_id) or community.commissioner_id == user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the community owner or a global admin can manage balances",
+        )
+
+    wallet_rows = (
+        db.query(Wallet, User)
+        .join(User, User.id == Wallet.user_id)
+        .filter(Wallet.community_id == community_id)
+        .order_by(User.username.asc())
+        .all()
+    )
+
+    return [
+        CommunityWalletSummaryResponse(
+            user_id=user.id,
+            username=user.username,
+            balance=wallet.balance,
+        )
+        for wallet, user in wallet_rows
+    ]
+
+
+@app.patch(
+    "/api/communities/{community_id}/wallets/{target_user_id}",
+    response_model=CommunityWalletAdjustResponse,
+)
+def adjust_community_wallet(
+    community_id: int,
+    target_user_id: int,
+    payload: CommunityWalletAdjustRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Adjust a community member wallet balance (commissioner/global-admin only).
+    """
+    actor_user_id = current_user.get("user_id")
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+
+    if not (_is_global_admin(db, actor_user_id) or community.commissioner_id == actor_user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the community owner or a global admin can manage balances",
+        )
+
+    wallet = db.query(Wallet).filter(
+        Wallet.community_id == community_id,
+        Wallet.user_id == target_user_id,
+    ).first()
+    if not wallet:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wallet not found for target user")
+
+    target_user = _get_user_or_404(db, target_user_id)
+    amount = Decimal(payload.amount)
+    previous_balance = Decimal(wallet.balance)
+
+    if payload.operation == "set":
+        new_balance = amount
+    elif payload.operation == "add":
+        new_balance = previous_balance + amount
+    else:
+        if previous_balance < amount:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot subtract {amount}; current balance is {previous_balance}",
+            )
+        new_balance = previous_balance - amount
+
+    wallet.balance = new_balance
+    db.commit()
+    db.refresh(wallet)
+
+    actor_user = db.query(User).filter(User.id == actor_user_id).first()
+    actor_name = actor_user.username if actor_user else f"user_{actor_user_id}"
+    reason_text = payload.reason.strip() if payload.reason else ""
+    adjustment_text = f"{payload.operation} {amount} chips"
+    content = (
+        f"{actor_name} updated your {community.name} balance: {adjustment_text}. "
+        f"New balance: {wallet.balance} chips."
+    )
+    if reason_text:
+        content = f"{content} Reason: {reason_text}"
+
+    inbox_message = InboxMessage(
+        recipient_user_id=target_user.id,
+        sender_user_id=actor_user_id,
+        message_type="community_wallet_adjustment",
+        title=f"Balance Updated in {community.name}",
+        content=content,
+        message_metadata={
+            "community_id": community.id,
+            "community_name": community.name,
+            "operation": payload.operation,
+            "amount": str(amount),
+            "new_balance": str(wallet.balance),
+            "reason": reason_text or None,
+        },
+        is_actionable=False,
+    )
+    db.add(inbox_message)
+    db.commit()
+
+    return CommunityWalletAdjustResponse(
+        success=True,
+        user_id=target_user.id,
+        community_id=community.id,
+        operation=payload.operation,
+        amount=amount,
+        previous_balance=previous_balance,
+        new_balance=Decimal(wallet.balance),
+        message=f"Updated {target_user.username}'s balance successfully",
+    )
+
+
 # ============================================================================
 # Table Endpoints (Public - requires auth)
 # ============================================================================
@@ -2165,6 +2345,7 @@ def get_community_tables(
 def create_table(
     community_id: int,
     table: TableCreate,
+    _: None = Depends(_require_ui_create_request),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2184,17 +2365,13 @@ def create_table(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Community not found"
         )
-    
     # Check if user is trying to create a permanent table
-    if table.is_permanent:
-        # Get the league to check ownership
-        league = db.query(League).filter(League.id == community.league_id).first()
-        if not league or league.owner_id != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only community owners can create permanent tables"
-            )
-    
+    if table.is_permanent and community.commissioner_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the community owner can create permanent tables"
+        )
+
     is_global_admin = _is_global_admin(db, user_id)
     has_wallet = db.query(Wallet.id).filter(
         Wallet.user_id == user_id,
@@ -2725,8 +2902,8 @@ def delete_table(
     db: Session = Depends(get_db)
 ):
     """
-    Delete a table (only community owners can delete tables)
-    Requires authentication and ownership
+    Delete a table (community owner or global admin)
+    Requires authentication and permission checks.
     """
     user_id = current_user.get("user_id")
     
@@ -2738,19 +2915,18 @@ def delete_table(
             detail="Table not found"
         )
     
-    # Get the community and league to check ownership
+    # Get the community to check ownership
     community = db.query(Community).filter(Community.id == table.community_id).first()
     if not community:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Community not found"
         )
-    
-    league = db.query(League).filter(League.id == community.league_id).first()
-    if not league or league.owner_id != user_id:
+
+    if not (_is_global_admin(db, user_id) or community.commissioner_id == user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only community owners can delete tables"
+            detail="Only the community owner or a global admin can delete tables"
         )
     
     # Check if table has any seated players
@@ -5830,6 +6006,20 @@ def send_direct_message(
         content=payload.content.strip(),
     )
     db.add(message)
+
+    inbox_message = InboxMessage(
+        recipient_user_id=recipient.id,
+        sender_user_id=sender.id,
+        message_type="direct_message",
+        title=f"New message from {sender.username}",
+        content=message.content,
+        message_metadata={
+            "sender_user_id": sender.id,
+            "sender_username": sender.username,
+        },
+        is_actionable=False,
+    )
+    db.add(inbox_message)
     db.commit()
     db.refresh(message)
 
@@ -6054,6 +6244,7 @@ def create_community_in_league(
     description: str | None = None,
     currency: str | None = None,
     starting_balance: float | None = None,
+    _: None = Depends(_require_ui_create_request),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -6254,7 +6445,7 @@ def _send_verification_email(email: str, username: str, code: str):
     msg = MIMEMultipart()
     msg['From'] = settings.EMAIL_FROM
     msg['To'] = email
-    msg['Subject'] = "Poker Platform - Email Verification"
+    msg['Subject'] = "DormStacks - Email Verification"
     
     body = f"""
     Hello {username},
@@ -6265,7 +6456,7 @@ def _send_verification_email(email: str, username: str, code: str):
     
     If you didn't request this, please ignore this email.
     
-    - Poker Platform Team
+    - DormStacks Team
     """
     
     msg.attach(MIMEText(body, 'plain'))
@@ -6299,7 +6490,7 @@ def _send_admin_login_email(email: str, username: str, code: str):
     msg = MIMEMultipart()
     msg['From'] = settings.EMAIL_FROM
     msg['To'] = email
-    msg['Subject'] = "Poker Platform - Admin Login Verification"
+    msg['Subject'] = "DormStacks - Admin Login Verification"
     
     body = f"""
     Hello {username},
@@ -6312,7 +6503,7 @@ def _send_admin_login_email(email: str, username: str, code: str):
     
     If you didn't attempt to login, please secure your account immediately.
     
-    - Poker Platform Team
+    - DormStacks Team
     """
     
     msg.attach(MIMEText(body, 'plain'))
@@ -6345,7 +6536,7 @@ def _send_account_recovery_email(email: str, username: str, code: str):
     msg = MIMEMultipart()
     msg['From'] = settings.EMAIL_FROM
     msg['To'] = email
-    msg['Subject'] = "Poker Platform - Account Recovery Verification"
+    msg['Subject'] = "DormStacks - Account Recovery Verification"
 
     body = f"""
     Hello {username},
@@ -6358,7 +6549,7 @@ def _send_account_recovery_email(email: str, username: str, code: str):
 
     If you did not request this, you can ignore this email.
 
-    - Poker Platform Team
+    - DormStacks Team
     """
 
     msg.attach(MIMEText(body, 'plain'))
@@ -6547,7 +6738,7 @@ def send_profile_update_email(email: str, username: str, code: str):
     msg = MIMEMultipart()
     msg['From'] = settings.EMAIL_FROM
     msg['To'] = email
-    msg['Subject'] = 'Profile Update Verification - Poker Platform'
+    msg['Subject'] = 'Profile Update Verification - DormStacks'
     
     body = f"""
     Hello {username},
@@ -6558,7 +6749,7 @@ def send_profile_update_email(email: str, username: str, code: str):
     
     If you didn't request this change, please secure your account immediately.
     
-    - Poker Platform Team
+    - DormStacks Team
     """
     
     msg.attach(MIMEText(body, 'plain'))

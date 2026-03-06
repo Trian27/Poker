@@ -40,6 +40,35 @@ def connect():
 sio.connect('http://localhost:3000')
 ```
 
+## End-to-End Bot Gameplay Smoke Test
+
+From repo root, run:
+
+```bash
+workon poker
+python scripts/test_autonomous_bot_gameplay.py --mode bot-vs-bot
+```
+
+For a manual human-vs-bot validation run:
+
+```bash
+workon poker
+python scripts/test_autonomous_bot_gameplay.py --mode human-vs-bot --timeout-seconds 420
+```
+
+If your environment requires email verification, pass existing verified users:
+
+```bash
+python scripts/test_autonomous_bot_gameplay.py \
+  --mode bot-vs-bot \
+  --setup-username <setup_user> --setup-user-password <setup_pass> \
+  --bot1-username <bot_user_1> --bot1-password <bot_pass_1> \
+  --bot2-username <bot_user_2> --bot2-password <bot_pass_2>
+```
+
+Full guide:
+- [`docs/BOT_GAMEPLAY_TESTING.md`](/Users/trian/Projects/Poker/docs/BOT_GAMEPLAY_TESTING.md)
+
 ## Architecture
 
 ### WebSocket Architecture

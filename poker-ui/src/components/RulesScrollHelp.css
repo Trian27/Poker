@@ -6,15 +6,15 @@
 
 .rules-scroll-help.is-floating {
   position: fixed;
-  right: 18px;
+  right: 4px;
   bottom: 16px;
   z-index: 250;
 }
 
 .rules-scroll-trigger {
-  border: 1px solid rgba(15, 23, 42, 0.35);
-  background: rgba(255, 255, 255, 0.95);
-  color: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.78);
+  background: rgba(7, 12, 16, 0.96);
+  color: #f8fafc;
   width: 38px;
   height: 38px;
   border-radius: 999px;
@@ -38,11 +38,11 @@
   width: min(380px, calc(100vw - 26px));
   max-height: min(72vh, 560px);
   overflow-y: auto;
-  background: #ffffff;
-  color: #0f172a;
-  border: 1px solid #cbd5e1;
-  border-radius: 12px;
-  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.26);
+  background: #111a22;
+  color: #e8eff3;
+  border: 1px solid #2f4350;
+  border-radius: 0;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
   padding: 12px 12px 10px;
   z-index: 260;
 }
@@ -70,24 +70,24 @@
 }
 
 .rules-scroll-close {
-  border: 1px solid #cbd5e1;
-  background: #f8fafc;
-  color: #0f172a;
+  border: 1px solid rgba(232, 239, 243, 0.42);
+  background: #19262f;
+  color: #ffffff;
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: 0;
   cursor: pointer;
   font-size: 1.1rem;
   line-height: 1;
 }
 
 .rules-scroll-close:hover {
-  background: #e2e8f0;
+  background: #243442;
 }
 
 .rules-scroll-note {
   font-size: 0.8rem;
-  color: #475569;
+  color: #b7c7d3;
   margin: 6px 0 6px;
   font-weight: 600;
 }
@@ -103,12 +103,12 @@
 }
 
 .rules-scroll-links a {
-  color: #1d4ed8;
+  color: #8ed2a8;
 }
 
 @media (max-width: 700px) {
   .rules-scroll-help.is-floating {
-    right: 12px;
+    right: 2px;
     bottom: 10px;
   }
 }

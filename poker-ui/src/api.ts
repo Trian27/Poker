@@ -2,14 +2,44 @@
  * API Client for communicating with FastAPI backend
  */
 import axios from 'axios';
+import type { ActiveSeatStatus, CommunityWalletAdjustResponse, CommunityWalletSummary } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const TOKEN_STORAGE_KEY = 'token';
 const USER_STORAGE_KEY = 'user';
+const SESSION_EXPIRY_STORAGE_KEY = 'auth_session_expires_at';
 let inMemoryToken: string | null = null;
+
+const clearPersistedSessionStorage = () => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  window.localStorage.removeItem(USER_STORAGE_KEY);
+  window.localStorage.removeItem(SESSION_EXPIRY_STORAGE_KEY);
+};
+
+const isPersistentSessionExpired = (): boolean => {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  const rawExpiry = window.localStorage.getItem(SESSION_EXPIRY_STORAGE_KEY);
+  if (!rawExpiry) {
+    return true;
+  }
+  const expiryMs = Number(rawExpiry);
+  if (!Number.isFinite(expiryMs)) {
+    return true;
+  }
+  return Date.now() >= expiryMs;
+};
 
 const readPersistentToken = (): string | null => {
   if (typeof window === 'undefined') {
+    return null;
+  }
+  if (isPersistentSessionExpired()) {
+    clearPersistedSessionStorage();
     return null;
   }
   return window.localStorage.getItem(TOKEN_STORAGE_KEY);
@@ -25,11 +55,7 @@ export const getApiAuthToken = (): string | null => {
 
 export const clearApiAuthStorage = () => {
   inMemoryToken = null;
-  if (typeof window === 'undefined') {
-    return;
-  }
-  window.localStorage.removeItem(TOKEN_STORAGE_KEY);
-  window.localStorage.removeItem(USER_STORAGE_KEY);
+  clearPersistedSessionStorage();
 };
 
 // Create axios instance with default config
@@ -50,6 +76,9 @@ api.interceptors.request.use(
         token, // FastAPI expects token as query param
       };
     }
+    const headers = axios.AxiosHeaders.from(config.headers);
+    headers.set('X-Dormstacks-UI', 'web');
+    config.headers = headers;
     return config;
   },
   (error) => {
@@ -220,6 +249,20 @@ export const communitiesApi = {
     const response = await api.delete(`/api/communities/${communityId}`);
     return response.data;
   },
+
+  getWallets: async (communityId: number): Promise<CommunityWalletSummary[]> => {
+    const response = await api.get(`/api/communities/${communityId}/wallets`);
+    return response.data as CommunityWalletSummary[];
+  },
+
+  adjustWalletBalance: async (
+    communityId: number,
+    targetUserId: number,
+    payload: { operation: 'set' | 'add' | 'subtract'; amount: number; reason?: string }
+  ): Promise<CommunityWalletAdjustResponse> => {
+    const response = await api.patch(`/api/communities/${communityId}/wallets/${targetUserId}`, payload);
+    return response.data as CommunityWalletAdjustResponse;
+  },
 };
 
 // Wallets API
@@ -275,9 +318,9 @@ export const tablesApi = {
     return response.data;
   },
 
-  getMyActiveSeat: async () => {
+  getMyActiveSeat: async (): Promise<ActiveSeatStatus> => {
     const response = await api.get('/api/tables/me/active-seat');
-    return response.data;
+    return response.data as ActiveSeatStatus;
   },
 
   create: async (communityId: number, tableData: {
@@ -287,6 +330,7 @@ export const tablesApi = {
     small_blind: number;
     big_blind: number;
     buy_in: number;
+    is_permanent?: boolean;
     agents_allowed?: boolean;
     tournament_start_time?: string;
     tournament_starting_stack?: number;
@@ -336,6 +380,11 @@ export const tablesApi = {
 
   unregisterTournament: async (tableId: number) => {
     const response = await api.delete(`/api/tables/${tableId}/tournament/register`);
+    return response.data;
+  },
+
+  delete: async (tableId: number) => {
+    const response = await api.delete(`/api/tables/${tableId}`);
     return response.data;
   },
 

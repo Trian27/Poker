@@ -1,7 +1,7 @@
 .feature-page {
   min-height: 100vh;
-  background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
-  color: #0f172a;
+  background: #000000;
+  color: #e8eff3;
   padding: 18px;
 }
 
@@ -19,13 +19,17 @@
 }
 
 .feature-header .secondary {
-  border: 1px solid #334155;
-  background: #f8fafc;
-  color: #0f172a;
-  border-radius: 8px;
+  border: 1px solid rgba(232, 239, 243, 0.42);
+  background: #19262f;
+  color: #ffffff;
   padding: 8px 10px;
   cursor: pointer;
   font-weight: 700;
+}
+
+.feature-header .secondary:hover {
+  background: #243442;
+  border-color: rgba(232, 239, 243, 0.58);
 }
 
 .feature-grid {
@@ -35,11 +39,10 @@
 }
 
 .feature-card {
-  background: #fff;
-  border: 1px solid #dbeafe;
-  border-radius: 12px;
+  background: rgba(17, 26, 34, 0.95);
+  border: 1px solid #2b3f4d;
   padding: 12px;
-  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
 }
 
 .feature-card h3 {
@@ -66,40 +69,47 @@
 .feature-card select,
 .feature-card textarea {
   width: 100%;
-  border: 1px solid #cbd5e1;
-  border-radius: 8px;
+  border: 1px solid #2f4350;
+  background: #111a22;
+  color: #e8eff3;
   padding: 8px;
   font-size: 0.9rem;
 }
 
 .feature-card button {
-  border: 1px solid #1d4ed8;
-  background: #2563eb;
+  border: none;
+  background: var(--felt-green-surface);
   color: #fff;
-  border-radius: 8px;
   padding: 8px 10px;
   cursor: pointer;
   font-weight: 700;
 }
 
 .feature-card button.secondary {
-  border-color: #334155;
-  background: #f8fafc;
-  color: #0f172a;
+  border-color: rgba(232, 239, 243, 0.42);
+  background: #19262f;
+  color: #ffffff;
+}
+
+.feature-card button:hover {
+  filter: brightness(1.06);
+}
+
+.feature-card button.secondary:hover {
+  background: #243442;
 }
 
 .feature-meta {
   font-size: 0.82rem;
-  color: #475569;
+  color: #b7c7d3;
 }
 
 .msg-thread {
   max-height: 360px;
   overflow-y: auto;
-  border: 1px solid #dbeafe;
-  border-radius: 10px;
+  border: 1px solid #2f4350;
   padding: 10px;
-  background: #f8fafc;
+  background: #0f171f;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -107,16 +117,15 @@
 
 .msg-bubble {
   max-width: 86%;
-  border-radius: 10px;
   padding: 8px 10px;
-  background: #fff;
-  border: 1px solid #dbeafe;
+  background: #111a22;
+  border: 1px solid #2b3f4d;
 }
 
 .msg-bubble.mine {
   align-self: flex-end;
-  background: #dbeafe;
-  border-color: #93c5fd;
+  background: var(--felt-green-surface);
+  border-color: #2f6b3f;
 }
 
 .emote-bank {
@@ -129,4 +138,20 @@
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.feature-page :is(
+  .feature-card,
+  .feature-header .secondary,
+  .feature-card button,
+  .feature-row input,
+  .feature-row select,
+  .feature-row textarea,
+  .feature-card input,
+  .feature-card select,
+  .feature-card textarea,
+  .msg-thread,
+  .msg-bubble
+) {
+  border-radius: 0;
 }

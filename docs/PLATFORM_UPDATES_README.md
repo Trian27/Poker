@@ -26,13 +26,21 @@ This document will be updated continuously as work moves forward.
 - Backgrounds
 - Tournament logic
 - Learning hub
-- Rakes
+- Rakes for community owners
 - Finalize API integration for AI bot play
 - Enable API only tournaments with open source documentation
 - Rejoin button
 - Adding chip functionality to those in your community
 - Ability to delete tables, communities, or leagues you own
 - Ability for commissioners to create lasting tables
+- Automated testing: runs unit tests, integration tests, etc., and also creates an automatically generated video testing
+the different components which shows a few runs of a few different scenarios of a game.
+- Changing name of platform to DormStacks
+- Change background to match the green/learning asthetic
+- Make chat updates go to the inbox.
+- "No leagues available. Create one to get started!", should not be in quotes
+- Domain Name, Server
+- Inbox error
 
 ## Known Bugs To Be Addressed
 - Names for communities and leagues need to be added as a field in database.

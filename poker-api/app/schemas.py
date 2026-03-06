@@ -4,7 +4,7 @@ Pydantic schemas for request/response validation
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 from enum import Enum
 
 
@@ -84,6 +84,8 @@ class AdminUserResponse(BaseModel):
     id: int
     username: str
     email: EmailStr
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BanStatusRequest(BaseModel):
@@ -173,6 +175,32 @@ class WalletResponse(WalletBase):
     updated_at: Optional[datetime] = None
     
     model_config = ConfigDict(from_attributes=True)
+
+
+class CommunityWalletSummaryResponse(BaseModel):
+    """Wallet summary for a community member."""
+    user_id: int
+    username: str
+    balance: Decimal
+
+
+class CommunityWalletAdjustRequest(BaseModel):
+    """Commissioner/admin wallet adjustment payload."""
+    operation: Literal["set", "add", "subtract"]
+    amount: Decimal = Field(..., ge=0)
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+
+class CommunityWalletAdjustResponse(BaseModel):
+    """Wallet adjustment result."""
+    success: bool
+    user_id: int
+    community_id: int
+    operation: Literal["set", "add", "subtract"]
+    amount: Decimal
+    previous_balance: Decimal
+    new_balance: Decimal
+    message: str
 
 
 # ============================================================================

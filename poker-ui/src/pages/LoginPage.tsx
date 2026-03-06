@@ -1,17 +1,20 @@
 /**
  * Login page component
  */
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../auth-context';
 import { authApi, tablesApi } from '../api';
 import './AuthPages.css';
 import { getApiErrorMessage, getApiErrorStatus } from '../utils/error';
 import { clearAutoRejoinSuppression, isAutoRejoinSuppressed } from '../utils/activeSeatRejoin';
+import { hasSeenDormstacks, markDormstacksSeen } from '../utils/visitorState';
 
 export const LoginPage: React.FC = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [staySignedIn, setStaySignedIn] = useState(true);
+  const [isReturningVisitor, setIsReturningVisitor] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [isRejoiningTable, setIsRejoiningTable] = useState(false);
@@ -31,9 +34,20 @@ export const LoginPage: React.FC = () => {
   const [recoveredUsername, setRecoveredUsername] = useState('');
   
   const navigate = useNavigate();
-  const { login } = useAuth();
+  const { login, isAuthenticated, isReady } = useAuth();
+  const hasAutoRedirectedRef = useRef(false);
+  const brandHeading = (
+    <h1 className="brand-title">
+      <img src="/assets/brand-book-embossed.svg" alt="" className="brand-logo-icon" />
+      <span>DormStacks</span>
+    </h1>
+  );
 
-  const navigateAfterLogin = async () => {
+  useEffect(() => {
+    setIsReturningVisitor(hasSeenDormstacks());
+  }, []);
+
+  const navigateAfterLogin = useCallback(async () => {
     if (isAutoRejoinSuppressed()) {
       clearAutoRejoinSuppression();
       navigate('/dashboard', { replace: true });
@@ -55,7 +69,15 @@ export const LoginPage: React.FC = () => {
     }
 
     navigate('/dashboard', { replace: true });
-  };
+  }, [navigate]);
+
+  useEffect(() => {
+    if (!isReady || !isAuthenticated || showVerification || showRecovery || hasAutoRedirectedRef.current) {
+      return;
+    }
+    hasAutoRedirectedRef.current = true;
+    void navigateAfterLogin();
+  }, [isReady, isAuthenticated, showVerification, showRecovery, navigateAfterLogin]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -83,7 +105,8 @@ export const LoginPage: React.FC = () => {
         is_banned: false
       };
       
-      login(response.access_token, user);
+      login(response.access_token, user, { persist: staySignedIn });
+      markDormstacksSeen();
       await navigateAfterLogin();
     } catch (err: unknown) {
       if (getApiErrorStatus(err) === 401) {
@@ -115,7 +138,8 @@ export const LoginPage: React.FC = () => {
         is_banned: false
       };
       
-      login(response.access_token, user);
+      login(response.access_token, user, { persist: staySignedIn });
+      markDormstacksSeen();
       await navigateAfterLogin();
     } catch (err: unknown) {
       setError(getApiErrorMessage(err, 'Verification failed. Please try again.'));
@@ -182,7 +206,7 @@ export const LoginPage: React.FC = () => {
     return (
       <div className="auth-container">
         <div className="auth-card">
-          <h1>🃏 Poker Platform</h1>
+          {brandHeading}
           <h2>Admin Verification</h2>
           <p className="verification-info">
             A verification code has been sent to your email.
@@ -234,7 +258,7 @@ export const LoginPage: React.FC = () => {
     return (
       <div className="auth-container">
         <div className="auth-card">
-          <h1>🃏 Poker Platform</h1>
+          {brandHeading}
           <h2>Recover Account</h2>
 
           {recoveryMessage && <div className="success-message">{recoveryMessage}</div>}
@@ -365,8 +389,9 @@ export const LoginPage: React.FC = () => {
   return (
     <div className="auth-container">
       <div className="auth-card">
-        <h1>🃏 Poker Platform</h1>
+        {brandHeading}
         <h2>Login</h2>
+        {isReturningVisitor && <p className="verification-info">Welcome back.</p>}
 
         {isRejoiningTable && (
           <div className="rejoin-banner auth-rejoin-banner">
@@ -400,6 +425,18 @@ export const LoginPage: React.FC = () => {
               autoComplete="current-password"
             />
           </div>
+
+          <label className="checkbox-row" htmlFor="staySignedIn">
+            <input
+              id="staySignedIn"
+              type="checkbox"
+              checked={staySignedIn}
+              onChange={(e) => setStaySignedIn(e.target.checked)}
+              disabled={loading}
+            />
+            Stay signed in
+          </label>
+          <p className="auth-helper-text">Global admin accounts always require re-login.</p>
 
           {error && <div className="error-message">{error}</div>}
 

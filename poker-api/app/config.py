@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     
     # App
     DEBUG: bool = True
-    APP_NAME: str = "Poker Platform API"
+    APP_NAME: str = "DormStacks API"
     VERSION: str = "1.0.0"
     
     # Environment Mode: "dev" or "production"

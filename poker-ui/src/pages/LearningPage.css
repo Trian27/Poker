@@ -31,8 +31,8 @@
 }
 
 .active-item {
-  border-color: #2563eb !important;
-  background: #dbeafe !important;
+  border-color: #2f6b3f !important;
+  background: var(--felt-green-surface) !important;
 }
 
 .learning-hand-meta {
@@ -45,11 +45,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #cbd5e1;
-  border-radius: 8px;
+  border: 1px solid #2f4350;
   padding: 3px 7px;
   margin-right: 4px;
-  background: #fff;
+  background: #111a22;
   min-width: 34px;
 }
 
@@ -62,9 +61,8 @@
 }
 
 .timeline-row {
-  border: 1px solid #dbeafe;
-  border-radius: 10px;
-  background: #f8fafc;
+  border: 1px solid #2f4350;
+  background: #111a22;
   padding: 7px 8px;
   display: flex;
   align-items: center;
@@ -73,8 +71,8 @@
 }
 
 .timeline-row.selected {
-  border-color: #2563eb;
-  background: #eff6ff;
+  border-color: #2f6b3f;
+  background: var(--felt-green-surface);
 }
 
 .timeline-main {
@@ -87,7 +85,7 @@
 
 .timeline-seq {
   font-weight: 800;
-  color: #1d4ed8;
+  color: #8ed2a8;
 }
 
 .timeline-user {
@@ -97,28 +95,27 @@
 .timeline-action {
   text-transform: uppercase;
   font-size: 0.8rem;
-  color: #0f172a;
+  color: #e8eff3;
 }
 
 .timeline-chip,
 .timeline-stage {
   font-size: 0.8rem;
-  color: #475569;
+  color: #b7c7d3;
 }
 
 .btn-analyze {
-  border: 1px solid #0891b2;
-  background: #06b6d4;
+  border: 1px solid #2f6b3f;
+  background: var(--felt-green-surface);
   color: #fff;
-  border-radius: 8px;
   padding: 6px 10px;
   cursor: pointer;
   font-weight: 700;
 }
 
 .coach-panel {
-  border-color: #c7d2fe;
-  background: linear-gradient(180deg, #eef2ff 0%, #f8fafc 100%);
+  border-color: #2f4350;
+  background: linear-gradient(180deg, #0f171f 0%, #111a22 100%);
 }
 
 .coach-summary {
@@ -135,8 +132,8 @@
 }
 
 .coach-tag {
-  background: #e0e7ff;
-  color: #3730a3;
+  background: var(--felt-green-surface);
+  color: #8ed2a8;
   font-size: 0.75rem;
   border-radius: 999px;
   padding: 3px 8px;
@@ -149,12 +146,15 @@
 }
 
 .coach-action-row {
-  border: 1px solid #cbd5e1;
-  background: #fff;
-  border-radius: 10px;
+  border: 1px solid #2f4350;
+  background: #0f171f;
   padding: 8px;
   display: grid;
   gap: 4px;
+}
+
+.learning-page :is(.card-pill, .timeline-row, .btn-analyze, .coach-action-row) {
+  border-radius: 0;
 }
 
 @media (max-width: 1200px) {

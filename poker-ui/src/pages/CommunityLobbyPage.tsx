@@ -2,8 +2,9 @@ import { useEffect, useState, useCallback, type CSSProperties } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { communitiesApi, tablesApi, walletsApi, inboxApi } from '../api';
 import { useAuth } from '../auth-context';
-import type { Community, Table, Wallet, TableSeat, TableTournamentDetails, InboxMessage } from '../types';
+import type { Community, Table, Wallet, TableSeat, TableTournamentDetails, InboxMessage, ActiveSeatStatus } from '../types';
 import UserMenu from '../components/UserMenu';
+import CommunitySettingsModal from '../components/CommunitySettingsModal';
 import './CommunityLobby.css';
 import { getApiErrorMessage, getApiErrorStatus } from '../utils/error';
 
@@ -24,6 +25,7 @@ export default function CommunityLobbyPage() {
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [activeSeat, setActiveSeat] = useState<ActiveSeatStatus | null>(null);
   
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -57,14 +59,26 @@ export default function CommunityLobbyPage() {
   const [tournamentBlindProgressionPercent, setTournamentBlindProgressionPercent] = useState(50);
   const [tournamentPayoutIsPercentage, setTournamentPayoutIsPercentage] = useState(true);
   const [tournamentPayoutInput, setTournamentPayoutInput] = useState('');
+  const [isPermanentTable, setIsPermanentTable] = useState(false);
   
   // Join table state
   const [buyInAmount, setBuyInAmount] = useState(1000);
   const [selectedSeat, setSelectedSeat] = useState<number | null>(null);
+  const [showApiJoinInfo, setShowApiJoinInfo] = useState(false);
+  const [apiJoinCopyFeedback, setApiJoinCopyFeedback] = useState<string | null>(null);
+  const [showTableSettingsModal, setShowTableSettingsModal] = useState(false);
+  const [showCommunitySettingsModal, setShowCommunitySettingsModal] = useState(false);
+  const [tableForSettings, setTableForSettings] = useState<Table | null>(null);
 
   const parsedCommunityId = Number(communityId);
-  const canUseFixedTournamentPayout = !!(user && community && (user.is_admin || community.commissioner_id === user.id));
-  const canDeleteCommunity = !!(user && community && (user.is_admin || community.commissioner_id === user.id));
+  const idsEqual = (left?: number | null, right?: number | null) =>
+    Number.isFinite(Number(left)) && Number.isFinite(Number(right)) && Number(left) === Number(right);
+  const canUseFixedTournamentPayout = !!(user && community && (user.is_admin || idsEqual(community.commissioner_id, user.id)));
+  const canOpenCommunitySettings = !!(user && community && (Boolean(wallet) || user.is_admin || idsEqual(community.commissioner_id, user.id)));
+  const canManageTables = !!(user && community && (user.is_admin || idsEqual(community.commissioner_id, user.id)));
+  const canCreatePermanentTables = !!(user && community && idsEqual(community.commissioner_id, user.id));
+  const authApiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+  const gameServerBaseUrl = import.meta.env.VITE_GAME_SERVER_URL || 'http://localhost:3000';
 
   const loadUnreadCount = useCallback(async () => {
     try {
@@ -118,10 +132,11 @@ export default function CommunityLobbyPage() {
         setError(null);
       }
 
-      const [communities, wallets, tablesData] = await Promise.all([
+      const [communities, wallets, tablesData, activeSeatData] = await Promise.all([
         communitiesApi.getAll(),
         walletsApi.getAll(),
         tablesApi.getByCommunity(parsedCommunityId),
+        tablesApi.getMyActiveSeat(),
       ]);
 
       const comm = communities.find((c: Community) => c.id === parsedCommunityId);
@@ -158,6 +173,11 @@ export default function CommunityLobbyPage() {
 
       const userWallet = wallets.find((w: Wallet) => w.community_id === parsedCommunityId);
       setWallet(userWallet || null);
+      if (activeSeatData?.active && activeSeatData.table_id) {
+        setActiveSeat(activeSeatData);
+      } else {
+        setActiveSeat(null);
+      }
     } catch (err: unknown) {
       const message = getApiErrorMessage(err, 'Failed to load community data');
       if (silent) {
@@ -227,6 +247,14 @@ export default function CommunityLobbyPage() {
       setSelectedTable(updatedSelectedTable);
     }
   }, [showJoinModal, selectedTable, tables]);
+
+  useEffect(() => {
+    if (showJoinModal) {
+      return;
+    }
+    setShowApiJoinInfo(false);
+    setApiJoinCopyFeedback(null);
+  }, [showJoinModal]);
 
   useEffect(() => {
     if (!Number.isFinite(parsedCommunityId) || parsedCommunityId <= 0) {
@@ -358,6 +386,7 @@ export default function CommunityLobbyPage() {
         small_blind: smallBlind,
         big_blind: bigBlind,
         buy_in: buyIn,
+        is_permanent: gameType === 'tournament' ? true : isPermanentTable,
         agents_allowed: agentsAllowed,
         tournament_start_time: gameType === 'tournament' ? new Date(tournamentStartTime).toISOString() : undefined,
         tournament_starting_stack: gameType === 'tournament' ? tournamentStartingStack : undefined,
@@ -393,6 +422,7 @@ export default function CommunityLobbyPage() {
       setTournamentBlindProgressionPercent(50);
       setTournamentPayoutIsPercentage(true);
       setTournamentPayoutInput('');
+      setIsPermanentTable(false);
       setShowCreateModal(false);
       
       // Reload tables
@@ -421,24 +451,34 @@ export default function CommunityLobbyPage() {
     }
   };
 
-  const handleDeleteCommunity = async () => {
-    if (!community || !canDeleteCommunity) {
+  const openTableSettings = (table: Table) => {
+    setTableForSettings(table);
+    setShowTableSettingsModal(true);
+  };
+
+  const closeTableSettings = () => {
+    setShowTableSettingsModal(false);
+    setTableForSettings(null);
+  };
+
+  const handleDeleteTable = async () => {
+    if (!tableForSettings || !canManageTables) {
       return;
     }
-
     const confirmed = window.confirm(
-      `Delete community "${community.name}"? This deletes its tables and wallets.`
+      `Delete table "${tableForSettings.name}"? Hand history will be preserved for analysis.`
     );
     if (!confirmed) {
       return;
     }
 
     try {
-      await communitiesApi.delete(community.id);
-      navigate('/dashboard');
-      return;
+      await tablesApi.delete(tableForSettings.id);
+      closeTableSettings();
+      await loadData({ silent: true });
+      alert('Table deleted successfully.');
     } catch (err: unknown) {
-      alert(getApiErrorMessage(err, 'Failed to delete community'));
+      alert(getApiErrorMessage(err, 'Failed to delete table'));
     }
   };
 
@@ -544,11 +584,26 @@ export default function CommunityLobbyPage() {
   };
 
   const openJoinModal = async (table: Table) => {
+    if (activeSeat?.active && activeSeat.table_id === table.id) {
+      const communityQuery = Number.isFinite(parsedCommunityId) && parsedCommunityId > 0
+        ? `?communityId=${parsedCommunityId}`
+        : '';
+      navigate(`/game/${table.id}${communityQuery}`);
+      return;
+    }
+
     setSelectedTable(table);
     setBuyInAmount(table.game_type === 'tournament' ? (table.tournament_starting_stack || 1000) : table.buy_in);
     setSelectedSeat(null);
+    setShowApiJoinInfo(false);
+    setApiJoinCopyFeedback(null);
     setShowJoinModal(true);
     await loadSeats(table, true);
+  };
+
+  const handleSpectateTable = (table: Table) => {
+    const communityQuery = Number.isFinite(parsedCommunityId) ? `?communityId=${parsedCommunityId}&spectate=1` : '?spectate=1';
+    navigate(`/game/${table.id}${communityQuery}`);
   };
 
   const handleRegisterTournament = async (table: Table) => {
@@ -705,6 +760,43 @@ export default function CommunityLobbyPage() {
   const reviewTargetName = reviewCommunityName || reviewLeagueName || 'Unknown';
   const reviewUsesBalance = typeof reviewMessage?.metadata?.community_id === 'number'
     || Number.isFinite(Number(reviewMessage?.metadata?.community_id));
+  const apiJoinSnippet = selectedTable
+    ? [
+      `# Login a bot account`,
+      `BOT_LOGIN_JSON=$(curl -s -X POST --get \\`,
+      `  --data-urlencode "username=<bot_username>" \\`,
+      `  --data-urlencode "password=<bot_password>" \\`,
+      `  "${authApiBaseUrl}/auth/login")`,
+      `BOT_TOKEN=$(echo "$BOT_LOGIN_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')`,
+      `BOT_USER_ID=$(echo "$BOT_LOGIN_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["user"]["id"])')`,
+      ``,
+      `# Optional: reserve a seat from API (same action as UI join)`,
+      `curl -s -X POST "${authApiBaseUrl}/api/tables/${selectedTable.id}/join?token=$BOT_TOKEN" \\`,
+      `  -H "Content-Type: application/json" \\`,
+      `  -d '{"buy_in_amount": ${selectedTable.game_type === 'tournament' ? (selectedTable.tournament_starting_stack || 1000) : buyInAmount}, "seat_number": ${selectedSeat ?? '<seat_number>'}}'`,
+      ``,
+      `# Start autonomous bot for this table`,
+      `python poker-agent-api/agent_websocket.py \\`,
+      `  --server "${gameServerBaseUrl}" \\`,
+      `  --game-id "table_${selectedTable.id}" \\`,
+      `  --token "$BOT_TOKEN" \\`,
+      `  --user-id "$BOT_USER_ID" \\`,
+      `  --action-delay-seconds 3`,
+    ].join('\n')
+    : '';
+
+  const handleCopyApiJoinSnippet = async () => {
+    if (!apiJoinSnippet) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(apiJoinSnippet);
+      setApiJoinCopyFeedback('Copied');
+    } catch {
+      setApiJoinCopyFeedback('Copy failed');
+    }
+    window.setTimeout(() => setApiJoinCopyFeedback(null), 1500);
+  };
 
   if (loading) {
     return (
@@ -774,6 +866,14 @@ export default function CommunityLobbyPage() {
       </div>
 
       <div className="lobby-actions">
+        {canOpenCommunitySettings && (
+          <button
+            className="create-table-button"
+            onClick={() => setShowCommunitySettingsModal(true)}
+          >
+            Community Settings
+          </button>
+        )}
         <button 
           className="create-table-button"
           onClick={() => setShowCreateModal(true)}
@@ -781,14 +881,6 @@ export default function CommunityLobbyPage() {
         >
           + Create Table
         </button>
-        {canDeleteCommunity && (
-          <button
-            className="delete-community-button"
-            onClick={handleDeleteCommunity}
-          >
-            Delete Community
-          </button>
-        )}
       </div>
 
       <div className="tables-section">
@@ -920,15 +1012,53 @@ export default function CommunityLobbyPage() {
                         Tournament Canceled
                       </button>
                     )}
+                    {table.status !== 'finished' && (
+                      <button
+                        className="join-button secondary"
+                        onClick={() => handleSpectateTable(table)}
+                      >
+                        Spectate
+                      </button>
+                    )}
+                    {canManageTables && (
+                      <button
+                        className="join-button secondary"
+                        onClick={() => openTableSettings(table)}
+                      >
+                        Table Settings
+                      </button>
+                    )}
                   </div>
                 ) : (
-                  <button 
-                    className="join-button"
-                    onClick={() => openJoinModal(table)}
-                    disabled={!wallet || table.status === 'finished'}
-                  >
-                    {table.status === 'finished' ? 'Finished' : 'Join Table'}
-                  </button>
+                  <>
+                  <div className="table-primary-actions">
+                    {table.status !== 'finished' && (
+                      <button
+                        className="join-button secondary"
+                        onClick={() => handleSpectateTable(table)}
+                      >
+                        Spectate
+                      </button>
+                    )}
+                    <button
+                      className="join-button"
+                      onClick={() => openJoinModal(table)}
+                      disabled={((!wallet && !(activeSeat?.active && activeSeat.table_id === table.id)) || table.status === 'finished')}
+                    >
+                      {table.status === 'finished'
+                        ? 'Finished'
+                        : (activeSeat?.active && activeSeat.table_id === table.id ? 'Rejoin Table' : 'Join Table')}
+                    </button>
+                  </div>
+                  {canManageTables && (
+                    <button
+                      className="join-button secondary table-settings-button"
+                      onClick={() => openTableSettings(table)}
+                    >
+                      Table Settings
+                    </button>
+                  )}
+                  </>
                 )}
               </div>
             ))}
@@ -1185,6 +1315,21 @@ export default function CommunityLobbyPage() {
                   When enabled, AI poker agents can join this table
                 </p>
               </div>
+
+              {gameType === 'cash' && canCreatePermanentTables && (
+                <div className="form-group checkbox-group">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={isPermanentTable}
+                      onChange={(e) => setIsPermanentTable(e.target.checked)}
+                    />
+                    <span className="checkbox-text">
+                      Keep Table Permanent (do not auto-delete when empty)
+                    </span>
+                  </label>
+                </div>
+              )}
               
               <div className="modal-actions">
                 <button type="button" onClick={() => setShowCreateModal(false)}>
@@ -1209,19 +1354,12 @@ export default function CommunityLobbyPage() {
             </div>
             
             <div className="join-info">
-              <p><strong>Game Type:</strong> {selectedTable.game_type === 'cash' ? 'Cash Game' : 'Tournament'}</p>
+              <p><strong>Game Type:</strong> {selectedTable.game_type === 'cash' ? '💵 Cash Game' : '🏆 Tournament'}</p>
               <p><strong>Blinds:</strong> {selectedTable.small_blind}/{selectedTable.big_blind}</p>
-              {selectedTable.game_type === 'cash' ? (
-                <p><strong>Minimum Buy-in:</strong> {selectedTable.buy_in} chips</p>
-              ) : (
-                <>
-                  <p><strong>Entry Fee:</strong> {selectedTable.buy_in} chips</p>
-                  <p><strong>Starting Stack:</strong> {selectedTable.tournament_starting_stack || 1000} chips</p>
-                </>
-              )}
-              {wallet && (
-                <p><strong>Your Balance:</strong> {typeof wallet.balance === 'string' ? wallet.balance : wallet.balance.toFixed(2)} chips</p>
-              )}
+              <p><strong>Buy-in:</strong> {selectedTable.buy_in} chips</p>
+              <p><strong>Seats:</strong> {tableSeatCounts[selectedTable.id] ?? 0}/{selectedTable.max_seats}</p>
+              <p><strong>Agents:</strong> {selectedTable.agents_allowed !== false ? '🤖 Allowed' : '🚫 Humans Only'}</p>
+              <p><strong>Status:</strong> {selectedTable.status}</p>
             </div>
             
             {selectedTable.game_type === 'cash' && (
@@ -1291,10 +1429,39 @@ export default function CommunityLobbyPage() {
                 </div>
               )}
             </div>
+
+            {showApiJoinInfo && (
+              <div className="api-join-info">
+                <h4>Join via API</h4>
+                <p>
+                  Use this if you want a bot process to connect to this exact table without manually finding IDs.
+                </p>
+                <div className="api-join-meta">
+                  <span><strong>Community ID:</strong> {community.id}</span>
+                  <span><strong>Table ID:</strong> {selectedTable.id}</span>
+                  <span><strong>Game ID:</strong> table_{selectedTable.id}</span>
+                </div>
+                <pre>{apiJoinSnippet}</pre>
+                <button
+                  type="button"
+                  className="api-copy-button"
+                  onClick={handleCopyApiJoinSnippet}
+                >
+                  {apiJoinCopyFeedback ? apiJoinCopyFeedback : 'Copy Snippet'}
+                </button>
+              </div>
+            )}
             
             <div className="modal-actions">
               <button type="button" onClick={() => setShowJoinModal(false)}>
                 Cancel
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => setShowApiJoinInfo((current) => !current)}
+              >
+                {showApiJoinInfo ? 'Hide API Join' : 'Join via API'}
               </button>
                 <button 
                   type="button" 
@@ -1312,6 +1479,66 @@ export default function CommunityLobbyPage() {
             </div>
         </div>
       )}
+
+      {showTableSettingsModal && tableForSettings && (
+        <div className="modal-overlay" onClick={closeTableSettings}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Table Settings</h2>
+              <button className="close-button" onClick={closeTableSettings}>×</button>
+            </div>
+            <div className="join-info">
+              <p><strong>Name:</strong> {tableForSettings.name}</p>
+              <p><strong>Type:</strong> {tableForSettings.game_type === 'cash' ? 'Cash Game' : 'Tournament'}</p>
+              <p><strong>Status:</strong> {tableForSettings.status}</p>
+              <p><strong>Blinds:</strong> {tableForSettings.small_blind}/{tableForSettings.big_blind}</p>
+              <p><strong>Buy-in:</strong> {tableForSettings.buy_in} chips</p>
+              <p><strong>Max Seats:</strong> {tableForSettings.max_seats}</p>
+              <p><strong>Agents Allowed:</strong> {tableForSettings.agents_allowed !== false ? 'Yes' : 'No'}</p>
+              <p><strong>Permanent:</strong> {tableForSettings.is_permanent ? 'Yes' : 'No'}</p>
+              {typeof tableForSettings.action_timeout_seconds === 'number' && (
+                <p><strong>Action Timeout:</strong> {tableForSettings.action_timeout_seconds}s</p>
+              )}
+              {tableForSettings.game_type === 'tournament' && (
+                <>
+                  <p><strong>Tournament State:</strong> {tableForSettings.tournament_state || 'scheduled'}</p>
+                  <p><strong>Start Time:</strong> {formatDateTime(tableForSettings.tournament_start_time)}</p>
+                  <p><strong>Starting Stack:</strong> {tableForSettings.tournament_starting_stack ?? 1000} chips</p>
+                  <p><strong>Security Deposit:</strong> {tableForSettings.tournament_security_deposit ?? Math.ceil((tableForSettings.buy_in || 0) * 0.1)} chips</p>
+                  <p><strong>Confirmation Window:</strong> {tableForSettings.tournament_confirmation_window_seconds ?? 60}s</p>
+                  <p><strong>Blind Interval:</strong> {tableForSettings.tournament_blind_interval_minutes ?? 10} min</p>
+                  <p><strong>Blind Increase:</strong> {tableForSettings.tournament_blind_progression_percent ?? 50}%</p>
+                  <p><strong>Payout Mode:</strong> {tableForSettings.tournament_payout_is_percentage === false ? 'Fixed chips' : 'Percentage'}</p>
+                  {Array.isArray(tableForSettings.tournament_payout) && tableForSettings.tournament_payout.length > 0 && (
+                    <p>
+                      <strong>Payout:</strong> {tableForSettings.tournament_payout.join(', ')} {tableForSettings.tournament_payout_is_percentage === false ? 'chips' : '%'}
+                    </p>
+                  )}
+                  <p><strong>Prize Pool:</strong> {tableForSettings.tournament_prize_pool ?? 0} chips</p>
+                </>
+              )}
+            </div>
+            <div className="modal-actions table-settings-actions">
+              <button type="button" className="table-settings-close-button" onClick={closeTableSettings}>Close</button>
+              {canManageTables && (
+                <button type="button" className="danger-action table-settings-delete-button" onClick={handleDeleteTable}>
+                  Delete Table
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <CommunitySettingsModal
+        isOpen={showCommunitySettingsModal}
+        community={community}
+        user={user}
+        onClose={() => setShowCommunitySettingsModal(false)}
+        onDeleted={() => {
+          navigate('/dashboard');
+        }}
+      />
 
       {showInboxModal && (
         <div className="community-inbox-overlay" onClick={() => setShowInboxModal(false)}>
