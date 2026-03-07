@@ -986,11 +986,12 @@ export const GameTablePage: React.FC = () => {
     // If facing a bet, preset sizing is based on pot-after-call.
     const effectivePot = Math.max(0, gameState.pot + (callAmount > 0 ? callAmount : 0));
     const halfPot = Math.ceil(effectivePot * 0.5);
+    const oneThirdPot = Math.ceil(effectivePot / 3);
     const presetConfigs = [
+      { label: '1/3 Pot', amount: oneThirdPot },
       { label: '1/2 Pot', amount: halfPot },
       { label: 'Pot', amount: Math.ceil(effectivePot) },
       { label: '2x Pot', amount: Math.ceil(effectivePot * 2) },
-      { label: '3x Pot', amount: Math.ceil(effectivePot * 3) },
     ];
 
     return presetConfigs.map((preset) => ({
@@ -1506,7 +1507,7 @@ export const GameTablePage: React.FC = () => {
                   <div className="bet-group">
                     <input
                       type="number"
-                      placeholder="Amount"
+                      placeholder=" Amount"
                       value={betAmount}
                       onChange={(e) => setBetAmount(e.target.value)}
                       min={minRaiseSize}

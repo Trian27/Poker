@@ -41,6 +41,10 @@ the different components which shows a few runs of a few different scenarios of 
 - "No leagues available. Create one to get started!", should not be in quotes
 - Domain Name, Server
 - Inbox error
+- Bomb pot tables
+- PLO tables
 
 ## Known Bugs To Be Addressed
 - Names for communities and leagues need to be added as a field in database.
+- Need to implement a minimum raise requirement.
+    - Minimum raise = at least the size of the previous bet or raise in that same street. If someone bets $60, the minimum raise is $60 more.

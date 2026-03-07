@@ -567,7 +567,7 @@
 }
 
 .playing-card.card-back {
-  /*background-image: var(--card-back-image);*/
+  background-image: var(--card-back-image);
   background-position: center;
   background-size: cover;
   border: 1px solid #f8fafc;
@@ -629,28 +629,37 @@
 }
 
 .action-panel {
-  background: rgba(2, 12, 20, 0.78);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  left: 50%;
+  gap: 8px;
+  /*transform: translateX(-50%);*/
+  width: auto;
+  min-width: 450px; 
+  max-width: 600px;
+  padding: 10px 14px;
+  background: rgba(10, 20, 30, 0.96);
+  backdrop-filter: blur(8px);
   border-radius: 12px;
-  padding: 6px 8px;
-  max-width: 960px;
-  margin: 0 auto;
-  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
 }
 
 .action-area {
-  min-height: clamp(44px, 6.5vh, 64px);
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  margin: 0 auto;
+  padding: 10px 0;
+  width: 100%;
 }
 
 .emote-row {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
+  flex-direction: column;
   gap: 6px;
-  margin-bottom: 6px;
+  position: fixed;
+  left: 12px;
+  bottom: 120px; 
 }
 
 .btn-emote {
@@ -683,59 +692,164 @@
 }
 
 .quick-bets {
-  display: flex;
+  /* display: flex;
   gap: 6px;
   justify-content: center;
   flex-wrap: wrap;
-  margin-bottom: 4px;
+  margin-bottom: 4px; */
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-bottom: 12px;
 }
 
 .btn-quick-bet {
-  border: 1px solid rgba(59, 130, 246, 0.65);
+  /* border: 1px solid rgba(59, 130, 246, 0.65);
   background: rgba(30, 64, 175, 0.26);
   color: #dbeafe;
   border-radius: 999px;
   padding: 5px 9px;
   font-size: 0.78rem;
   font-weight: 700;
-  cursor: pointer;
+  cursor: pointer; */
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #fff;
+  border-radius: 20px;
+  padding: 8px 16px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  transition: all 0.2s ease;
 }
 
-.btn-quick-bet:hover {
+/* .btn-quick-bet:hover {
   background: rgba(30, 64, 175, 0.42);
+} */
+.btn-quick-bet:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
 }
 
 .action-buttons {
-  display: flex;
+  /* display: flex;
   gap: 6px;
   flex-wrap: wrap;
   justify-content: center;
-  align-items: center;
+  align-items: center; */
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  align-items: stretch;
+  height: 50px; 
+  width: 100%;
 }
 
 .btn-action {
-  border: none;
+  /* border: none;
   border-radius: 8px;
   padding: 7px 11px;
   font-size: 0.82rem;
   font-weight: 800;
   cursor: pointer;
-  color: #fff;
+  color: #fff; */
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 4px 6px rgba(0, 0, 0, 0.3);
+  transition: transform 0.1s ease, filter 0.2s ease;
+  flex: 1; 
+  height: 50px;
+}
+.btn-action:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
 }
 
-.btn-fold { background: #dc2626; }
+.btn-fold { 
+  flex: 1;
+  background: linear-gradient(180deg, #e11d48 0%, #9f1239 100%); 
+}
+.btn-fold::before { content: '✕'; font-size: 1.2rem; }
+
+.btn-call, .btn-check { 
+  background: linear-gradient(180deg, #16a34a 0%, #166534 100%); 
+  flex: 1.2;
+}
+.btn-call::before, .btn-check::before { content: '✓'; font-size: 1.2rem; }
+
+.btn-bet, .btn-raise { 
+  flex: 2.0;
+  background: linear-gradient(180deg, #ea580c, #c2410c);
+  font-size: 1.2rem; /* Make the text pop more */
+}
+
+.btn-allin { 
+  flex: 0.5; 
+  min-width: 80px;
+  background: linear-gradient(180deg, #4f46e5, #3730a3);
+  font-size: 0.85rem;
+  padding: 0;
+}
+
+/* Bet Input Group */
+.bet-group {
+  display: flex;
+  flex: 2.2;
+  background: #050a10;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.bet-input {
+  width: 100px;
+  background: transparent;
+  border: none;
+  color: #fbbf24;
+  font-size: 1.2rem;
+  font-weight: 800;
+  text-align: center;
+  border-right: 1px solid rgba(255, 255, 255, 0.1);
+}
+.bet-group .btn-bet {
+  flex: 1.0;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  background: linear-gradient(180deg, #ea580c, #9a3412);
+  font-size: 1.3rem;
+}
+
+.btn-action:disabled {
+  filter: grayscale(1) opacity(0.5);
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* .btn-fold { background: #dc2626; }
 .btn-check { background: #2563eb; }
 .btn-call { background: #0891b2; }
 .btn-bet,
 .btn-raise { background: #d97706; }
 .btn-allin { background: #7c3aed; }
 
-.btn-action.btn-disabled,
-.btn-action:disabled {
+ .btn-action.btn-disabled,
+ .btn-action:disabled {
   background: #64748b !important;
   color: #cbd5e1;
   cursor: not-allowed;
   opacity: 0.75;
+} */
+/* .btn-action:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
 }
 
 .bet-group {
@@ -758,7 +872,7 @@
   outline: none;
   border-color: #fbbf24;
 }
-
+*/ 
 .waiting-turn,
 .folded-message {
   text-align: center;
