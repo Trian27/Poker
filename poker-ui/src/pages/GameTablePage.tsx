@@ -1040,19 +1040,23 @@ export const GameTablePage: React.FC = () => {
   }, [activeEmotes]);
 
   const tableThemeStyles = useMemo(() => {
-    const styles: CSSProperties = {};
-    if (tableTheme.tableBackground) {
-      (styles as Record<string, string>)['--table-background-image'] = tableTheme.tableBackground;
-    }
-    if (tableTheme.tableFelt) {
-      (styles as Record<string, string>)['--table-felt-image'] = tableTheme.tableFelt;
-    }
+    const styles: CSSProperties = {
+      // Background image from the public folder
+      backgroundImage: 'url("/assets/table.png")',
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+      backgroundRepeat: 'no-repeat',
+      backgroundColor: '#07151b',
+    };
+
+    // Keep the card theme variables
     if (tableTheme.cardFront) {
       (styles as Record<string, string>)['--card-front-image'] = tableTheme.cardFront;
     }
     if (tableTheme.cardBack) {
       (styles as Record<string, string>)['--card-back-image'] = tableTheme.cardBack;
     }
+
     return styles;
   }, [tableTheme]);
 

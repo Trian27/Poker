@@ -1,5 +1,5 @@
 .game-container {
-  --table-background-image: radial-gradient(circle at 50% 20%, #184a1f 0%, #0c2229 65%, #07151b 100%);
+  /* --table-background-image: radial-gradient(circle at 50% 20%, #184a1f 0%, #0c2229 65%, #07151b 100%);
   --table-felt-image: radial-gradient(circle at center, #15803d 0%, #166534 55%, #14532d 100%);
   --card-front-image: linear-gradient(145deg, #ffffff 0%, #f8fafc 100%);
   --card-back-image: repeating-linear-gradient(45deg, #8b1d1d 0 6px, #9f2424 6px 12px);
@@ -32,7 +32,34 @@
   color: #f8fafc;
   display: flex;
   flex-direction: column;
+  position: relative; */
+  /* --- Card & Component Assets --- */
+  --pocket-card-width: 32px;
+  --pocket-card-height: 46px;
+  --pocket-card-hidden-ratio: 0.25;
+  --pocket-card-extra-lift: 2px;
+  --card-front-image: linear-gradient(145deg, #ffffff 0%, #f8fafc 100%);
+  --card-back-image: repeating-linear-gradient(45deg, #8b1d1d 0 6px, #9f2424 6px 12px);
+
+  /* --- Player & Seat Geometry --- */
+  --player-circle-size: clamp(102px, 11.4vmin, 114px);
+  --seat-radius-x: 51.2;
+  --seat-radius-y: 50.4;
+  --seat-card-offset: 100;
+
+  /* --- Layout & Background --- */
+  height: 100svh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   position: relative;
+  color: #f8fafc;
+  
+  /* Use the relative path to your image */
+  background-position: center !important;
+  background-size: cover !important;
+  background-repeat: no-repeat !important;
+  background-color: #07151b;
 }
 
 .game-header {
@@ -180,7 +207,7 @@
 }
 
 .game-table {
-  width: var(--dynamic-table-width);
+  /* width: var(--dynamic-table-width);
   height: var(--dynamic-table-height);
   max-width: 100%;
   max-height: 100%;
@@ -195,7 +222,22 @@
     inset 0 0 40px rgba(0, 0, 0, 0.35),
     0 16px 35px rgba(0, 0, 0, 0.35);
   position: relative;
-  transform: translateY(var(--dynamic-table-shift-y));
+  transform: translateY(var(--dynamic-table-shift-y)); */
+    /* This matches the size of the table in your image */
+  width: var(--dynamic-table-width);
+  height: var(--dynamic-table-height);
+  
+  /* Keep it centered */
+  margin: auto;
+  position: relative;
+  
+  /* Remove all the borders, gradients, and shadows! */
+  background: transparent;
+  border: none;
+  box-shadow: none;
+
+  /* Use this to nudge the invisible grid so it aligns with the image felt */
+  transform: translateY(20px); 
 }
 
 .table-center {
@@ -525,7 +567,7 @@
 }
 
 .playing-card.card-back {
-  background-image: var(--card-back-image);
+  /*background-image: var(--card-back-image);*/
   background-position: center;
   background-size: cover;
   border: 1px solid #f8fafc;
@@ -746,7 +788,7 @@
 }
 
 .playing-card.card-front-themed {
-  background-image: var(--card-front-image);
+  /*background-image: var(--card-front-image);*/
   background-position: center;
   background-size: cover;
 }
