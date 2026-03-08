@@ -19,7 +19,7 @@
   "license": "MIT",
   "dependencies": {
     "@types/express": "^5.0.4",
-    "axios": "^1.12.2",
+    "axios": "^1.13.6",
     "body-parser": "^2.2.0",
     "express": "^5.1.0",
     "ioredis": "^5.8.2",

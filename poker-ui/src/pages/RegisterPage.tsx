@@ -1,13 +1,13 @@
 /**
  * Register page component
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../auth-context';
 import { authApi } from '../api';
 import './AuthPages.css';
 import { getApiErrorMessage } from "../utils/error";
-import { consumePostSignupTutorialPending, markDormstacksSeen } from '../utils/visitorState';
+import { consumePostSignupTutorialPending, hasSeenDormstacks, markDormstacksSeen } from '../utils/visitorState';
 
 export const RegisterPage: React.FC = () => {
   const [username, setUsername] = useState('');
@@ -31,6 +31,12 @@ export const RegisterPage: React.FC = () => {
       <span>DormStacks</span>
     </h1>
   );
+
+  useEffect(() => {
+    if (!hasSeenDormstacks()) {
+      navigate('/', { replace: true });
+    }
+  }, [navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

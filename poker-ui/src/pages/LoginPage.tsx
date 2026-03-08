@@ -44,8 +44,12 @@ export const LoginPage: React.FC = () => {
   );
 
   useEffect(() => {
-    setIsReturningVisitor(hasSeenDormstacks());
-  }, []);
+    const seenBefore = hasSeenDormstacks();
+    setIsReturningVisitor(seenBefore);
+    if (!seenBefore) {
+      navigate('/', { replace: true });
+    }
+  }, [navigate]);
 
   const navigateAfterLogin = useCallback(async () => {
     if (isAutoRejoinSuppressed()) {

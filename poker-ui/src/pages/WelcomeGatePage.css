@@ -29,8 +29,8 @@
 .welcome-book-stage {
   width: min(95vw, 1060px);
   min-height: 0;
-  height: min(74svh, 570px);
-  max-height: 74svh;
+  height: min(82svh, 700px);
+  max-height: 82svh;
   display: grid;
   place-items: center;
   overflow: hidden;
@@ -38,7 +38,7 @@
 
 .welcome-book-frame {
   --open-book-width: min(95vw, 980px);
-  --open-book-height: min(68svh, 500px);
+  --open-book-height: min(76svh, 620px);
   --spine-width: 16px;
   --page-width: calc((var(--open-book-width) - var(--spine-width)) / 2);
   --book-anchor-x: 56%;
@@ -138,8 +138,8 @@
   position: absolute;
   top: 50%;
   left: calc(var(--book-anchor-x) + ((var(--page-width) + var(--spine-width)) / 2));
-  width: var(--page-width);
-  height: var(--open-book-height);
+  width: calc(var(--page-width) * 1.06);
+  height: calc(var(--open-book-height) * 1.12);
   transform: translate(-50%, -50%) rotateY(0deg);
   margin: 0;
   padding: 0;
@@ -170,32 +170,15 @@
   display: none;
 }
 
-.welcome-book-cover-image {
+.welcome-book-cover-art {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: cover;
-  transform: scale(1);
-  transform-origin: center;
-  filter: drop-shadow(0 14px 24px rgba(0, 0, 0, 0.55));
+  display: block;
+  transform: translateZ(0);
   z-index: 1;
   pointer-events: none;
-}
-
-.welcome-book-cover-title {
-  position: absolute;
-  inset: 50% auto auto 50%;
-  transform: translate(-50%, -50%);
-  font-size: clamp(1.45rem, 3.7vw, 2.7rem);
-  font-weight: 800;
-  color: #e9f4e2;
-  text-shadow:
-    0 1px 2px rgba(20, 32, 14, 0.8),
-    0 0 12px rgba(46, 87, 35, 0.45);
-  letter-spacing: 0.02em;
-  pointer-events: none;
-  z-index: 2;
 }
 
 .welcome-page-flip-stack {
@@ -256,18 +239,39 @@
   text-align: center;
 }
 
+.welcome-book-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(0.7rem, 1.8vw, 1.4rem);
+  flex-wrap: wrap;
+}
+
+.welcome-book-link {
+  color: #d6bc87;
+  font-size: clamp(0.82rem, 1.15vw, 0.95rem);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(214, 188, 135, 0.42);
+  padding-bottom: 0.12rem;
+}
+
+.welcome-book-link:hover {
+  color: #f0ddb5;
+  border-bottom-color: rgba(240, 221, 181, 0.74);
+}
+
 @media (max-width: 760px) {
   .welcome-book-frame {
     --open-book-width: min(95vw, 700px);
-    --open-book-height: min(62svh, 410px);
+    --open-book-height: min(68svh, 500px);
     --spine-width: 12px;
     --page-width: calc((var(--open-book-width) - var(--spine-width)) / 2);
     --book-anchor-x: 54%;
   }
 
   .welcome-book-stage {
-    height: min(72svh, 500px);
-    max-height: 72svh;
+    height: min(78svh, 580px);
+    max-height: 78svh;
   }
 
   .welcome-open-book {

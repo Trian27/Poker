@@ -1219,10 +1219,15 @@
 .modal-content label,
 .modal-content p,
 .community-inbox-title-row strong,
+.community-inbox-title-row span,
 .community-inbox-message p,
 .community-inbox-from,
 .seat-selected-info,
 .checkbox-text {
+  color: #ffffff;
+}
+
+.community-inbox-message .action-taken {
   color: #e8eff3;
 }
 

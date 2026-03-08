@@ -7,6 +7,9 @@ import { ProtectedRoute } from './ProtectedRoute';
 import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { WelcomeGatePage } from './pages/WelcomeGatePage';
+import { WelcomeChipGatePage } from './pages/WelcomeChipGatePage';
+import { WelcomeChipFlipGatePage } from './pages/WelcomeChipFlipGatePage';
+import { WelcomeDealRevealPage } from './pages/WelcomeDealRevealPage';
 import { DashboardPage } from './pages/DashboardPage';
 import CommunityLobbyPage from './pages/CommunityLobbyPage';
 import { GameTablePage } from './pages/GameTablePage';
@@ -25,6 +28,10 @@ function AppRoutes() {
   const isInGame = location.pathname.startsWith('/game/');
   const hideGlobalFloatingUi = (
     location.pathname === '/'
+    || location.pathname === '/chipspin'
+    || location.pathname === '/chipflip'
+    || location.pathname === '/dealreveal'
+    || location.pathname === '/learningmode'
     || location.pathname === '/login'
     || location.pathname === '/register'
     || location.pathname === '/tutorial'
@@ -35,7 +42,11 @@ function AppRoutes() {
   return (
     <>
       <Routes>
-        <Route path="/" element={<WelcomeGatePage />} />
+        <Route path="/" element={<WelcomeDealRevealPage />} />
+        <Route path="/chipspin" element={<WelcomeChipGatePage />} />
+        <Route path="/chipflip" element={<WelcomeChipFlipGatePage />} />
+        <Route path="/dealreveal" element={<WelcomeDealRevealPage />} />
+        <Route path="/learningmode" element={<WelcomeGatePage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route

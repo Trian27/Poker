@@ -20,7 +20,7 @@
   --felt-green-surface:
     url('/assets/poker-felt-texture.svg') 0 0 / 64px 64px repeat,
     url('/assets/poker-felt-texture.svg') 20px 14px / 108px 108px repeat,
-    linear-gradient(145deg, #2f6b3f 0%, #255637 56%, #1d4a34 100%);
+    linear-gradient(140deg, #1e7d1e 0%, #1a6f1a 52%, #166316 100%);
   
   font-synthesis: none;
   text-rendering: optimizeLegibility;

@@ -88,6 +88,51 @@
   flex: 0 0 auto;
 }
 
+.dashboard-header .brand-cards-logo {
+  position: relative;
+  width: 2.05rem;
+  height: 1.7rem;
+  flex: 0 0 auto;
+  display: inline-block;
+}
+
+.dashboard-header .brand-cards-logo::before,
+.dashboard-header .brand-cards-logo::after {
+  content: '';
+  position: absolute;
+  width: 1.22rem;
+  height: 1.7rem;
+  border-radius: 0.18rem;
+  border: 1px solid #dfe7f1;
+  box-shadow:
+    0 5px 12px rgba(0, 0, 0, 0.45),
+    inset 0 0 0 2px rgba(255, 255, 255, 0.16),
+    inset 0 -8px 14px rgba(0, 0, 0, 0.25);
+}
+
+.dashboard-header .brand-cards-logo::before {
+  left: 0;
+  top: 0.02rem;
+  transform: rotate(-11deg);
+  background:
+    radial-gradient(circle at 22% 18%, rgba(255, 255, 255, 0.16) 0%, transparent 26%),
+    repeating-linear-gradient(
+      135deg,
+      rgba(212, 228, 251, 0.28) 0 4px,
+      rgba(88, 122, 179, 0.28) 4px 8px
+    ),
+    linear-gradient(180deg, #2c558d 0%, #1f3c69 100%);
+}
+
+.dashboard-header .brand-cards-logo::after {
+  right: 0;
+  top: 0.02rem;
+  transform: rotate(11deg);
+  background:
+    linear-gradient(180deg, rgba(8, 10, 16, 0.1) 0%, rgba(4, 6, 10, 0.24) 100%),
+    url('/assets/header-logo-right-card.png') center center / cover no-repeat;
+}
+
 .user-info {
   position: absolute;
   right: clamp(2px, 0.4vw, 8px);
@@ -113,6 +158,11 @@
   background: transparent;
   color: #e8eff3;
   padding: 0 14px;
+}
+
+.dashboard-header .inbox-btn .badge {
+  top: 14px;
+  right: 6px;
 }
 
 .dashboard-header .inbox-btn .inbox-label {
@@ -1164,8 +1214,6 @@
 .dashboard-container .league-description,
 .dashboard-container .info-item .label,
 .dashboard-container .info-item .value,
-.dashboard-container .message-date,
-.dashboard-container .message-from,
 .dashboard-container .settings-note,
 .dashboard-container .settings-empty,
 .dashboard-container .helper-text {
@@ -1185,6 +1233,25 @@
   background: var(--felt-green-surface);
   border-color: #8ed2a8;
   box-shadow: inset 4px 0 0 #8ed2a8;
+}
+
+.dashboard-container .inbox-message,
+.dashboard-container .inbox-message *,
+.dashboard-container .user-message,
+.dashboard-container .user-message *,
+.dashboard-container .modal .message-content,
+.dashboard-container .modal .message-date,
+.dashboard-container .modal .message-from,
+.dashboard-container .modal .message-meta-line,
+.dashboard-container .modal .message-json-details summary,
+.dashboard-container .modal .message-json-details pre,
+.dashboard-container .modal p,
+.dashboard-container .modal p strong {
+  color: #ffffff;
+}
+
+.dashboard-container .modal .action-taken {
+  color: #e8eff3;
 }
 
 .dashboard-container .league-join-panel {

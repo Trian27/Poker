@@ -552,7 +552,7 @@ export const DashboardPage: React.FC = () => {
       <header className="dashboard-header">
         <div className="header-left">
           <h1 className="logo">
-            <img src="/assets/brand-book-embossed.svg" alt="" className="brand-logo-icon" />
+            <span className="brand-cards-logo" aria-hidden />
             <span>DormStacks</span>
           </h1>
         </div>

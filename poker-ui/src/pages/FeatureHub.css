@@ -120,12 +120,17 @@
   padding: 8px 10px;
   background: #111a22;
   border: 1px solid #2b3f4d;
+  color: #ffffff;
 }
 
 .msg-bubble.mine {
   align-self: flex-end;
   background: var(--felt-green-surface);
   border-color: #2f6b3f;
+}
+
+.msg-bubble .feature-meta {
+  color: #ffffff;
 }
 
 .emote-bank {
