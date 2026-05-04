@@ -28,9 +28,14 @@ The repo should not commit large runtime artifacts or native libraries to Git. I
 - `shasum`
 - `tar`
 
-### For `smoke-test`
+### For `smoke-test` and `probe`
 - Docker Desktop installed
 - Docker Desktop running
+
+### Optional for local probe debugging
+- `.NET 8 SDK`
+
+The tracked probe does not require host `dotnet` for normal use. It runs inside Docker.
 
 ### Apple Silicon note
 The smoke test uses a `linux/amd64` container. That is expected, because the runtime bundle is Linux `x64`.
@@ -188,6 +193,53 @@ What `smoke-test` does:
 
 This does **not** run real G5 analysis logic yet. It only proves that the installed bundle is visible and readable from Docker on macOS.
 
+### Probe
+
+```bash
+./scripts/install_g5_runtime.sh probe
+```
+
+What `probe` does:
+- runs `verify` first
+- starts a pinned `linux/amd64` `.NET` SDK container
+- mounts `.runtime/engines/g5/current/app` at `/opt/g5` as read-only
+- mounts the tracked probe source read-only
+- copies both into writable temp directories inside the container
+- sets `LD_LIBRARY_PATH` to the writable runtime copy
+- runs a tiny `.NET` console probe against the copied runtime
+
+Why the writable copies are required:
+- upstream G5 opens `full_stats_list_6max.bin` in a way that fails on a read-only runtime mount
+- `dotnet run` needs a writable project directory for build outputs
+
+What `probe` validates:
+- `bundle-manifest.json` is present and readable
+- `G5Gym.dll` loads from the installed runtime
+- managed dependencies resolve from the installed runtime directory
+- native dependencies resolve inside Linux Docker
+- `PythonAPI(6, 15)` constructs successfully
+- a minimal six-max preflop sequence reaches `calculateHeroAction`
+
+Expected probe stages:
+- `manifest check`
+- `G5Gym.dll load`
+- `dependency resolution`
+- `PythonAPI construction`
+- `createGame`
+- `startNewHand`
+- `dealHoleCards`
+- `calculateHeroAction`
+
+Expected success output looks like:
+
+```text
+probe success: actionType=... byAmount=... checkCallEV=... betRaiseEV=... timeSpentSeconds=... message=...
+```
+
+`probe` is stronger than `smoke-test`:
+- `smoke-test` proves Docker can mount and read the runtime
+- `probe` proves the managed/native G5 runtime can initialize and execute one minimal decision path
+
 ### Clean
 
 ```bash
@@ -248,6 +300,12 @@ The documentation is informational only. The installer always uses the operator-
 - Start Docker Desktop
 - Confirm `docker info` succeeds locally
 - On Apple Silicon, let Docker run the `linux/amd64` image under emulation
+
+### Probe fails
+- Run `./scripts/install_g5_runtime.sh verify` first and confirm it passes
+- If the failure mentions managed or native load, treat it as a runtime bundle or tracked-patch issue, not a probe-app issue
+- If the failure mentions a missing stage method or signature mismatch, compare the installed runtime against the pinned G5 source and patch set
+- If you want to debug the probe app interactively on the host, install `.NET 8 SDK` and run it manually against a writable runtime copy
 
 ### Reinstall a bundle
 - Re-run `install` with the new URL/SHA
