@@ -16,3 +16,5 @@ poker-ui/node_modules/
 .runtime/
 tools/g5-runtime-probe/bin/
 tools/g5-runtime-probe/obj/
+g5-advisor-service/bin/
+g5-advisor-service/obj/

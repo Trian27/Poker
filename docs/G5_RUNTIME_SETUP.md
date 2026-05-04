@@ -11,6 +11,8 @@ G5 is **not** run natively on macOS in this first step. The local workflow is:
 
 To build a local G5 runtime bundle from the pinned upstream source before installing it, see [G5_BUNDLE_BUILD.md](G5_BUNDLE_BUILD.md).
 
+To run the preflop-only standalone advisor service on top of the installed runtime, see [../g5-advisor-service/README.md](../g5-advisor-service/README.md).
+
 ## Why This Exists
 
 The repo should not commit large runtime artifacts or native libraries to Git. Instead, this setup script:
@@ -239,6 +241,27 @@ probe success: actionType=... byAmount=... checkCallEV=... betRaiseEV=... timeSp
 `probe` is stronger than `smoke-test`:
 - `smoke-test` proves Docker can mount and read the runtime
 - `probe` proves the managed/native G5 runtime can initialize and execute one minimal decision path
+
+### Advisor service
+
+After `probe` passes, you can start the standalone preflop advisor service:
+
+```bash
+docker compose up g5-advisor-service
+```
+
+The service:
+- mounts `.runtime/engines/g5/current/app` read-only at `/opt/g5-bundle`
+- copies the runtime into writable container storage
+- dynamically loads G5 from the installed bundle
+- exposes:
+  - `GET /health`
+  - `POST /api/v1/advisor/g5/analyze-decision`
+
+The current service scope is intentionally narrow:
+- standalone service only
+- hero preflop decisions only
+- no `poker-api`, UI, or bot wiring yet
 
 ### Clean
 
