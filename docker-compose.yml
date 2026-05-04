@@ -83,6 +83,29 @@ services:
       - poker-network
     restart: unless-stopped
 
+  # Standalone G5 Advisor Service
+  g5-advisor-service:
+    platform: linux/amd64
+    build:
+      context: ./g5-advisor-service
+      dockerfile: Dockerfile
+    container_name: poker-g5-advisor-service
+    environment:
+      G5_RUNTIME_BUNDLE_SOURCE_DIR: /opt/g5-bundle
+      G5_RUNTIME_WORK_DIR: /var/lib/g5-runtime/current
+      G5_RECENT_HANDS_COUNT: ${G5_RECENT_HANDS_COUNT:-15}
+      G5_PREFLOP_CHARTS_LEVEL: ${G5_PREFLOP_CHARTS_LEVEL:-4}
+      G5_DEBUG_RESPONSE: ${G5_DEBUG_RESPONSE:-false}
+      G5_SERVICE_PORT: 8002
+      ENV_MODE: ${ENV_MODE:-dev}
+    volumes:
+      - ./.runtime/engines/g5/current/app:/opt/g5-bundle:ro
+    ports:
+      - "8002:8002"
+    networks:
+      - poker-network
+    restart: unless-stopped
+
   # Node.js Game Server
   game-server:
     build:

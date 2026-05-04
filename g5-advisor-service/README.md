@@ -1,0 +1,130 @@
+# G5 Advisor Service
+
+This service exposes the installed G5 runtime bundle as an internal HTTP advisor.
+
+## Current Scope
+
+v1 is intentionally narrow:
+- standalone service only
+- preflop-only hero decision analysis
+- no `poker-api`, UI, or bot wiring yet
+- dynamic loading from the installed runtime bundle
+
+## Runtime Requirement
+
+The service expects the installed bundle to be mounted read-only at `/opt/g5-bundle` and copies it into writable container storage before loading G5.
+
+Default local startup:
+
+```bash
+docker compose up g5-advisor-service
+```
+
+The compose service runs as `linux/amd64` because the installed G5 bundle is `linux-x64`.
+
+If the runtime is missing or initialization fails:
+- the process stays alive
+- `GET /health` returns `503`
+- `POST /api/v1/advisor/g5/analyze-decision` returns `503`
+
+## Endpoints
+
+### `GET /health`
+
+Readiness endpoint. Returns `200` only after:
+- runtime copy
+- manifest validation
+- reflection binding
+- native resolution
+- warm `OpponentModeling` init
+- startup preflop self-check
+
+### `POST /api/v1/advisor/g5/analyze-decision`
+
+Internal request shape:
+
+```json
+{
+  "hero_player_id": "player_4",
+  "decision_sequence": 3,
+  "hand_data": {
+    "community_cards": [],
+    "players": [
+      { "player_id": "player_1", "username": "P1", "seat_number": 1, "hole_cards": [] },
+      { "player_id": "player_2", "username": "P2", "seat_number": 2, "hole_cards": [] },
+      { "player_id": "player_3", "username": "P3", "seat_number": 3, "hole_cards": [] },
+      {
+        "player_id": "player_4",
+        "username": "P4",
+        "seat_number": 4,
+        "hole_cards": [
+          { "rank": "A", "suit": "spades" },
+          { "rank": "K", "suit": "diamonds" }
+        ]
+      },
+      { "player_id": "player_5", "username": "P5", "seat_number": 5, "hole_cards": [] },
+      { "player_id": "player_6", "username": "P6", "seat_number": 6, "hole_cards": [] }
+    ],
+    "blinds": { "small_blind": 50, "big_blind": 100 },
+    "dealer_player_id": "player_1",
+    "small_blind_player_id": "player_2",
+    "big_blind_player_id": "player_3",
+    "starting_stacks": {
+      "player_1": 10000,
+      "player_2": 10000,
+      "player_3": 10000,
+      "player_4": 10000,
+      "player_5": 10000,
+      "player_6": 10000
+    },
+    "action_log": [
+      {
+        "sequence": 1,
+        "stage": "preflop",
+        "player_id": "player_2",
+        "action": "small-blind",
+        "source": "forced",
+        "requested_amount": 50,
+        "committed_chips": 50,
+        "pot_before": 0,
+        "to_call_before": 0
+      },
+      {
+        "sequence": 2,
+        "stage": "preflop",
+        "player_id": "player_3",
+        "action": "big-blind",
+        "source": "forced",
+        "requested_amount": 100,
+        "committed_chips": 100,
+        "pot_before": 50,
+        "to_call_before": 0
+      },
+      {
+        "sequence": 3,
+        "stage": "preflop",
+        "player_id": "player_4",
+        "action": "raise",
+        "source": "player",
+        "requested_amount": 300,
+        "committed_chips": 400,
+        "to_call_before": 100
+      }
+    ]
+  }
+}
+```
+
+## Warnings
+
+Possible `warnings` values:
+- `ignored_opponent_hole_cards`
+- `trimmed_future_board_cards`
+- `no_action_returned`
+- `unsupported_hidden_forced_contribution`
+
+## Important limitations
+
+- v1 only supports target actions where `stage == preflop`
+- amount semantics are still experimental pending replay-validation tests
+- the service is an infrastructure/runtime integration step, not a strategy-quality guarantee
