@@ -1,0 +1,14 @@
+{
+  "source_repo": "https://github.com/Nemandza82/g5-poker-bot.git",
+  "source_ref": "a2403f558f18f2d1a80effdb4102b3e49bd1e0ff",
+  "source_commit_expected": "a2403f558f18f2d1a80effdb4102b3e49bd1e0ff",
+  "builder_platform": "linux/amd64",
+  "dotnet_target": "net8.0",
+  "entrypoint_hint": "G5Gym.dll",
+  "default_bundle_version_template": "{source_commit_short}-{patch_set_hash8}",
+  "patches": [
+    "patches/g5/0001-use-portable-preflop-chart-path.patch",
+    "patches/g5/0002-disable-windows-only-g5gym-postbuild.patch",
+    "patches/g5/0003-add-origin-rpath-to-decisionmaking.patch"
+  ]
+}
