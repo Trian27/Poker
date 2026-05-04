@@ -35,6 +35,7 @@ Thumbs.db
 # Logs
 logs/
 *.log
+.runtime/
 
 # Documentation (not needed in containers)
 *.md

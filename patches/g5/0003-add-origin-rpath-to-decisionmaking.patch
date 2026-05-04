@@ -1,0 +1,14 @@
+diff --git a/src/DecisionMaking/Makefile b/src/DecisionMaking/Makefile
+index 93397e0..61722d9 100644
+--- a/src/DecisionMaking/Makefile
++++ b/src/DecisionMaking/Makefile
+@@ -1,7 +1,8 @@
+ OPT_FLAGS = -std=c++11 -O2 -s -DNDEBUG
++LINK_FLAGS = -Wl,-rpath,'$$ORIGIN'
+ 
+ output: DecisionMaking.o ForExport.o PreFlopEquity.o Range.o GameState.o GameContext.o Pot.o PlayerModel.o PostFlopParams.o PreFlopParams.o AllHandStrengths.o AllCounters.o HandStrengthCounter.o HandStrength.o Card.o Common.o
+-	g++ -shared $(OPT_FLAGS) DecisionMaking.o ForExport.o PreFlopEquity.o Range.o GameState.o GameContext.o Pot.o PlayerModel.o PostFlopParams.o PreFlopParams.o AllHandStrengths.o AllCounters.o HandStrengthCounter.o HandStrength.o Card.o Common.o -o libdec_making.so -ltbb
++	g++ -shared $(OPT_FLAGS) DecisionMaking.o ForExport.o PreFlopEquity.o Range.o GameState.o GameContext.o Pot.o PlayerModel.o PostFlopParams.o PreFlopParams.o AllHandStrengths.o AllCounters.o HandStrengthCounter.o HandStrength.o Card.o Common.o $(LINK_FLAGS) -o libdec_making.so -ltbb
+ 
+ COMPILE_FLAGS = $(OPT_FLAGS) -c -fPIC
+ 

@@ -189,6 +189,9 @@ For testing coverage and status, see [TESTING_STATUS.md](docs/TESTING_STATUS.md)
 ### Operations Runbook
 For maintenance safety checks (including DB target verification before cleanup), see [OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md).
 
+### G5 Runtime Setup
+For local G5 runtime bootstrap on macOS developer machines using Docker-hosted Linux assets, see [G5_RUNTIME_SETUP.md](docs/G5_RUNTIME_SETUP.md).
+
 ## Contributing
 1. Fork the repository.
 2. Create a feature branch.
