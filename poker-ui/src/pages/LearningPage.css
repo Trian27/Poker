@@ -118,42 +118,102 @@
   background: linear-gradient(180deg, #0f171f 0%, #111a22 100%);
 }
 
-.coach-summary {
-  font-size: 1rem;
-  font-weight: 800;
-  margin-bottom: 8px;
-}
-
-.coach-tags {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
-}
-
-.coach-tag {
-  background: var(--felt-green-surface);
-  color: #8ed2a8;
-  font-size: 0.75rem;
-  border-radius: 999px;
-  padding: 3px 8px;
-  font-weight: 700;
-}
-
-.coach-actions {
+.coach-result-card,
+.coach-unsupported-card {
   display: grid;
+  gap: 12px;
+}
+
+.coach-result-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.coach-result-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
 }
 
-.coach-action-row {
+.coach-engine-pill,
+.coach-amount-pill,
+.coach-warning-pill {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #2f4350;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.coach-engine-pill {
+  background: #18252f;
+  color: #8ed2a8;
+}
+
+.coach-amount-pill {
+  background: var(--felt-green-surface);
+  color: #e8eff3;
+}
+
+.coach-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.coach-metric-card {
   border: 1px solid #2f4350;
   background: #0f171f;
-  padding: 8px;
+  padding: 10px;
   display: grid;
   gap: 4px;
 }
 
-.learning-page :is(.card-pill, .timeline-row, .btn-analyze, .coach-action-row) {
+.coach-metric-label,
+.coach-section-label,
+.coach-unsupported-meta {
+  font-size: 0.8rem;
+  color: #b7c7d3;
+}
+
+.coach-warning-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.coach-warning-pill {
+  background: #2b2515;
+  color: #f0d28b;
+}
+
+.coach-message-box,
+.coach-unsupported-card {
+  border: 1px solid #2f4350;
+  background: #0f171f;
+  padding: 10px;
+}
+
+.coach-unsupported-title {
+  font-weight: 800;
+  color: #f0d28b;
+}
+
+.coach-unsupported-message {
+  color: #e8eff3;
+}
+
+.coach-unsupported-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.learning-page :is(.card-pill, .timeline-row, .btn-analyze, .coach-metric-card, .coach-message-box, .coach-unsupported-card, .coach-engine-pill, .coach-amount-pill, .coach-warning-pill) {
   border-radius: 0;
 }
 
@@ -165,5 +225,14 @@
 
   .learning-timeline {
     max-height: 36vh;
+  }
+
+  .coach-result-header,
+  .coach-unsupported-meta {
+    flex-direction: column;
+  }
+
+  .coach-metrics-grid {
+    grid-template-columns: 1fr;
   }
 }

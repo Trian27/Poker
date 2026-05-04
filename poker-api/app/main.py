@@ -36,7 +36,7 @@ from .schemas import (
     WalletOperation, WalletOperationResponse,
     TokenVerifyRequest, TokenVerifyResponse,
     HandHistoryCreate, HandHistoryResponse, HandHistorySummary,
-    LearningSessionSummary, LearningCoachRequest, LearningCoachResponse, LearningActionRecommendation,
+    LearningSessionSummary, LearningCoachRequest, LearningCoachResponse,
     TableQueuePosition, QueueJoinRequest, TableTournamentDetailsResponse, TournamentRegistrationResponse, TournamentPayoutUpdateRequest,
     SkinCreate, SkinResponse, UserSkinResponse, EquipSkinRequest,
     SkinSubmissionCreate, SkinSubmissionResponse, SkinSubmissionReview, SkinSubmissionCreatorDecision,
@@ -145,11 +145,22 @@ def _bootstrap_admin_user() -> None:
 
 
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     ensure_schema()
     _bootstrap_admin_user()
     if settings.ENABLE_TEST_FIXTURE_API and not settings.is_production:
         logger.warning("Test fixture API is enabled outside production")
+    app.state.g5_advisor_client = httpx.AsyncClient(
+        base_url=settings.G5_ADVISOR_SERVICE_URL.rstrip("/"),
+        timeout=settings.G5_ADVISOR_TIMEOUT_SECONDS,
+    )
+
+
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    client = getattr(app.state, "g5_advisor_client", None)
+    if client is not None:
+        await client.aclose()
 
 
 # ============================================================================
@@ -5247,6 +5258,39 @@ def get_my_hand_history(
     return summaries
 
 
+def _get_visible_hand_history_row(db: Session, hand_id: str, user_id: int):
+    from sqlalchemy import text
+    partition = _get_partition_context_for_user_id(db, user_id)
+
+    if partition.kind == "normal":
+        query = text("""
+            SELECT h.id, h.community_id, h.table_id, h.table_name, h.played_at, h.hand_data
+            FROM hand_history h
+            WHERE h.id = :hand_id
+            AND h.is_test_only = FALSE
+            AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
+                WHERE (player->>'user_id')::int = :user_id
+            )
+        """)
+        params = {"hand_id": hand_id, "user_id": user_id}
+    else:
+        query = text("""
+            SELECT h.id, h.community_id, h.table_id, h.table_name, h.played_at, h.hand_data
+            FROM hand_history h
+            WHERE h.id = :hand_id
+            AND h.is_test_only = TRUE
+            AND h.test_run_tag = :test_run_tag
+            AND EXISTS (
+                SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
+                WHERE (player->>'user_id')::int = :user_id
+            )
+        """)
+        params = {"hand_id": hand_id, "user_id": user_id, "test_run_tag": partition.run_tag}
+
+    return db.execute(query, params).first()
+
+
 @app.get("/api/hands/{hand_id}", response_model=HandHistoryResponse)
 def get_hand_details(
     hand_id: str,
@@ -5260,35 +5304,7 @@ def get_hand_details(
     This prevents users from viewing hands they weren't involved in.
     """
     user_id = current_user["user_id"]
-    partition = _get_partition_context_for_user_id(db, user_id)
-
-    if partition.kind == "normal":
-        query = text("""
-        SELECT h.id, h.community_id, h.table_id, h.table_name, h.played_at, h.hand_data
-        FROM hand_history h
-        WHERE h.id = :hand_id
-        AND h.is_test_only = FALSE
-        AND EXISTS (
-            SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
-            WHERE (player->>'user_id')::int = :user_id
-        )
-    """)
-        params = {"hand_id": hand_id, "user_id": user_id}
-    else:
-        query = text("""
-        SELECT h.id, h.community_id, h.table_id, h.table_name, h.played_at, h.hand_data
-        FROM hand_history h
-        WHERE h.id = :hand_id
-        AND h.is_test_only = TRUE
-        AND h.test_run_tag = :test_run_tag
-        AND EXISTS (
-            SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
-            WHERE (player->>'user_id')::int = :user_id
-        )
-    """)
-        params = {"hand_id": hand_id, "user_id": user_id, "test_run_tag": partition.run_tag}
-
-    result = db.execute(query, params).first()
+    result = _get_visible_hand_history_row(db, hand_id, user_id)
     
     if not result:
         raise HTTPException(
@@ -5310,241 +5326,203 @@ def get_hand_details(
 # Learning Endpoints
 # ============================================================================
 
-RANK_VALUE_MAP = {
-    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
-    "10": 10, "T": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
+LEARNING_STREETS = {"preflop", "flop", "turn", "river"}
+LEARNING_DECISION_ACTIONS = {"fold", "check", "call", "bet", "raise", "all-in"}
+G5_UNSUPPORTED_CODES = {
+    "unsupported_street",
+    "unsupported_hidden_forced_contribution",
+    "unsupported_action",
+    "player_to_act_mismatch",
+    "target_turn_mismatch",
 }
 
 
-def _parse_card(card: dict[str, str]) -> tuple[int, str] | None:
-    if not isinstance(card, dict):
+def _normalize_learning_street(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in LEARNING_STREETS else None
+
+
+def _normalize_learning_action(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _coerce_int(value: object) -> int | None:
+    try:
+        coerced = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
         return None
-    rank_raw = str(card.get("rank", "")).upper()
-    suit_raw = str(card.get("suit", "")).lower()
-    if rank_raw not in RANK_VALUE_MAP:
-        return None
-    if suit_raw not in {"hearts", "diamonds", "clubs", "spades"}:
-        return None
-    return RANK_VALUE_MAP[rank_raw], suit_raw
+    return coerced
 
 
-def _clamp_score(value: float) -> float:
-    return max(0.0, min(1.0, value))
+def _extract_hero_player_id(hand_data: dict[str, object], current_user_id: int) -> str:
+    players = hand_data.get("players", [])
+    if not isinstance(players, list):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="hero_not_in_hand")
+
+    matches: list[str] = []
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        if _coerce_int(player.get("user_id")) != current_user_id:
+            continue
+        player_id = str(player.get("player_id") or "").strip()
+        if player_id:
+            matches.append(player_id)
+
+    if not matches:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="hero_not_in_hand")
+    if len(matches) > 1:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="ambiguous_hero_player")
+    return matches[0]
 
 
-def _preflop_strength(hole_cards: list[dict[str, str]]) -> tuple[float, list[str]]:
-    parsed = [_parse_card(card) for card in hole_cards]
-    cards = [card for card in parsed if card is not None]
-    if len(cards) != 2:
-        return 0.2, ["invalid-cards"]
+def _find_learning_action_entry(hand_data: dict[str, object], decision_sequence: int) -> dict[str, object]:
+    action_log = hand_data.get("action_log", [])
+    if not isinstance(action_log, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="decision_sequence_not_found")
 
-    (r1, s1), (r2, s2) = cards
-    high = max(r1, r2)
-    low = min(r1, r2)
-    pair = r1 == r2
-    suited = s1 == s2
-    gap = abs(r1 - r2)
-    tags: list[str] = []
-
-    score = 0.35 + (high - 8) * 0.03
-    if pair:
-        tags.append("pocket-pair")
-        if high >= 13:
-            score += 0.45
-        elif high >= 11:
-            score += 0.34
-        elif high >= 8:
-            score += 0.24
-        else:
-            score += 0.15
-
-    if suited:
-        tags.append("suited")
-        score += 0.06
-
-    if high >= 11 and low >= 10:
-        tags.append("broadway")
-        score += 0.12
-
-    if gap == 1:
-        tags.append("connector")
-        score += 0.08
-    elif gap == 2:
-        tags.append("one-gap")
-        score += 0.03
-    elif gap >= 5:
-        tags.append("disconnected")
-        score -= 0.07
-
-    if high == 14 and low <= 9:
-        tags.append("weak-ace-kicker")
-        score -= 0.06
-
-    return _clamp_score(score), tags
+    matches = [
+        entry for entry in action_log
+        if isinstance(entry, dict) and _coerce_int(entry.get("sequence")) == decision_sequence
+    ]
+    if not matches:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="decision_sequence_not_found")
+    if len(matches) > 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ambiguous_decision_sequence")
+    return matches[0]
 
 
-def _postflop_strength(
-    hole_cards: list[dict[str, str]],
-    community_cards: list[dict[str, str]]
-) -> tuple[float, list[str]]:
-    parsed = [_parse_card(card) for card in [*hole_cards, *community_cards]]
-    cards = [card for card in parsed if card is not None]
-    if len(cards) < 5:
-        return 0.25, ["insufficient-postflop-cards"]
-
-    rank_values = [rank for rank, _ in cards]
-    suits = [suit for _, suit in cards]
-    rank_counts = Counter(rank_values)
-    suit_counts = Counter(suits)
-    tags: list[str] = []
-    score = 0.35
-
-    has_flush = any(count >= 5 for count in suit_counts.values())
-    has_flush_draw = any(count == 4 for count in suit_counts.values())
-
-    unique_ranks = sorted(set(rank_values))
-    if 14 in unique_ranks:
-        unique_ranks = [1] + unique_ranks
-
-    max_straight_run = 1
-    run = 1
-    for index in range(1, len(unique_ranks)):
-        if unique_ranks[index] == unique_ranks[index - 1] + 1:
-            run += 1
-            max_straight_run = max(max_straight_run, run)
-        else:
-            run = 1
-
-    has_straight = max_straight_run >= 5
-    has_open_ended_draw = max_straight_run == 4
-
-    count_values = sorted(rank_counts.values(), reverse=True)
-    has_quads = count_values and count_values[0] == 4
-    has_trips = count_values and count_values[0] == 3
-    pair_count = sum(1 for value in count_values if value == 2)
-    has_full_house = has_trips and (pair_count >= 1 or count_values.count(3) >= 2)
-    has_two_pair = pair_count >= 2
-    has_pair = pair_count >= 1 or has_trips
-
-    if has_quads:
-        tags.append("quads")
-        score = max(score, 0.98)
-    elif has_full_house:
-        tags.append("full-house")
-        score = max(score, 0.95)
-    elif has_flush and has_straight:
-        tags.append("straight-flush")
-        score = max(score, 0.99)
-    elif has_flush:
-        tags.append("flush")
-        score = max(score, 0.9)
-    elif has_straight:
-        tags.append("straight")
-        score = max(score, 0.84)
-    elif has_trips:
-        tags.append("trips")
-        score = max(score, 0.76)
-    elif has_two_pair:
-        tags.append("two-pair")
-        score = max(score, 0.68)
-    elif has_pair:
-        tags.append("pair")
-        score = max(score, 0.56)
-    else:
-        tags.append("high-card")
-        score = max(score, 0.36)
-
-    if has_flush_draw:
-        tags.append("flush-draw")
-        score += 0.08
-    if has_open_ended_draw:
-        tags.append("straight-draw")
-        score += 0.06
-
-    return _clamp_score(score), tags
+def _extract_action_player_id(entry: dict[str, object]) -> str:
+    return str(entry.get("player_id") or entry.get("playerId") or "").strip()
 
 
-def _build_learning_recommendation(payload: LearningCoachRequest) -> LearningCoachResponse:
-    street = payload.street.lower()
-    if street == "preflop":
-        strength, tags = _preflop_strength(payload.hole_cards)
-    else:
-        strength, tags = _postflop_strength(payload.hole_cards, payload.community_cards)
+def _has_hidden_forced_contribution(hand_data: dict[str, object]) -> bool:
+    action_log = hand_data.get("action_log", [])
+    if not isinstance(action_log, list):
+        return False
 
-    pot = max(0, int(payload.pot))
-    to_call = max(0, int(payload.to_call))
-    min_raise = max(1, int(payload.min_raise))
-    stack = max(0, int(payload.stack))
-    can_check = payload.can_check or to_call == 0
-    pressure_ratio = to_call / max(1, pot + to_call)
+    for entry in action_log:
+        if not isinstance(entry, dict):
+            continue
+        action = _normalize_learning_action(entry.get("action"))
+        source = str(entry.get("source") or "").strip().lower()
+        if source == "forced" and action in {"small-blind", "big-blind"}:
+            return (_coerce_int(entry.get("pot_before")) or _coerce_int(entry.get("potBefore")) or 0) > 0
+    return False
 
-    top_actions: list[LearningActionRecommendation] = []
 
-    def add_action(action: str, score: float, rationale: str, amount: int | None = None) -> None:
-        top_actions.append(
-            LearningActionRecommendation(
-                action=action,
-                amount=amount,
-                score=round(_clamp_score(score), 3),
-                rationale=rationale,
-            )
+def _unsupported_learning_response(
+    *,
+    hand_id: str,
+    decision_sequence: int,
+    street: str | None,
+    unsupported_code: str,
+    unsupported_message: str,
+    warnings: list[str] | None = None,
+) -> LearningCoachResponse:
+    return LearningCoachResponse(
+        status="unsupported",
+        engine="g5",
+        hand_id=hand_id,
+        decision_sequence=decision_sequence,
+        street=street,
+        warnings=warnings or [],
+        unsupported_code=unsupported_code,
+        unsupported_message=unsupported_message,
+    )
+
+
+def _error_response(status_code: int, error_code: str, message: str):
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": error_code,
+            "message": message,
+        },
+    )
+
+
+async def _request_g5_learning_recommendation(
+    *,
+    hand_id: str,
+    decision_sequence: int,
+    street: str,
+    hero_player_id: str,
+    hand_data: dict[str, object],
+) -> object:
+    client = getattr(app.state, "g5_advisor_client", None)
+    if client is None:
+        logger.error("G5 advisor client missing from app state")
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "g5_service_unavailable", "G5 advisor service is unavailable.")
+
+    try:
+        response = await client.post(
+            "/api/v1/advisor/g5/analyze-decision",
+            json={
+                "hero_player_id": hero_player_id,
+                "decision_sequence": decision_sequence,
+                "hand_data": hand_data,
+            },
+        )
+    except httpx.TimeoutException:
+        logger.warning("G5 advisor timed out for hand_id=%s sequence=%s", hand_id, decision_sequence)
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "g5_service_timeout", "G5 advisor service timed out.")
+    except httpx.HTTPError as exc:
+        logger.error("G5 advisor unavailable for hand_id=%s sequence=%s", hand_id, decision_sequence, exc_info=exc)
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "g5_service_unavailable", "G5 advisor service is unavailable.")
+
+    payload = response.json() if response.content else {}
+    if response.status_code == status.HTTP_200_OK:
+        warnings = payload.get("warnings")
+        return LearningCoachResponse(
+            status="ok",
+            engine="g5",
+            hand_id=hand_id,
+            decision_sequence=decision_sequence,
+            street=street,
+            recommended_action=payload.get("recommended_action"),
+            amount=payload.get("amount"),
+            raw_action_type=payload.get("raw_action_type"),
+            raw_by_amount=payload.get("raw_by_amount"),
+            check_call_ev=payload.get("check_call_ev"),
+            bet_raise_ev=payload.get("bet_raise_ev"),
+            time_spent_seconds=payload.get("time_spent_seconds"),
+            message=payload.get("message"),
+            warnings=warnings if isinstance(warnings, list) else [],
         )
 
-    bet_half_pot = max(min_raise, int(math.ceil(max(1, pot) * 0.5)))
-    bet_three_quarter = max(min_raise, int(math.ceil(max(1, pot) * 0.75)))
-    raise_standard = max(min_raise, int(math.ceil(max(to_call * 2, pot * 0.75))))
+    error_code = str(payload.get("error") or "").strip()
+    error_message = str(payload.get("message") or payload.get("detail") or "").strip()
 
-    if can_check:
-        if strength >= 0.88:
-            add_action("bet", 0.93, "Very strong hand; build the pot.", bet_three_quarter)
-            add_action("bet", 0.86, "Pressure weaker ranges with value.", bet_half_pot)
-            add_action("check", 0.35, "Slow-play line, lower EV in most spots.")
-        elif strength >= 0.67:
-            add_action("bet", 0.82, "Likely ahead; extract value and deny equity.", bet_half_pot)
-            add_action("check", 0.64, "Pot-control line is acceptable.")
-            add_action("bet", 0.58, "Larger sizing for protection.", bet_three_quarter)
-        elif strength >= 0.5:
-            add_action("check", 0.74, "Medium strength; avoid overbuilding the pot.")
-            add_action("bet", 0.62, "Small value/protection bet.", bet_half_pot)
-            add_action("bet", 0.44, "Larger bluff/semi-bluff line.", bet_three_quarter)
-        else:
-            add_action("check", 0.88, "Weak hand; preserve chips.")
-            add_action("bet", 0.38, "Occasional bluff to keep ranges mixed.", bet_half_pot)
-            add_action("bet", 0.22, "Large bluff is high variance here.", bet_three_quarter)
-    else:
-        if strength >= 0.9:
-            add_action("raise", 0.95, "Premium strength; maximize value.", min(raise_standard, stack))
-            add_action("call", 0.76, "Call keeps weaker hands in.")
-            add_action("fold", 0.05, "Folding this strength is a major leak.")
-        elif strength >= 0.72:
-            if pressure_ratio <= 0.38 and stack > to_call:
-                add_action("raise", 0.8, "Strong enough to raise for value/protection.", min(raise_standard, stack))
-            add_action("call", 0.77, "Profitable continue versus this price.")
-            add_action("fold", 0.2, "Fold if villain is very tight and line is underbluffed.")
-        elif strength >= 0.55:
-            add_action("call", 0.66 if pressure_ratio <= 0.25 else 0.48, "Continue mainly when pot odds are favorable.")
-            add_action("fold", 0.58 if pressure_ratio > 0.25 else 0.38, "Fold more often versus larger pressure.")
-            add_action("raise", 0.31, "Occasional bluff/semi-bluff candidate.")
-        elif strength >= 0.42:
-            add_action("fold", 0.74, "Mostly behind without enough equity.")
-            add_action("call", 0.43 if pressure_ratio <= 0.16 else 0.2, "Call only at strong price.")
-            add_action("raise", 0.15, "Bluff line should be rare.")
-        else:
-            add_action("fold", 0.92, "Low equity versus aggression.")
-            add_action("call", 0.18 if pressure_ratio <= 0.1 else 0.05, "Only continue with very cheap price.")
-            add_action("raise", 0.03, "High-risk, low-reward bluff.")
+    if response.status_code in {status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_ENTITY}:
+        if error_code in G5_UNSUPPORTED_CODES:
+            return _unsupported_learning_response(
+                hand_id=hand_id,
+                decision_sequence=decision_sequence,
+                street=street,
+                unsupported_code=error_code,
+                unsupported_message=error_message or "This decision is not supported by the current G5 replay adapter.",
+            )
 
-    top_actions = sorted(top_actions, key=lambda item: item.score, reverse=True)[:3]
-    best = top_actions[0]
-    summary = f"Recommended: {best.action.upper()}" + (f" {best.amount}" if best.amount is not None else "")
+        logger.error(
+            "Unexpected G5 client error for hand_id=%s sequence=%s code=%s payload=%s",
+            hand_id,
+            decision_sequence,
+            error_code or "<missing>",
+            payload,
+        )
+        return _error_response(status.HTTP_502_BAD_GATEWAY, "g5_integration_error", "Unexpected G5 advisor response.")
 
-    base_tags = list(dict.fromkeys([*tags, f"strength:{round(strength, 2)}", f"pressure:{round(pressure_ratio, 2)}"]))
-    return LearningCoachResponse(
-        recommended_action=best.action,
-        summary=summary,
-        tags=base_tags[:8],
-        top_actions=top_actions,
+    logger.error(
+        "Unexpected G5 service response for hand_id=%s sequence=%s status=%s payload=%s",
+        hand_id,
+        decision_sequence,
+        response.status_code,
+        payload,
     )
+    return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "g5_service_unavailable", "G5 advisor service is unavailable.")
 
 
 @app.get("/api/learning/sessions", response_model=list[LearningSessionSummary])
@@ -5640,12 +5618,77 @@ def get_learning_session_hands(
 
 
 @app.post("/api/learning/coach/recommend", response_model=LearningCoachResponse)
-def get_learning_coach_recommendation(
+async def get_learning_coach_recommendation(
     payload: LearningCoachRequest,
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    _ = current_user  # authenticated endpoint
-    return _build_learning_recommendation(payload)
+    if not payload.hand_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="hand_id_required",
+        )
+    if payload.decision_sequence is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="decision_sequence_required",
+        )
+
+    user_id = current_user["user_id"]
+    hand = _get_visible_hand_history_row(db, payload.hand_id, user_id)
+    if not hand:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Hand not found or you were not a participant",
+        )
+
+    hand_data = hand.hand_data if isinstance(hand.hand_data, dict) else {}
+    hero_player_id = _extract_hero_player_id(hand_data, user_id)
+    target_entry = _find_learning_action_entry(hand_data, payload.decision_sequence)
+
+    target_player_id = _extract_action_player_id(target_entry)
+    if target_player_id != hero_player_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="decision_not_hero_action",
+        )
+
+    street = _normalize_learning_street(target_entry.get("stage"))
+    if street != "preflop":
+        return _unsupported_learning_response(
+            hand_id=payload.hand_id,
+            decision_sequence=payload.decision_sequence,
+            street=street,
+            unsupported_code="unsupported_street",
+            unsupported_message="G5 preflop analysis is currently available only for hero preflop decisions.",
+        )
+
+    action_name = _normalize_learning_action(target_entry.get("action"))
+    if action_name not in LEARNING_DECISION_ACTIONS:
+        return _unsupported_learning_response(
+            hand_id=payload.hand_id,
+            decision_sequence=payload.decision_sequence,
+            street=street,
+            unsupported_code="unsupported_non_decision_action",
+            unsupported_message="This action is not a strategic decision that can be analyzed yet.",
+        )
+
+    if _has_hidden_forced_contribution(hand_data):
+        return _unsupported_learning_response(
+            hand_id=payload.hand_id,
+            decision_sequence=payload.decision_sequence,
+            street=street,
+            unsupported_code="unsupported_hidden_forced_contribution",
+            unsupported_message="This hand includes hidden forced contribution that the current replay adapter cannot represent.",
+        )
+
+    return await _request_g5_learning_recommendation(
+        hand_id=payload.hand_id,
+        decision_sequence=payload.decision_sequence,
+        street=street,
+        hero_player_id=hero_player_id,
+        hand_data=hand_data,
+    )
 
 
 # ============================================================================

@@ -184,9 +184,9 @@ internal sealed class G5RuntimeHost
                     }
 
                     var currentPlayerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
-                    if (!prepared.PlayerIdToIndex.TryGetValue(entry.PlayerId, out var actorIndex))
+                    if (!prepared.PlayerIdToIndex.TryGetValue(entry.EffectivePlayerId, out var actorIndex))
                     {
-                        throw new ServiceApiException(StatusCodes.Status400BadRequest, "unknown_action_actor", $"Unknown action actor in replay: {entry.PlayerId}");
+                        throw new ServiceApiException(StatusCodes.Status400BadRequest, "unknown_action_actor", $"Unknown action actor in replay: {entry.EffectivePlayerId}");
                     }
                     if (currentPlayerToActIndex != actorIndex)
                     {
@@ -229,7 +229,7 @@ internal sealed class G5RuntimeHost
                 return new AnalyzeDecisionResponse
                 {
                     DecisionSequence = prepared.TargetEntry.Sequence,
-                    RecommendedAction = NormalizeAction(rawActionType, prepared.TargetEntry.ToCallBefore ?? 0, warnings),
+                    RecommendedAction = NormalizeAction(rawActionType, prepared.TargetEntry.EffectiveToCallBefore ?? 0, warnings),
                     Amount = DeriveNormalizedAmount(rawActionType, rawByAmount),
                     RawActionType = rawActionType,
                     RawByAmount = rawByAmount,
@@ -355,7 +355,7 @@ internal sealed class G5RuntimeHost
         var targetEntry = actionLog.FirstOrDefault(entry => entry.Sequence == request.DecisionSequence)
             ?? throw new ServiceApiException(StatusCodes.Status400BadRequest, "decision_sequence_not_found", $"No action_log entry found for sequence {request.DecisionSequence}");
 
-        if (!string.Equals(targetEntry.PlayerId, hero.PlayerId, StringComparison.Ordinal))
+        if (!string.Equals(targetEntry.EffectivePlayerId, hero.PlayerId, StringComparison.Ordinal))
         {
             throw new ServiceApiException(StatusCodes.Status400BadRequest, "decision_not_hero_action", $"Sequence {request.DecisionSequence} does not belong to hero_player_id {hero.PlayerId}");
         }
@@ -371,7 +371,7 @@ internal sealed class G5RuntimeHost
         }
 
         var firstForcedBlind = actionLog.FirstOrDefault(ShouldSkipForcedBlind);
-        if (firstForcedBlind is not null && (firstForcedBlind.PotBefore ?? 0) > 0)
+        if (firstForcedBlind is not null && (firstForcedBlind.EffectivePotBefore ?? 0) > 0)
         {
             throw new ServiceApiException(
                 StatusCodes.Status422UnprocessableEntity,
@@ -466,7 +466,7 @@ internal sealed class G5RuntimeHost
             case "bet":
             case "raise":
             {
-                var requestedAmount = entry.RequestedAmount ?? 0;
+                var requestedAmount = entry.EffectiveRequestedAmount ?? 0;
                 if (requestedAmount <= 0)
                 {
                     throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "invalid_raise_amount", $"Sequence {entry.Sequence} is missing a positive requested_amount");
@@ -476,8 +476,8 @@ internal sealed class G5RuntimeHost
             }
             case "all-in":
             {
-                var committed = entry.CommittedChips ?? 0;
-                var toCall = entry.ToCallBefore ?? 0;
+                var committed = entry.EffectiveCommittedChips ?? 0;
+                var toCall = entry.EffectiveToCallBefore ?? 0;
                 if (committed <= 0)
                 {
                     throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "invalid_all_in_amount", $"Sequence {entry.Sequence} is missing committed_chips");

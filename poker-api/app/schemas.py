@@ -379,33 +379,30 @@ class LearningSessionSummary(BaseModel):
     last_hand_at: Optional[datetime] = None
 
 
-class LearningActionRecommendation(BaseModel):
-    action: str
-    amount: Optional[int] = None
-    score: float
-    rationale: str
-
-
 class LearningCoachRequest(BaseModel):
-    """Input snapshot for learning coach recommendations."""
-    street: str = Field(..., pattern="^(preflop|flop|turn|river)$")
-    hole_cards: list[dict[str, str]]
-    community_cards: list[dict[str, str]] = Field(default_factory=list)
-    pot: int = Field(..., ge=0)
-    to_call: int = Field(default=0, ge=0)
-    min_raise: int = Field(default=1, ge=1)
-    stack: int = Field(..., ge=0)
-    players_in_hand: int = Field(default=2, ge=2, le=10)
-    can_check: bool = False
-    position: Optional[str] = None
+    """Input for canonical hand-history-backed learning recommendations."""
+    hand_id: Optional[str] = Field(default=None, min_length=1)
+    decision_sequence: Optional[int] = Field(default=None, ge=1)
 
 
 class LearningCoachResponse(BaseModel):
-    """Coach output for a decision point."""
-    recommended_action: str
-    summary: str
-    tags: list[str]
-    top_actions: list[LearningActionRecommendation]
+    """G5-backed output for a decision point."""
+    status: Literal["ok", "unsupported"]
+    engine: Literal["g5"] = "g5"
+    hand_id: str
+    decision_sequence: int
+    street: Optional[Literal["preflop", "flop", "turn", "river"]] = None
+    recommended_action: Optional[str] = None
+    amount: Optional[int] = None
+    raw_action_type: Optional[str] = None
+    raw_by_amount: Optional[int] = None
+    check_call_ev: Optional[float] = None
+    bet_raise_ev: Optional[float] = None
+    time_spent_seconds: Optional[float] = None
+    message: Optional[str] = None
+    warnings: list[str] = Field(default_factory=list)
+    unsupported_code: Optional[str] = None
+    unsupported_message: Optional[str] = None
 
 
 # ============================================================================

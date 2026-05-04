@@ -28,13 +28,13 @@ export const getApiErrorMessage = (error: unknown, fallback: string): string => 
       if (detail) {
         return detail;
       }
-      const errorMessage = asNonEmptyString(payload.error);
-      if (errorMessage) {
-        return errorMessage;
-      }
       const message = asNonEmptyString(payload.message);
       if (message) {
         return message;
+      }
+      const errorMessage = asNonEmptyString(payload.error);
+      if (errorMessage) {
+        return errorMessage;
       }
     }
 
