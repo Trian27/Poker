@@ -309,18 +309,23 @@ export interface LearningSessionSummary {
   last_hand_at?: string | null;
 }
 
-export interface LearningCoachAction {
-  action: 'fold' | 'check' | 'call' | 'bet' | 'raise' | string;
-  amount?: number | null;
-  score: number;
-  rationale: string;
-}
-
 export interface LearningCoachRecommendation {
-  recommended_action: string;
-  summary: string;
-  tags: string[];
-  top_actions: LearningCoachAction[];
+  status: 'ok' | 'unsupported';
+  engine: 'g5';
+  hand_id: string;
+  decision_sequence: number;
+  street: 'preflop' | 'flop' | 'turn' | 'river' | null;
+  recommended_action: string | null;
+  amount: number | null;
+  raw_action_type: string | null;
+  raw_by_amount: number | null;
+  check_call_ev: number | null;
+  bet_raise_ev: number | null;
+  time_spent_seconds: number | null;
+  message: string | null;
+  warnings: string[];
+  unsupported_code: string | null;
+  unsupported_message: string | null;
 }
 
 // Join Request types

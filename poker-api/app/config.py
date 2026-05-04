@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     EMAIL_VERIFICATION_EXPIRE_MINUTES: int = 15
     FEEDBACK_EXPORT_DIR: str = "feedback_reports"
 
+    # Internal advisor integration
+    G5_ADVISOR_SERVICE_URL: str = "http://g5-advisor-service:8002"
+    G5_ADVISOR_TIMEOUT_SECONDS: float = 5.0
+
     # Optional admin bootstrap (creates/promotes admin on startup)
     ADMIN_USERNAME: Optional[str] = None
     ADMIN_EMAIL: Optional[str] = None

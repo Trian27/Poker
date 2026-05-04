@@ -47,23 +47,127 @@ internal sealed class ActionLogEntry
     public int Sequence { get; init; }
     public string Stage { get; init; } = string.Empty;
     public string PlayerId { get; init; } = string.Empty;
+
+    [JsonPropertyName("playerId")]
+    public string? PlayerIdCamel { get; init; }
+
+    [JsonIgnore]
+    public string EffectivePlayerId => !string.IsNullOrWhiteSpace(PlayerId) ? PlayerId : (PlayerIdCamel ?? string.Empty);
+
     public int? UserId { get; init; }
+
+    [JsonPropertyName("userId")]
+    public int? UserIdCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveUserId => UserId ?? UserIdCamel;
+
     public string? Username { get; init; }
     public string Action { get; init; } = string.Empty;
     public string? Source { get; init; }
     public int? RequestedAmount { get; init; }
+
+    [JsonPropertyName("requestedAmount")]
+    public int? RequestedAmountCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveRequestedAmount => RequestedAmount ?? RequestedAmountCamel;
+
     public int? CommittedChips { get; init; }
+
+    [JsonPropertyName("committedChips")]
+    public int? CommittedChipsCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveCommittedChips => CommittedChips ?? CommittedChipsCamel;
+
     public int? ToCallBefore { get; init; }
+
+    [JsonPropertyName("toCallBefore")]
+    public int? ToCallBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveToCallBefore => ToCallBefore ?? ToCallBeforeCamel;
+
     public int? MinimumRaiseBefore { get; init; }
+
+    [JsonPropertyName("minimumRaiseBefore")]
+    public int? MinimumRaiseBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveMinimumRaiseBefore => MinimumRaiseBefore ?? MinimumRaiseBeforeCamel;
+
     public int? PlayersInHandBefore { get; init; }
+
+    [JsonPropertyName("playersInHandBefore")]
+    public int? PlayersInHandBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePlayersInHandBefore => PlayersInHandBefore ?? PlayersInHandBeforeCamel;
+
     public int? PotBefore { get; init; }
+
+    [JsonPropertyName("potBefore")]
+    public int? PotBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePotBefore => PotBefore ?? PotBeforeCamel;
+
     public int? PotAfter { get; init; }
+
+    [JsonPropertyName("potAfter")]
+    public int? PotAfterCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePotAfter => PotAfter ?? PotAfterCamel;
+
     public int? CurrentBetBefore { get; init; }
+
+    [JsonPropertyName("currentBetBefore")]
+    public int? CurrentBetBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveCurrentBetBefore => CurrentBetBefore ?? CurrentBetBeforeCamel;
+
     public int? CurrentBetAfter { get; init; }
+
+    [JsonPropertyName("currentBetAfter")]
+    public int? CurrentBetAfterCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectiveCurrentBetAfter => CurrentBetAfter ?? CurrentBetAfterCamel;
+
     public int? PlayerBetBefore { get; init; }
+
+    [JsonPropertyName("playerBetBefore")]
+    public int? PlayerBetBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePlayerBetBefore => PlayerBetBefore ?? PlayerBetBeforeCamel;
+
     public int? PlayerBetAfter { get; init; }
+
+    [JsonPropertyName("playerBetAfter")]
+    public int? PlayerBetAfterCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePlayerBetAfter => PlayerBetAfter ?? PlayerBetAfterCamel;
+
     public int? PlayerStackBefore { get; init; }
+
+    [JsonPropertyName("playerStackBefore")]
+    public int? PlayerStackBeforeCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePlayerStackBefore => PlayerStackBefore ?? PlayerStackBeforeCamel;
+
     public int? PlayerStackAfter { get; init; }
+
+    [JsonPropertyName("playerStackAfter")]
+    public int? PlayerStackAfterCamel { get; init; }
+
+    [JsonIgnore]
+    public int? EffectivePlayerStackAfter => PlayerStackAfter ?? PlayerStackAfterCamel;
 }
 
 internal sealed class AnalyzeDecisionResponse
