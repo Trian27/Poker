@@ -15,6 +15,8 @@ ACTIVE_APP_DIR="$CURRENT_LINK/app"
 METADATA_FILE="$METADATA_DIR/install.json"
 RUNTIME_HELPER="$SCRIPT_DIR/g5_runtime_common.py"
 SMOKE_TEST_IMAGE="${G5_SMOKE_TEST_IMAGE:-python:3.12-alpine}"
+BUILDER_DOCKERFILE="$REPO_ROOT/docker/g5-runtime-builder.Dockerfile"
+PROBE_SOURCE_DIR="$REPO_ROOT/tools/g5-runtime-probe"
 
 TMP_DOWNLOAD=""
 TMP_EXTRACT_DIR=""
@@ -29,6 +31,7 @@ Commands:
   install       Download, verify, extract, and activate a G5 runtime bundle
   verify        Validate the active G5 runtime layout and install metadata
   smoke-test    Validate Docker can mount and read the active runtime bundle
+  probe         Validate the installed runtime can load G5 and execute a minimal decision path
   clean         Remove all local G5 runtime files under .runtime/engines/g5
 
 Options:
@@ -40,6 +43,7 @@ Environment:
   G5_RUNTIME_BUNDLE_URL
   G5_RUNTIME_BUNDLE_SHA256
   G5_SMOKE_TEST_IMAGE   Optional Docker image for smoke-test (default: python:3.12-alpine)
+  G5_PROBE_IMAGE        Optional Docker image for probe (default: pinned .NET SDK image)
 EOF
 }
 
@@ -146,8 +150,37 @@ resolve_bundle_root() {
 }
 
 check_docker_available() {
+  local command_name="${1:-this command}"
   need_cmd docker
-  docker info >/dev/null 2>&1 || die "Docker is required for smoke-test. Start Docker Desktop and try again."
+  docker info >/dev/null 2>&1 || die "Docker is required for ${command_name}. Start Docker Desktop and try again."
+}
+
+resolve_probe_image() {
+  local configured_image="${G5_PROBE_IMAGE:-}"
+  if [ -n "$configured_image" ]; then
+    printf '%s\n' "$configured_image"
+    return 0
+  fi
+
+  [ -f "$BUILDER_DOCKERFILE" ] || die "Missing builder Dockerfile: $BUILDER_DOCKERFILE"
+  local default_image
+  default_image="$(
+    python3 - "$BUILDER_DOCKERFILE" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        match = re.match(r"^ARG\s+BUILDER_BASE_IMAGE=(.+)$", line.strip())
+        if match:
+            print(match.group(1).strip())
+            raise SystemExit(0)
+
+raise SystemExit("ERROR: Could not locate ARG BUILDER_BASE_IMAGE in Dockerfile")
+PY
+  )"
+  printf '%s\n' "$default_image"
 }
 
 install_runtime() {
@@ -253,7 +286,7 @@ validate_runtime() {
 smoke_test_runtime() {
   need_cmd python3
   validate_runtime
-  check_docker_available
+  check_docker_available "smoke-test"
 
   log "Running Docker smoke-test with image: $SMOKE_TEST_IMAGE"
   docker run --rm -i --platform linux/amd64 \
@@ -323,6 +356,33 @@ print("G5 runtime smoke-test passed.")
 PY
 }
 
+probe_runtime() {
+  need_cmd python3
+  validate_runtime
+  check_docker_available "probe"
+  [ -d "$PROBE_SOURCE_DIR" ] || die "Missing tracked probe source directory: $PROBE_SOURCE_DIR"
+  [ -f "$PROBE_SOURCE_DIR/G5RuntimeProbe.csproj" ] || die "Missing probe project file: $PROBE_SOURCE_DIR/G5RuntimeProbe.csproj"
+
+  local probe_image
+  probe_image="$(resolve_probe_image)"
+
+  log "Running G5 runtime probe with image: $probe_image"
+  docker run --rm -i --platform linux/amd64 \
+    -v "$ACTIVE_APP_DIR:/opt/g5:ro" \
+    -v "$PROBE_SOURCE_DIR:/probe-src:ro" \
+    "$probe_image" \
+    /bin/bash -lc '
+set -euo pipefail
+rm -rf /tmp/g5-probe
+mkdir -p /tmp/g5-probe/runtime /tmp/g5-probe/probe-src
+cp -R /opt/g5/. /tmp/g5-probe/runtime/
+cp -R /probe-src/. /tmp/g5-probe/probe-src/
+export LD_LIBRARY_PATH=/tmp/g5-probe/runtime:${LD_LIBRARY_PATH:-}
+dotnet restore /tmp/g5-probe/probe-src/G5RuntimeProbe.csproj --ignore-failed-sources >/dev/null
+dotnet run --no-restore --project /tmp/g5-probe/probe-src/G5RuntimeProbe.csproj -- --runtime-dir /tmp/g5-probe/runtime
+'
+}
+
 clean_runtime() {
   if [ -d "$ENGINE_ROOT" ] || [ -L "$ENGINE_ROOT" ]; then
     rm -rf "$ENGINE_ROOT"
@@ -373,6 +433,9 @@ case "$COMMAND" in
     ;;
   smoke-test)
     smoke_test_runtime
+    ;;
+  probe)
+    probe_runtime
     ;;
   clean)
     clean_runtime

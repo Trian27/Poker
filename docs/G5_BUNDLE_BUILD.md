@@ -159,6 +159,7 @@ export G5_RUNTIME_BUNDLE_SHA256="<sha256>"
 ./scripts/install_g5_runtime.sh install
 ./scripts/install_g5_runtime.sh verify
 ./scripts/install_g5_runtime.sh smoke-test
+./scripts/install_g5_runtime.sh probe
 ```
 
 ## Output Metadata
