@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     # Internal advisor integration
     G5_ADVISOR_SERVICE_URL: str = "http://g5-advisor-service:8002"
     G5_ADVISOR_TIMEOUT_SECONDS: float = 5.0
+    G5_ENABLE_POSTFLOP_ANALYSIS: bool = True
 
     # Optional admin bootstrap (creates/promotes admin on startup)
     ADMIN_USERNAME: Optional[str] = None

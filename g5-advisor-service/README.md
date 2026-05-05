@@ -4,12 +4,13 @@ This service exposes the installed G5 runtime bundle as an internal HTTP advisor
 
 ## Current Scope
 
-v1 is intentionally narrow:
-- preflop-only hero decision analysis
+The service currently supports:
+- hero decision analysis on `preflop`, `flop`, `turn`, and `river`
 - dynamic loading from the installed runtime bundle
 - manifest-driven table-profile routing
+- pure replay planning plus G5 execution against the installed runtime
 
-The service is already wired behind the Learning Hub flow through `poker-api`, but it remains preflop-only in this PR.
+The service is already wired behind the Learning Hub flow through `poker-api`.
 
 ## Runtime Requirement
 
@@ -42,7 +43,7 @@ Readiness endpoint. Returns `200` only after:
 - reflection binding
 - native resolution
 - warm `OpponentModeling` init for both profiles
-- startup preflop self-check for both profiles
+- startup `preflop -> flop -> calculateHeroAction()` self-check for both profiles
 
 Health also exposes per-profile readiness metadata:
 - `profiles.heads_up`
@@ -129,14 +130,25 @@ Internal request shape:
 Possible `warnings` values:
 - `ignored_opponent_hole_cards`
 - `trimmed_future_board_cards`
+- `multiway_postflop_fallback`
 - `no_action_returned`
 - `unsupported_hidden_forced_contribution`
 
 ## Important limitations
 
-- v1 only supports target actions where `stage == preflop`
 - profile selection is based on validated seated/dealt player count, not active players:
   - `2` players => `heads_up`
   - `3..6` players => `six_max`
+- `multiway_postflop_fallback` means G5 used its simplified large-multiway postflop path because `numActivePlayers() >= 5` at decision time
 - amount semantics are still experimental pending replay-validation tests
 - the service is an infrastructure/runtime integration step, not a strategy-quality guarantee
+
+## Learning Kill Switch
+
+If you need to disable postflop Learning analysis without changing the advisor service, set this on the `auth-api` / `poker-api` container:
+
+```bash
+G5_ENABLE_POSTFLOP_ANALYSIS=false
+```
+
+That restores the previous `unsupported_street` behavior for non-preflop hero actions while leaving the service itself intact.

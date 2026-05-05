@@ -8,6 +8,7 @@ internal sealed class G5ReflectionBindings
     public Type IActionEstimatorType { get; }
     public Type BotGameStateType { get; }
     public Type CardType { get; }
+    public Type PlayerType { get; }
     public Type TableTypeType { get; }
     public Type PokerClientType { get; }
     public Type ActionTypeType { get; }
@@ -22,11 +23,17 @@ internal sealed class G5ReflectionBindings
 
     public MethodInfo StartNewHandMethod { get; }
     public MethodInfo DealHoleCardsMethod { get; }
+    public MethodInfo GoToNextStreetCardMethod { get; }
+    public MethodInfo GoToNextStreetCardsMethod { get; }
     public MethodInfo PlayerCheckCallsMethod { get; }
     public MethodInfo PlayerBetRaisesByMethod { get; }
     public MethodInfo PlayerFoldsMethod { get; }
     public MethodInfo CalculateHeroActionMethod { get; }
     public MethodInfo GetPlayerToActIndMethod { get; }
+    public MethodInfo GetStreetMethod { get; }
+    public MethodInfo PotSizeMethod { get; }
+    public MethodInfo GetAmountToCallMethod { get; }
+    public MethodInfo GetPlayersMethod { get; }
     public MethodInfo NumActivePlayersMethod { get; }
     public MethodInfo NumActiveNonAllInPlayersMethod { get; }
 
@@ -36,6 +43,8 @@ internal sealed class G5ReflectionBindings
     public BoundMember DecisionBetRaiseEvMember { get; }
     public BoundMember DecisionTimeSpentSecondsMember { get; }
     public BoundMember DecisionMessageMember { get; }
+    public BoundMember PlayerStackMember { get; }
+    public BoundMember PlayerMoneyInPotMember { get; }
 
     public object TableTypeHeadsUpValue { get; }
     public object TableTypeSixMaxValue { get; }
@@ -51,6 +60,7 @@ internal sealed class G5ReflectionBindings
         Type iActionEstimatorType,
         Type botGameStateType,
         Type cardType,
+        Type playerType,
         Type tableTypeType,
         Type pokerClientType,
         Type actionTypeType,
@@ -62,11 +72,17 @@ internal sealed class G5ReflectionBindings
         FieldInfo recentHandsCountField,
         MethodInfo startNewHandMethod,
         MethodInfo dealHoleCardsMethod,
+        MethodInfo goToNextStreetCardMethod,
+        MethodInfo goToNextStreetCardsMethod,
         MethodInfo playerCheckCallsMethod,
         MethodInfo playerBetRaisesByMethod,
         MethodInfo playerFoldsMethod,
         MethodInfo calculateHeroActionMethod,
         MethodInfo getPlayerToActIndMethod,
+        MethodInfo getStreetMethod,
+        MethodInfo potSizeMethod,
+        MethodInfo getAmountToCallMethod,
+        MethodInfo getPlayersMethod,
         MethodInfo numActivePlayersMethod,
         MethodInfo numActiveNonAllInPlayersMethod,
         BoundMember decisionActionTypeMember,
@@ -75,6 +91,8 @@ internal sealed class G5ReflectionBindings
         BoundMember decisionBetRaiseEvMember,
         BoundMember decisionTimeSpentSecondsMember,
         BoundMember decisionMessageMember,
+        BoundMember playerStackMember,
+        BoundMember playerMoneyInPotMember,
         object tableTypeHeadsUpValue,
         object tableTypeSixMaxValue,
         object pokerClientPokerKingValue,
@@ -87,6 +105,7 @@ internal sealed class G5ReflectionBindings
         IActionEstimatorType = iActionEstimatorType;
         BotGameStateType = botGameStateType;
         CardType = cardType;
+        PlayerType = playerType;
         TableTypeType = tableTypeType;
         PokerClientType = pokerClientType;
         ActionTypeType = actionTypeType;
@@ -98,11 +117,17 @@ internal sealed class G5ReflectionBindings
         RecentHandsCountField = recentHandsCountField;
         StartNewHandMethod = startNewHandMethod;
         DealHoleCardsMethod = dealHoleCardsMethod;
+        GoToNextStreetCardMethod = goToNextStreetCardMethod;
+        GoToNextStreetCardsMethod = goToNextStreetCardsMethod;
         PlayerCheckCallsMethod = playerCheckCallsMethod;
         PlayerBetRaisesByMethod = playerBetRaisesByMethod;
         PlayerFoldsMethod = playerFoldsMethod;
         CalculateHeroActionMethod = calculateHeroActionMethod;
         GetPlayerToActIndMethod = getPlayerToActIndMethod;
+        GetStreetMethod = getStreetMethod;
+        PotSizeMethod = potSizeMethod;
+        GetAmountToCallMethod = getAmountToCallMethod;
+        GetPlayersMethod = getPlayersMethod;
         NumActivePlayersMethod = numActivePlayersMethod;
         NumActiveNonAllInPlayersMethod = numActiveNonAllInPlayersMethod;
         DecisionActionTypeMember = decisionActionTypeMember;
@@ -111,6 +136,8 @@ internal sealed class G5ReflectionBindings
         DecisionBetRaiseEvMember = decisionBetRaiseEvMember;
         DecisionTimeSpentSecondsMember = decisionTimeSpentSecondsMember;
         DecisionMessageMember = decisionMessageMember;
+        PlayerStackMember = playerStackMember;
+        PlayerMoneyInPotMember = playerMoneyInPotMember;
         TableTypeHeadsUpValue = tableTypeHeadsUpValue;
         TableTypeSixMaxValue = tableTypeSixMaxValue;
         PokerClientPokerKingValue = pokerClientPokerKingValue;
@@ -126,6 +153,7 @@ internal sealed class G5ReflectionBindings
         var iActionEstimatorType = GetTypeOrThrow(logicAssembly, "G5.Logic.Estimators.IActionEstimator");
         var botGameStateType = GetTypeOrThrow(logicAssembly, "G5.Logic.BotGameState");
         var cardType = GetTypeOrThrow(logicAssembly, "G5.Logic.Card");
+        var playerType = GetTypeOrThrow(logicAssembly, "G5.Logic.Player");
         var tableTypeType = GetTypeOrThrow(logicAssembly, "G5.Logic.TableType");
         var pokerClientType = GetTypeOrThrow(logicAssembly, "G5.Logic.PokerClient");
         var actionTypeType = GetTypeOrThrow(logicAssembly, "G5.Logic.ActionType");
@@ -150,11 +178,17 @@ internal sealed class G5ReflectionBindings
 
         var startNewHandMethod = GetMethodOrThrow(botGameStateType, "startNewHand", typeof(List<int>));
         var dealHoleCardsMethod = GetMethodOrThrow(botGameStateType, "dealHoleCards", cardType, cardType);
+        var goToNextStreetCardMethod = GetMethodOrThrow(botGameStateType, "goToNextStreet", cardType);
+        var goToNextStreetCardsMethod = GetMethodOrThrow(botGameStateType, "goToNextStreet", typeof(List<>).MakeGenericType(cardType));
         var playerCheckCallsMethod = GetMethodOrThrow(botGameStateType, "playerCheckCalls", Type.EmptyTypes);
         var playerBetRaisesByMethod = GetMethodOrThrow(botGameStateType, "playerBetRaisesBy", typeof(int));
         var playerFoldsMethod = GetMethodOrThrow(botGameStateType, "playerFolds", Type.EmptyTypes);
         var calculateHeroActionMethod = GetMethodOrThrow(botGameStateType, "calculateHeroAction", Type.EmptyTypes);
         var getPlayerToActIndMethod = GetMethodOrThrow(botGameStateType, "getPlayerToActInd", Type.EmptyTypes);
+        var getStreetMethod = GetMethodOrThrow(botGameStateType, "getStreet", Type.EmptyTypes);
+        var potSizeMethod = GetMethodOrThrow(botGameStateType, "potSize", Type.EmptyTypes);
+        var getAmountToCallMethod = GetMethodOrThrow(botGameStateType, "getAmountToCall", Type.EmptyTypes);
+        var getPlayersMethod = GetMethodOrThrow(botGameStateType, "getPlayers", Type.EmptyTypes);
         var numActivePlayersMethod = GetMethodOrThrow(botGameStateType, "numActivePlayers", Type.EmptyTypes);
         var numActiveNonAllInPlayersMethod = GetMethodOrThrow(botGameStateType, "numActiveNonAllInPlayers", Type.EmptyTypes);
 
@@ -165,6 +199,8 @@ internal sealed class G5ReflectionBindings
         var decisionBetRaiseEvMember = CreateBoundMember(decisionType, "betRaiseEV");
         var decisionTimeSpentSecondsMember = CreateBoundMember(decisionType, "timeSpentSeconds");
         var decisionMessageMember = CreateBoundMember(decisionType, "message");
+        var playerStackMember = CreateBoundMember(playerType, "Stack");
+        var playerMoneyInPotMember = CreateBoundMember(playerType, "MoneyInPot");
 
         var tableTypeHeadsUpValue = GetEnumValueOrThrow(tableTypeType, "HeadsUp");
         var tableTypeSixMaxValue = GetEnumValueOrThrow(tableTypeType, "SixMax");
@@ -178,6 +214,7 @@ internal sealed class G5ReflectionBindings
             $"Type {modelingEstimatorType.FullName}",
             $"Type {botGameStateType.FullName}",
             $"Type {cardType.FullName}",
+            $"Type {playerType.FullName}",
             $"Ctor {FormatSignature(opponentModelingOptionsConstructor)}",
             $"Field {recentHandsCountField.FieldType.Name} {opponentModelingOptionsType.FullName}.{recentHandsCountField.Name}",
             $"Ctor {FormatSignature(opponentModelingConstructor)}",
@@ -186,11 +223,17 @@ internal sealed class G5ReflectionBindings
             $"Ctor {FormatSignature(cardStringConstructor)}",
             $"Method {FormatSignature(startNewHandMethod)}",
             $"Method {FormatSignature(dealHoleCardsMethod)}",
+            $"Method {FormatSignature(goToNextStreetCardMethod)}",
+            $"Method {FormatSignature(goToNextStreetCardsMethod)}",
             $"Method {FormatSignature(playerCheckCallsMethod)}",
             $"Method {FormatSignature(playerBetRaisesByMethod)}",
             $"Method {FormatSignature(playerFoldsMethod)}",
             $"Method {FormatSignature(calculateHeroActionMethod)}",
             $"Method {FormatSignature(getPlayerToActIndMethod)}",
+            $"Method {FormatSignature(getStreetMethod)}",
+            $"Method {FormatSignature(potSizeMethod)}",
+            $"Method {FormatSignature(getAmountToCallMethod)}",
+            $"Method {FormatSignature(getPlayersMethod)}",
             $"Method {FormatSignature(numActivePlayersMethod)}",
             $"Method {FormatSignature(numActiveNonAllInPlayersMethod)}",
             $"Member {decisionActionTypeMember.Signature}",
@@ -199,6 +242,8 @@ internal sealed class G5ReflectionBindings
             $"Member {decisionBetRaiseEvMember.Signature}",
             $"Member {decisionTimeSpentSecondsMember.Signature}",
             $"Member {decisionMessageMember.Signature}",
+            $"Member {playerStackMember.Signature}",
+            $"Member {playerMoneyInPotMember.Signature}",
             $"Enum {tableTypeType.FullName}.HeadsUp={(int)tableTypeHeadsUpValue}",
             $"Enum {tableTypeType.FullName}.SixMax={(int)tableTypeSixMaxValue}",
             $"Enum {pokerClientType.FullName}.PokerKing={(int)pokerClientPokerKingValue}",
@@ -212,6 +257,7 @@ internal sealed class G5ReflectionBindings
             iActionEstimatorType,
             botGameStateType,
             cardType,
+            playerType,
             tableTypeType,
             pokerClientType,
             actionTypeType,
@@ -223,11 +269,17 @@ internal sealed class G5ReflectionBindings
             recentHandsCountField,
             startNewHandMethod,
             dealHoleCardsMethod,
+            goToNextStreetCardMethod,
+            goToNextStreetCardsMethod,
             playerCheckCallsMethod,
             playerBetRaisesByMethod,
             playerFoldsMethod,
             calculateHeroActionMethod,
             getPlayerToActIndMethod,
+            getStreetMethod,
+            potSizeMethod,
+            getAmountToCallMethod,
+            getPlayersMethod,
             numActivePlayersMethod,
             numActiveNonAllInPlayersMethod,
             decisionActionTypeMember,
@@ -236,6 +288,8 @@ internal sealed class G5ReflectionBindings
             decisionBetRaiseEvMember,
             decisionTimeSpentSecondsMember,
             decisionMessageMember,
+            playerStackMember,
+            playerMoneyInPotMember,
             tableTypeHeadsUpValue,
             tableTypeSixMaxValue,
             pokerClientPokerKingValue,

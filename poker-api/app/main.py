@@ -4201,11 +4201,8 @@ def get_hand_details(
 LEARNING_STREETS = {"preflop", "flop", "turn", "river"}
 LEARNING_DECISION_ACTIONS = {"fold", "check", "call", "bet", "raise", "all-in"}
 G5_UNSUPPORTED_CODES = {
-    "unsupported_street",
     "unsupported_hidden_forced_contribution",
     "unsupported_action",
-    "player_to_act_mismatch",
-    "target_turn_mismatch",
 }
 
 
@@ -4526,13 +4523,13 @@ async def get_learning_coach_recommendation(
         )
 
     street = _normalize_learning_street(target_entry.get("stage"))
-    if street != "preflop":
+    if street != "preflop" and not settings.G5_ENABLE_POSTFLOP_ANALYSIS:
         return _unsupported_learning_response(
             hand_id=payload.hand_id,
             decision_sequence=payload.decision_sequence,
             street=street,
             unsupported_code="unsupported_street",
-            unsupported_message="G5 preflop analysis is currently available only for hero preflop decisions.",
+            unsupported_message="G5 postflop analysis is currently disabled.",
         )
 
     action_name = _normalize_learning_action(target_entry.get("action"))
