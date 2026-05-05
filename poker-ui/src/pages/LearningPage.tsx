@@ -443,7 +443,7 @@ export const LearningPage: React.FC = () => {
                       <div className="coach-unsupported-card">
                         <div className="coach-unsupported-title">Not supported yet</div>
                         <div className="coach-unsupported-message">
-                          {coachResult.unsupported_message || 'G5 preflop analysis is not available for this action yet.'}
+                          {coachResult.unsupported_message || 'G5 analysis is not available for this action yet.'}
                         </div>
                         <div className="coach-unsupported-meta">
                           <span>Street: {formatStreetLabel(coachResult.street)}</span>

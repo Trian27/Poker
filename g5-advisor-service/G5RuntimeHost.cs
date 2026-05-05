@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
@@ -6,6 +7,16 @@ using Microsoft.Extensions.Logging;
 internal sealed class G5RuntimeHost
 {
     private const string ReadyStage = "ready";
+    private static readonly HashSet<string> DecisionActions = new(StringComparer.Ordinal)
+    {
+        "fold",
+        "check",
+        "call",
+        "bet",
+        "raise",
+        "all-in",
+    };
+
     private readonly ILogger<G5RuntimeHost> _logger;
     private readonly G5AdvisorOptions _options;
     private readonly SemaphoreSlim _requestGate = new(1, 1);
@@ -72,12 +83,18 @@ internal sealed class G5RuntimeHost
         try
         {
             EnsureReady();
-            return AnalyzeCore(request);
+            return AnalyzeCore(request, captureSnapshots: false).Response;
         }
         finally
         {
             _requestGate.Release();
         }
+    }
+
+    internal AnalyzeForTestingResult AnalyzeForTesting(AnalyzeDecisionRequest request)
+    {
+        EnsureReady();
+        return AnalyzeCore(request, captureSnapshots: true);
     }
 
     private void EnsureReady()
@@ -172,7 +189,7 @@ internal sealed class G5RuntimeHost
         }
     }
 
-    private AnalyzeDecisionResponse AnalyzeCore(AnalyzeDecisionRequest request)
+    private AnalyzeForTestingResult AnalyzeCore(AnalyzeDecisionRequest request, bool captureSnapshots)
     {
         ArgumentNullException.ThrowIfNull(request);
         var bindings = _bindings ?? throw new ServiceApiException(StatusCodes.Status503ServiceUnavailable, "runtime_unready", "G5 bindings are not ready");
@@ -181,10 +198,11 @@ internal sealed class G5RuntimeHost
         var sharedOpponentModeling = GetWarmedOpponentModeling(prepared.Profile.Profile);
 
         _logger.LogInformation(
-            "Analyzing preflop decision: sequence={Sequence} hero={HeroPlayerId} replayed_actions={ActionCount} profile={Profile} seated_players={SeatedPlayers}",
+            "Analyzing decision: sequence={Sequence} hero={HeroPlayerId} target_street={TargetStreet} replay_steps={StepCount} profile={Profile} seated_players={SeatedPlayers}",
             prepared.TargetEntry.Sequence,
             prepared.Hero.PlayerId,
-            prepared.ReplayEntries.Count,
+            prepared.TargetStreet,
+            prepared.ReplayPlan.Steps.Count,
             prepared.Profile.Profile,
             prepared.SeatedPlayerCount);
 
@@ -203,38 +221,26 @@ internal sealed class G5RuntimeHost
                         CreateCard(bindings, prepared.HeroCards[1]),
                     });
 
-                var replayedActionCount = 0;
-                foreach (var entry in prepared.ReplayEntries)
-                {
-                    if (ShouldSkipForcedBlind(entry))
-                    {
-                        continue;
-                    }
+                var replayExecution = ExecuteReplayPlan(bindings, botGameState, prepared, captureSnapshots);
 
-                    var currentPlayerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
-                    if (!prepared.PlayerIdToIndex.TryGetValue(entry.EffectivePlayerId, out var actorIndex))
-                    {
-                        throw new ServiceApiException(StatusCodes.Status400BadRequest, "unknown_action_actor", $"Unknown action actor in replay: {entry.EffectivePlayerId}");
-                    }
-                    if (currentPlayerToActIndex != actorIndex)
-                    {
-                        throw new ServiceApiException(
-                            StatusCodes.Status400BadRequest,
-                            "player_to_act_mismatch",
-                            $"Replay desync before sequence {entry.Sequence}: expected actor index {actorIndex}, G5 expects {currentPlayerToActIndex}");
-                    }
+                AutoCompleteImplicitChecksUntilExpectedActor(
+                    bindings,
+                    botGameState,
+                    prepared,
+                    prepared.HeroIndex,
+                    prepared.TargetEntry.Sequence,
+                    new HashSet<int>(),
+                    snapshots: replayExecution.Snapshots is List<ReplayStateSnapshot> mutableSnapshots ? mutableSnapshots : null,
+                    captureSnapshots);
 
-                    ReplayAction(bindings, botGameState, entry);
-                    replayedActionCount += 1;
-                }
-
+                var currentStreet = ReadStreet(bindings, botGameState);
                 var playerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
-                if (playerToActIndex != prepared.HeroIndex)
+                if (!string.Equals(currentStreet, prepared.TargetStreet, StringComparison.Ordinal) || playerToActIndex != prepared.HeroIndex)
                 {
                     throw new ServiceApiException(
                         StatusCodes.Status400BadRequest,
                         "target_turn_mismatch",
-                        $"Replay reached player index {playerToActIndex}, but hero index is {prepared.HeroIndex}");
+                        $"Replay reached street {currentStreet} and player index {playerToActIndex}, but expected street {prepared.TargetStreet} and hero index {prepared.HeroIndex}");
                 }
 
                 var activePlayers = ConvertToInt(bindings.NumActivePlayersMethod.Invoke(botGameState, null), "numActivePlayers result");
@@ -250,12 +256,16 @@ internal sealed class G5RuntimeHost
                 var message = Convert.ToString(bindings.DecisionMessageMember.Read(rawDecision), CultureInfo.InvariantCulture) ?? string.Empty;
 
                 var warnings = new List<string>(prepared.Warnings);
+                if (!string.Equals(prepared.TargetStreet, "preflop", StringComparison.Ordinal) && activePlayers >= 5)
+                {
+                    warnings.Add("multiway_postflop_fallback");
+                }
                 if (string.Equals(rawActionType, "NoAction", StringComparison.Ordinal))
                 {
                     warnings.Add("no_action_returned");
                 }
 
-                return new AnalyzeDecisionResponse
+                var response = new AnalyzeDecisionResponse
                 {
                     DecisionSequence = prepared.TargetEntry.Sequence,
                     RecommendedAction = NormalizeAction(rawActionType, prepared.TargetEntry.EffectiveToCallBefore ?? 0, warnings),
@@ -270,7 +280,7 @@ internal sealed class G5RuntimeHost
                     Debug = _options.ShouldIncludeDebugResponse
                         ? new AnalyzeDecisionDebug
                         {
-                            ReplayedActionCount = replayedActionCount,
+                            ReplayedActionCount = replayExecution.ReplayedActionCount,
                             TargetStreet = prepared.TargetStreet,
                             TableProfile = prepared.Profile.Profile,
                             SeatedPlayerCount = prepared.SeatedPlayerCount,
@@ -280,6 +290,8 @@ internal sealed class G5RuntimeHost
                         }
                         : null,
                 };
+
+                return new AnalyzeForTestingResult(response, replayExecution.Snapshots);
             }
             finally
             {
@@ -358,10 +370,6 @@ internal sealed class G5RuntimeHost
         }
 
         var warnings = new List<string>();
-        if ((request.HandData.CommunityCards?.Count ?? 0) > 0)
-        {
-            warnings.Add("trimmed_future_board_cards");
-        }
         if (orderedPlayers.Any(player => player.PlayerId != hero.PlayerId && (player.HoleCards?.Count ?? 0) > 0))
         {
             warnings.Add("ignored_opponent_hole_cards");
@@ -390,18 +398,17 @@ internal sealed class G5RuntimeHost
             throw new ServiceApiException(StatusCodes.Status400BadRequest, "decision_not_hero_action", $"Sequence {request.DecisionSequence} does not belong to hero_player_id {hero.PlayerId}");
         }
 
-        var targetStreet = NormalizeStage(targetEntry.Stage);
-        if (!string.Equals(targetStreet, "preflop", StringComparison.Ordinal))
+        var targetStreet = ReplayHelpers.NormalizeStage(targetEntry.Stage);
+        var targetActionName = ReplayHelpers.NormalizeActionName(targetEntry.Action);
+        if (!DecisionActions.Contains(targetActionName))
         {
-            throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "unsupported_street", "v1 only supports target actions where stage == preflop");
+            throw new ServiceApiException(
+                StatusCodes.Status422UnprocessableEntity,
+                "unsupported_action",
+                $"Unsupported target action '{targetEntry.Action}' at sequence {targetEntry.Sequence}");
         }
 
-        if (ShouldSkipForcedBlind(targetEntry))
-        {
-            throw new ServiceApiException(StatusCodes.Status400BadRequest, "decision_not_playable_action", "The target decision_sequence points to a forced blind entry, not a hero decision");
-        }
-
-        var firstForcedBlind = actionLog.FirstOrDefault(ShouldSkipForcedBlind);
+        var firstForcedBlind = actionLog.FirstOrDefault(ReplayHelpers.ShouldSkipForcedBlind);
         if (firstForcedBlind is not null && (firstForcedBlind.EffectivePotBefore ?? 0) > 0)
         {
             throw new ServiceApiException(
@@ -411,10 +418,15 @@ internal sealed class G5RuntimeHost
         }
 
         var replayEntries = actionLog.Where(entry => entry.Sequence < targetEntry.Sequence).ToList();
-        if (replayEntries.Any(entry => !string.Equals(NormalizeStage(entry.Stage), "preflop", StringComparison.Ordinal)))
+        var futureEntries = actionLog.Where(entry => entry.Sequence > targetEntry.Sequence).ToList();
+        var replayPlan = G5ReplayPlanner.Build(new ReplayPlanningInput
         {
-            throw new ServiceApiException(StatusCodes.Status400BadRequest, "unexpected_preceding_stage", "Found a non-preflop action before the target preflop decision");
-        }
+            ReplayEntries = replayEntries,
+            TargetEntry = targetEntry,
+            CommunityCards = request.HandData.CommunityCards ?? new List<CardDto>(),
+        });
+        warnings.AddRange(replayPlan.Warnings);
+        var headsUpButtonActsFirstPostflop = seatedPlayerCount == 2 && UsesButtonFirstPostflopOrdering(actionLog, dealerPlayerId);
 
         var startingStacks = request.HandData.StartingStacks ?? new Dictionary<string, int>(StringComparer.Ordinal);
         var stackSizes = new int[orderedPlayers.Count];
@@ -445,13 +457,15 @@ internal sealed class G5RuntimeHost
             StackSizes: stackSizes,
             OrderedPlayers: orderedPlayers,
             PlayerIdToIndex: playerIdToIndex,
-            ReplayEntries: replayEntries,
+            ReplayPlan: replayPlan,
             TargetEntry: targetEntry,
-            HeroCards: new[] { ToG5Card(hero.HoleCards[0]), ToG5Card(hero.HoleCards[1]) },
+            HeroCards: new[] { ReplayHelpers.ToG5Card(hero.HoleCards[0]), ReplayHelpers.ToG5Card(hero.HoleCards[1]) },
             Warnings: warnings,
             Profile: profile,
             SeatedPlayerCount: seatedPlayerCount,
-            TargetStreet: targetStreet);
+            TargetStreet: targetStreet,
+            FutureEntries: futureEntries,
+            HeadsUpButtonActsFirstPostflop: headsUpButtonActsFirstPostflop);
     }
 
     private RuntimeTableProfile SelectRuntimeProfile(int seatedPlayerCount)
@@ -479,6 +493,26 @@ internal sealed class G5RuntimeHost
             StatusCodes.Status422UnprocessableEntity,
             "unsupported_player_count",
             $"No G5 table profile is configured for {seatedPlayerCount} validated participants.");
+    }
+
+    private static bool UsesButtonFirstPostflopOrdering(IEnumerable<ActionLogEntry> actionLog, string dealerPlayerId)
+    {
+        foreach (var street in new[] { "flop", "turn", "river" })
+        {
+            var firstEntry = actionLog
+                .Where(entry => string.Equals(ReplayHelpers.NormalizeStage(entry.Stage), street, StringComparison.Ordinal))
+                .OrderBy(entry => entry.Sequence)
+                .FirstOrDefault();
+
+            if (firstEntry is null)
+            {
+                continue;
+            }
+
+            return string.Equals(firstEntry.EffectivePlayerId, dealerPlayerId, StringComparison.Ordinal);
+        }
+
+        return false;
     }
 
     private object GetWarmedOpponentModeling(string profileName)
@@ -525,9 +559,272 @@ internal sealed class G5RuntimeHost
         return bindings.CardStringConstructor.Invoke(new object[] { g5Card });
     }
 
+    private ReplayExecutionResult ExecuteReplayPlan(G5ReflectionBindings bindings, object botGameState, PreparedReplayRequest prepared, bool captureSnapshots)
+    {
+        var snapshots = new List<ReplayStateSnapshot>();
+        var replayedActionCount = 0;
+        var consumedImplicitCheckSequences = new HashSet<int>();
+
+        foreach (var step in prepared.ReplayPlan.Steps)
+        {
+            switch (step)
+            {
+                case ReplayActionStep actionStep:
+                {
+                    var entry = actionStep.Entry;
+                    if (consumedImplicitCheckSequences.Contains(entry.Sequence))
+                    {
+                        continue;
+                    }
+
+                    if (!prepared.PlayerIdToIndex.TryGetValue(entry.EffectivePlayerId, out var actorIndex))
+                    {
+                        throw new ServiceApiException(StatusCodes.Status400BadRequest, "unknown_action_actor", $"Unknown action actor in replay: {entry.EffectivePlayerId}");
+                    }
+
+                    AutoCompleteImplicitChecksUntilExpectedActor(
+                        bindings,
+                        botGameState,
+                        prepared,
+                        actorIndex,
+                        entry.Sequence,
+                        consumedImplicitCheckSequences,
+                        snapshots,
+                        captureSnapshots);
+
+                    var currentPlayerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
+                    if (currentPlayerToActIndex != actorIndex)
+                    {
+                        throw new ServiceApiException(
+                            StatusCodes.Status400BadRequest,
+                            "player_to_act_mismatch",
+                            $"Replay desync before sequence {entry.Sequence}: expected actor index {actorIndex}, G5 expects {currentPlayerToActIndex}");
+                    }
+
+                    ReplayAction(bindings, botGameState, entry);
+                    replayedActionCount += 1;
+                    if (captureSnapshots)
+                    {
+                        snapshots.Add(CaptureSnapshot(bindings, botGameState, $"action:{entry.Sequence}:{ReplayHelpers.NormalizeActionName(entry.Action)}"));
+                    }
+                    break;
+                }
+                case ReplayStreetTransitionStep transitionStep:
+                {
+                    AutoCompleteImplicitChecksBeforeTransition(bindings, botGameState, transitionStep, snapshots, captureSnapshots);
+
+                    var currentPlayerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
+                    if (currentPlayerToActIndex != -1)
+                    {
+                        throw new ServiceApiException(
+                            StatusCodes.Status400BadRequest,
+                            "stage_transition_before_round_complete",
+                            $"Cannot advance from {transitionStep.FromStreet} to {transitionStep.ToStreet} while G5 still expects player index {currentPlayerToActIndex} to act.");
+                    }
+
+                    ExecuteStreetTransition(bindings, botGameState, transitionStep);
+                    if (captureSnapshots)
+                    {
+                        snapshots.Add(CaptureSnapshot(bindings, botGameState, $"transition:{transitionStep.ToStreet}"));
+                    }
+                    break;
+                }
+                default:
+                    throw new InvalidOperationException($"Unsupported replay step type {step.GetType().FullName}");
+            }
+        }
+
+        return new ReplayExecutionResult(
+            ReplayedActionCount: replayedActionCount,
+            PlayerToActIndex: ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result"),
+            ActivePlayers: ConvertToInt(bindings.NumActivePlayersMethod.Invoke(botGameState, null), "numActivePlayers result"),
+            ActiveNonAllInPlayers: ConvertToInt(bindings.NumActiveNonAllInPlayersMethod.Invoke(botGameState, null), "numActiveNonAllInPlayers result"),
+            Snapshots: snapshots);
+    }
+
+    private void AutoCompleteImplicitChecksBeforeTransition(
+        G5ReflectionBindings bindings,
+        object botGameState,
+        ReplayStreetTransitionStep transitionStep,
+        List<ReplayStateSnapshot> snapshots,
+        bool captureSnapshots)
+    {
+        while (true)
+        {
+            var currentPlayerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
+            if (currentPlayerToActIndex == -1)
+            {
+                return;
+            }
+
+            var amountToCall = ConvertToInt(bindings.GetAmountToCallMethod.Invoke(botGameState, null), "getAmountToCall result");
+            if (amountToCall != 0)
+            {
+                return;
+            }
+
+            var currentStreet = ReadStreet(bindings, botGameState);
+            _logger.LogInformation(
+                "Auto-completing omitted zero-cost check before {ToStreet} transition on {CurrentStreet} for player index {PlayerIndex}",
+                transitionStep.ToStreet,
+                currentStreet,
+                currentPlayerToActIndex);
+
+            bindings.PlayerCheckCallsMethod.Invoke(botGameState, null);
+            if (captureSnapshots)
+            {
+                snapshots.Add(CaptureSnapshot(bindings, botGameState, $"implicit-check:{currentStreet}:{currentPlayerToActIndex}"));
+            }
+        }
+    }
+
+    private void AutoCompleteImplicitChecksUntilExpectedActor(
+        G5ReflectionBindings bindings,
+        object botGameState,
+        PreparedReplayRequest prepared,
+        int expectedActorIndex,
+        int currentSequence,
+        HashSet<int> consumedImplicitCheckSequences,
+        List<ReplayStateSnapshot>? snapshots,
+        bool captureSnapshots)
+    {
+        while (true)
+        {
+            var currentPlayerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
+            if (currentPlayerToActIndex == -1 || currentPlayerToActIndex == expectedActorIndex)
+            {
+                return;
+            }
+
+            var amountToCall = ConvertToInt(bindings.GetAmountToCallMethod.Invoke(botGameState, null), "getAmountToCall result");
+            if (amountToCall != 0)
+            {
+                return;
+            }
+
+            var currentStreet = ReadStreet(bindings, botGameState);
+            var consumedSequence = FindExplicitImplicitCheckToConsume(
+                prepared,
+                currentStreet,
+                currentPlayerToActIndex,
+                currentSequence,
+                consumedImplicitCheckSequences);
+            var canApplyHeadsUpButtonFirstRule =
+                consumedSequence is null &&
+                prepared.HeadsUpButtonActsFirstPostflop &&
+                !string.Equals(currentStreet, "preflop", StringComparison.Ordinal) &&
+                expectedActorIndex == prepared.ButtonIndex;
+
+            if (consumedSequence is null && !canApplyHeadsUpButtonFirstRule)
+            {
+                return;
+            }
+
+            _logger.LogInformation(
+                "Auto-completing omitted zero-cost check on {CurrentStreet} for player index {PlayerIndex} before expected actor {ExpectedActorIndex}{Suffix}",
+                currentStreet,
+                currentPlayerToActIndex,
+                expectedActorIndex,
+                consumedSequence is null ? string.Empty : $" using future sequence {consumedSequence.Value}");
+
+            bindings.PlayerCheckCallsMethod.Invoke(botGameState, null);
+            if (consumedSequence is int explicitSequence)
+            {
+                consumedImplicitCheckSequences.Add(explicitSequence);
+            }
+            if (captureSnapshots && snapshots is not null)
+            {
+                snapshots.Add(CaptureSnapshot(bindings, botGameState, $"implicit-check:{currentStreet}:{currentPlayerToActIndex}"));
+            }
+        }
+    }
+
+    private int? FindExplicitImplicitCheckToConsume(
+        PreparedReplayRequest prepared,
+        string currentStreet,
+        int actorIndex,
+        int currentSequence,
+        HashSet<int> consumedImplicitCheckSequences)
+    {
+        var candidates = prepared.ReplayPlan.Steps
+            .OfType<ReplayActionStep>()
+            .Select(step => step.Entry)
+            .Concat(prepared.FutureEntries)
+            .Where(entry => entry.Sequence > currentSequence)
+            .OrderBy(entry => entry.Sequence);
+
+        foreach (var candidate in candidates)
+        {
+            if (consumedImplicitCheckSequences.Contains(candidate.Sequence))
+            {
+                continue;
+            }
+
+            var candidateStreet = ReplayHelpers.NormalizeStage(candidate.Stage);
+            if (!string.Equals(candidateStreet, currentStreet, StringComparison.Ordinal))
+            {
+                if (ReplayHelpers.GetStageIndex(candidateStreet) > ReplayHelpers.GetStageIndex(currentStreet))
+                {
+                    return null;
+                }
+
+                continue;
+            }
+
+            if (!prepared.PlayerIdToIndex.TryGetValue(candidate.EffectivePlayerId, out var candidateActorIndex) || candidateActorIndex != actorIndex)
+            {
+                continue;
+            }
+
+            if (string.Equals(ReplayHelpers.NormalizeActionName(candidate.Action), "check", StringComparison.Ordinal) &&
+                (candidate.EffectiveToCallBefore ?? 0) == 0)
+            {
+                return candidate.Sequence;
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    private void ExecuteStreetTransition(G5ReflectionBindings bindings, object botGameState, ReplayStreetTransitionStep transitionStep)
+    {
+        if (transitionStep.Cards.Count == 1)
+        {
+            bindings.GoToNextStreetCardMethod.Invoke(
+                botGameState,
+                new[] { CreateCard(bindings, ReplayHelpers.ToG5Card(transitionStep.Cards[0])) });
+            return;
+        }
+
+        if (transitionStep.Cards.Count == 3)
+        {
+            var cardList = BuildCardList(bindings, transitionStep.Cards);
+            bindings.GoToNextStreetCardsMethod.Invoke(botGameState, new[] { cardList });
+            return;
+        }
+
+        throw new InvalidOperationException($"Unsupported transition card count {transitionStep.Cards.Count} for {transitionStep.ToStreet}");
+    }
+
+    private object BuildCardList(G5ReflectionBindings bindings, IReadOnlyList<CardDto> cards)
+    {
+        var listType = typeof(List<>).MakeGenericType(bindings.CardType);
+        var list = Activator.CreateInstance(listType) as IList
+            ?? throw new InvalidOperationException("Failed to instantiate reflected List<Card>");
+
+        foreach (var card in cards)
+        {
+            list.Add(CreateCard(bindings, ReplayHelpers.ToG5Card(card)));
+        }
+
+        return list;
+    }
+
     private void ReplayAction(G5ReflectionBindings bindings, object botGameState, ActionLogEntry entry)
     {
-        var action = NormalizeActionName(entry.Action);
+        var action = ReplayHelpers.NormalizeActionName(entry.Action);
         switch (action)
         {
             case "fold":
@@ -540,35 +837,161 @@ internal sealed class G5RuntimeHost
             case "bet":
             case "raise":
             {
-                var requestedAmount = entry.EffectiveRequestedAmount ?? 0;
-                if (requestedAmount <= 0)
-                {
-                    throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "invalid_raise_amount", $"Sequence {entry.Sequence} is missing a positive requested_amount");
-                }
-                bindings.PlayerBetRaisesByMethod.Invoke(botGameState, new object[] { requestedAmount });
+                var chipsAdded = ComputeChipsAddedByAction(entry);
+                bindings.PlayerBetRaisesByMethod.Invoke(botGameState, new object[] { chipsAdded });
                 return;
             }
             case "all-in":
             {
-                var committed = entry.EffectiveCommittedChips ?? 0;
+                var chipsAdded = ComputeChipsAddedByAction(entry);
                 var toCall = entry.EffectiveToCallBefore ?? 0;
-                if (committed <= 0)
+                if (chipsAdded <= toCall)
                 {
-                    throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "invalid_all_in_amount", $"Sequence {entry.Sequence} is missing committed_chips");
-                }
-                if (committed <= toCall)
-                {
+                    if (chipsAdded < toCall)
+                    {
+                        var currentStack = ReadCurrentPlayerStack(bindings, botGameState);
+                        if (currentStack != chipsAdded)
+                        {
+                            throw new ServiceApiException(
+                                StatusCodes.Status400BadRequest,
+                                "short_all_in_call_stack_mismatch",
+                                $"Short all-in call at sequence {entry.Sequence} expected player stack {chipsAdded}, but G5 reports {currentStack}.");
+                        }
+                    }
+
                     bindings.PlayerCheckCallsMethod.Invoke(botGameState, null);
                 }
                 else
                 {
-                    bindings.PlayerBetRaisesByMethod.Invoke(botGameState, new object[] { committed - toCall });
+                    bindings.PlayerBetRaisesByMethod.Invoke(botGameState, new object[] { chipsAdded });
                 }
                 return;
             }
             default:
-                throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "unsupported_action", $"Unsupported preflop replay action '{entry.Action}' at sequence {entry.Sequence}");
+                throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "unsupported_action", $"Unsupported replay action '{entry.Action}' at sequence {entry.Sequence}");
         }
+    }
+
+    private int ComputeChipsAddedByAction(ActionLogEntry entry)
+    {
+        var candidates = new List<(string Source, int Value)>();
+
+        if (entry.EffectivePlayerBetBefore is int playerBetBefore && entry.EffectivePlayerBetAfter is int playerBetAfter)
+        {
+            var delta = playerBetAfter - playerBetBefore;
+            if (delta <= 0)
+            {
+                throw new ServiceApiException(
+                    StatusCodes.Status400BadRequest,
+                    "insufficient_action_amount_data",
+                    $"Sequence {entry.Sequence} produced a non-positive player-bet delta ({delta}).");
+            }
+            candidates.Add(("player_bet_delta", delta));
+        }
+
+        if (entry.EffectivePlayerStackBefore is int playerStackBefore && entry.EffectivePlayerStackAfter is int playerStackAfter)
+        {
+            var delta = playerStackBefore - playerStackAfter;
+            if (delta <= 0)
+            {
+                throw new ServiceApiException(
+                    StatusCodes.Status400BadRequest,
+                    "insufficient_action_amount_data",
+                    $"Sequence {entry.Sequence} produced a non-positive player-stack delta ({delta}).");
+            }
+            candidates.Add(("player_stack_delta", delta));
+        }
+
+        if (entry.EffectiveRequestedAmount is int requestedAmount && requestedAmount > 0)
+        {
+            candidates.Add(("requested_amount", requestedAmount));
+        }
+
+        if (candidates.Count == 0)
+        {
+            throw new ServiceApiException(
+                StatusCodes.Status400BadRequest,
+                "insufficient_action_amount_data",
+                $"Sequence {entry.Sequence} is missing enough data to derive chips added by this action.");
+        }
+
+        var distinctValues = candidates.Select(candidate => candidate.Value).Distinct().ToArray();
+        if (distinctValues.Length > 1)
+        {
+            var details = string.Join(", ", candidates.Select(candidate => $"{candidate.Source}={candidate.Value}"));
+            throw new ServiceApiException(
+                StatusCodes.Status400BadRequest,
+                "inconsistent_action_amount",
+                $"Sequence {entry.Sequence} has inconsistent chips-added sources: {details}");
+        }
+
+        return distinctValues[0];
+    }
+
+    private ReplayStateSnapshot CaptureSnapshot(G5ReflectionBindings bindings, object botGameState, string label)
+    {
+        var playerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
+        var potSize = ConvertToInt(bindings.PotSizeMethod.Invoke(botGameState, null), "potSize result");
+        var amountToCall = playerToActIndex >= 0
+            ? ConvertToInt(bindings.GetAmountToCallMethod.Invoke(botGameState, null), "getAmountToCall result")
+            : 0;
+        var street = ReadStreet(bindings, botGameState);
+
+        var moneyInPot = new List<int>();
+        var stacks = new List<int>();
+        foreach (var player in GetPlayers(bindings, botGameState))
+        {
+            moneyInPot.Add(ConvertToInt(bindings.PlayerMoneyInPotMember.Read(player), "Player.MoneyInPot"));
+            stacks.Add(ConvertToInt(bindings.PlayerStackMember.Read(player), "Player.Stack"));
+        }
+
+        return new ReplayStateSnapshot(
+            Label: label,
+            Street: street,
+            PotSize: potSize,
+            AmountToCall: amountToCall,
+            PlayerToActIndex: playerToActIndex,
+            ActivePlayers: ConvertToInt(bindings.NumActivePlayersMethod.Invoke(botGameState, null), "numActivePlayers result"),
+            ActiveNonAllInPlayers: ConvertToInt(bindings.NumActiveNonAllInPlayersMethod.Invoke(botGameState, null), "numActiveNonAllInPlayers result"),
+            MoneyInPotByPlayer: moneyInPot,
+            StackByPlayer: stacks);
+    }
+
+    private static IEnumerable<object> GetPlayers(G5ReflectionBindings bindings, object botGameState)
+    {
+        var players = bindings.GetPlayersMethod.Invoke(botGameState, null) as IEnumerable
+            ?? throw new InvalidOperationException("getPlayers() did not return an enumerable value");
+
+        foreach (var player in players)
+        {
+            if (player is not null)
+            {
+                yield return player;
+            }
+        }
+    }
+
+    private int ReadCurrentPlayerStack(G5ReflectionBindings bindings, object botGameState)
+    {
+        var playerToActIndex = ConvertToInt(bindings.GetPlayerToActIndMethod.Invoke(botGameState, null), "getPlayerToActInd result");
+        var players = GetPlayers(bindings, botGameState).ToList();
+        if (playerToActIndex < 0 || playerToActIndex >= players.Count)
+        {
+            throw new ServiceApiException(StatusCodes.Status400BadRequest, "player_to_act_mismatch", $"G5 reported invalid player-to-act index {playerToActIndex}");
+        }
+
+        return ConvertToInt(bindings.PlayerStackMember.Read(players[playerToActIndex]), "Player.Stack");
+    }
+
+    private string ReadStreet(G5ReflectionBindings bindings, object botGameState)
+    {
+        var street = Convert.ToString(bindings.GetStreetMethod.Invoke(botGameState, null), CultureInfo.InvariantCulture)?.Trim();
+        if (string.IsNullOrWhiteSpace(street))
+        {
+            throw new InvalidOperationException("getStreet() returned an empty value");
+        }
+
+        return ReplayHelpers.NormalizeStage(street);
     }
 
     private object WarmOpponentModeling(string runtimeDir, G5ReflectionBindings bindings, int recentHandsCount, RuntimeTableProfile profile)
@@ -597,7 +1020,7 @@ internal sealed class G5RuntimeHost
 
         foreach (var request in CreateStartupSelfCheckRequests())
         {
-            var response = AnalyzeCore(request);
+            var response = AnalyzeCore(request, captureSnapshots: false).Response;
             if (string.IsNullOrWhiteSpace(response.RawActionType))
             {
                 throw new InvalidOperationException("Startup self-check returned an empty raw action type");
@@ -609,18 +1032,24 @@ internal sealed class G5RuntimeHost
     {
         yield return new AnalyzeDecisionRequest
         {
-            HeroPlayerId = "hu_player_1",
-            DecisionSequence = 3,
+            HeroPlayerId = "hu_player_2",
+            DecisionSequence = 5,
             HandData = new HandData
             {
+                CommunityCards = new List<CardDto>
+                {
+                    new() { Rank = "A", Suit = "spades" },
+                    new() { Rank = "7", Suit = "clubs" },
+                    new() { Rank = "2", Suit = "diamonds" },
+                },
                 Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
                 DealerPlayerId = "hu_player_1",
                 SmallBlindPlayerId = "hu_player_1",
                 BigBlindPlayerId = "hu_player_2",
                 Players = new List<PlayerSnapshot>
                 {
-                    new() { PlayerId = "hu_player_1", Username = "HU1", SeatNumber = 1, HoleCards = new List<CardDto> { new() { Rank = "A", Suit = "spades" }, new() { Rank = "K", Suit = "diamonds" } } },
-                    new() { PlayerId = "hu_player_2", Username = "HU2", SeatNumber = 2 },
+                    new() { PlayerId = "hu_player_1", Username = "HU1", SeatNumber = 1 },
+                    new() { PlayerId = "hu_player_2", Username = "HU2", SeatNumber = 2, HoleCards = new List<CardDto> { new() { Rank = "A", Suit = "hearts" }, new() { Rank = "K", Suit = "diamonds" } } },
                 },
                 StartingStacks = new Dictionary<string, int>(StringComparer.Ordinal)
                 {
@@ -629,19 +1058,27 @@ internal sealed class G5RuntimeHost
                 },
                 ActionLog = new List<ActionLogEntry>
                 {
-                    new() { Sequence = 1, Stage = "preflop", PlayerId = "hu_player_1", Action = "small-blind", Source = "forced", RequestedAmount = 50, CommittedChips = 50, PotBefore = 0, ToCallBefore = 0 },
-                    new() { Sequence = 2, Stage = "preflop", PlayerId = "hu_player_2", Action = "big-blind", Source = "forced", RequestedAmount = 100, CommittedChips = 100, PotBefore = 50, ToCallBefore = 0 },
-                    new() { Sequence = 3, Stage = "preflop", PlayerId = "hu_player_1", Action = "call", Source = "player", RequestedAmount = 50, CommittedChips = 100, ToCallBefore = 50 },
+                    new() { Sequence = 1, Stage = "preflop", PlayerId = "hu_player_1", Action = "small-blind", Source = "forced", RequestedAmount = 50, CommittedChips = 50, PotBefore = 0, ToCallBefore = 0, PlayerBetBefore = 0, PlayerBetAfter = 50, PlayerStackBefore = 10000, PlayerStackAfter = 9950 },
+                    new() { Sequence = 2, Stage = "preflop", PlayerId = "hu_player_2", Action = "big-blind", Source = "forced", RequestedAmount = 100, CommittedChips = 100, PotBefore = 50, ToCallBefore = 0, PlayerBetBefore = 0, PlayerBetAfter = 100, PlayerStackBefore = 10000, PlayerStackAfter = 9900 },
+                    new() { Sequence = 3, Stage = "preflop", PlayerId = "hu_player_1", Action = "call", Source = "player", RequestedAmount = 50, CommittedChips = 50, PotBefore = 150, PotAfter = 200, ToCallBefore = 50, PlayerBetBefore = 50, PlayerBetAfter = 100, PlayerStackBefore = 9950, PlayerStackAfter = 9900 },
+                    new() { Sequence = 4, Stage = "preflop", PlayerId = "hu_player_2", Action = "check", Source = "player", PotBefore = 200, PotAfter = 200, ToCallBefore = 0, PlayerBetBefore = 100, PlayerBetAfter = 100, PlayerStackBefore = 9900, PlayerStackAfter = 9900 },
+                    new() { Sequence = 5, Stage = "flop", PlayerId = "hu_player_2", Action = "check", Source = "player", PotBefore = 200, PotAfter = 200, ToCallBefore = 0, PlayerBetBefore = 0, PlayerBetAfter = 0, PlayerStackBefore = 9900, PlayerStackAfter = 9900 },
                 },
             },
         };
 
         yield return new AnalyzeDecisionRequest
         {
-            HeroPlayerId = "player_4",
-            DecisionSequence = 3,
+            HeroPlayerId = "player_2",
+            DecisionSequence = 9,
             HandData = new HandData
             {
+                CommunityCards = new List<CardDto>
+                {
+                    new() { Rank = "Q", Suit = "hearts" },
+                    new() { Rank = "8", Suit = "clubs" },
+                    new() { Rank = "3", Suit = "spades" },
+                },
                 Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
                 DealerPlayerId = "player_1",
                 SmallBlindPlayerId = "player_2",
@@ -649,9 +1086,9 @@ internal sealed class G5RuntimeHost
                 Players = new List<PlayerSnapshot>
                 {
                     new() { PlayerId = "player_1", Username = "P1", SeatNumber = 1 },
-                    new() { PlayerId = "player_2", Username = "P2", SeatNumber = 2 },
+                    new() { PlayerId = "player_2", Username = "Hero", SeatNumber = 2, HoleCards = new List<CardDto> { new() { Rank = "A", Suit = "spades" }, new() { Rank = "K", Suit = "diamonds" } } },
                     new() { PlayerId = "player_3", Username = "P3", SeatNumber = 3 },
-                    new() { PlayerId = "player_4", Username = "P4", SeatNumber = 4, HoleCards = new List<CardDto> { new() { Rank = "A", Suit = "spades" }, new() { Rank = "K", Suit = "diamonds" } } },
+                    new() { PlayerId = "player_4", Username = "P4", SeatNumber = 4 },
                     new() { PlayerId = "player_5", Username = "P5", SeatNumber = 5 },
                     new() { PlayerId = "player_6", Username = "P6", SeatNumber = 6 },
                 },
@@ -666,9 +1103,15 @@ internal sealed class G5RuntimeHost
                 },
                 ActionLog = new List<ActionLogEntry>
                 {
-                    new() { Sequence = 1, Stage = "preflop", PlayerId = "player_2", Action = "small-blind", Source = "forced", RequestedAmount = 50, CommittedChips = 50, PotBefore = 0, ToCallBefore = 0 },
-                    new() { Sequence = 2, Stage = "preflop", PlayerId = "player_3", Action = "big-blind", Source = "forced", RequestedAmount = 100, CommittedChips = 100, PotBefore = 50, ToCallBefore = 0 },
-                    new() { Sequence = 3, Stage = "preflop", PlayerId = "player_4", Action = "raise", Source = "player", RequestedAmount = 300, CommittedChips = 400, ToCallBefore = 100 },
+                    new() { Sequence = 1, Stage = "preflop", PlayerId = "player_2", Action = "small-blind", Source = "forced", RequestedAmount = 50, CommittedChips = 50, PotBefore = 0, ToCallBefore = 0, PlayerBetBefore = 0, PlayerBetAfter = 50, PlayerStackBefore = 10000, PlayerStackAfter = 9950 },
+                    new() { Sequence = 2, Stage = "preflop", PlayerId = "player_3", Action = "big-blind", Source = "forced", RequestedAmount = 100, CommittedChips = 100, PotBefore = 50, ToCallBefore = 0, PlayerBetBefore = 0, PlayerBetAfter = 100, PlayerStackBefore = 10000, PlayerStackAfter = 9900 },
+                    new() { Sequence = 3, Stage = "preflop", PlayerId = "player_4", Action = "fold", Source = "player", PotBefore = 150, PotAfter = 150, ToCallBefore = 100, PlayerStackBefore = 10000, PlayerStackAfter = 10000 },
+                    new() { Sequence = 4, Stage = "preflop", PlayerId = "player_5", Action = "fold", Source = "player", PotBefore = 150, PotAfter = 150, ToCallBefore = 100, PlayerStackBefore = 10000, PlayerStackAfter = 10000 },
+                    new() { Sequence = 5, Stage = "preflop", PlayerId = "player_6", Action = "fold", Source = "player", PotBefore = 150, PotAfter = 150, ToCallBefore = 100, PlayerStackBefore = 10000, PlayerStackAfter = 10000 },
+                    new() { Sequence = 6, Stage = "preflop", PlayerId = "player_1", Action = "fold", Source = "player", PotBefore = 150, PotAfter = 150, ToCallBefore = 100, PlayerStackBefore = 10000, PlayerStackAfter = 10000 },
+                    new() { Sequence = 7, Stage = "preflop", PlayerId = "player_2", Action = "call", Source = "player", RequestedAmount = 50, CommittedChips = 50, PotBefore = 150, PotAfter = 200, ToCallBefore = 50, PlayerBetBefore = 50, PlayerBetAfter = 100, PlayerStackBefore = 9950, PlayerStackAfter = 9900 },
+                    new() { Sequence = 8, Stage = "preflop", PlayerId = "player_3", Action = "check", Source = "player", PotBefore = 200, PotAfter = 200, ToCallBefore = 0, PlayerBetBefore = 100, PlayerBetAfter = 100, PlayerStackBefore = 9900, PlayerStackAfter = 9900 },
+                    new() { Sequence = 9, Stage = "flop", PlayerId = "player_2", Action = "check", Source = "player", PotBefore = 200, PotAfter = 200, ToCallBefore = 0, PlayerBetBefore = 100, PlayerBetAfter = 100, PlayerStackBefore = 9900, PlayerStackAfter = 9900 },
                 },
             },
         };
@@ -1050,46 +1493,6 @@ internal sealed class G5RuntimeHost
         };
     }
 
-    private static string NormalizeActionName(string action)
-    {
-        return action.Trim().ToLowerInvariant();
-    }
-
-    private static string NormalizeStage(string stage)
-    {
-        return stage.Trim().ToLowerInvariant();
-    }
-
-    private static bool ShouldSkipForcedBlind(ActionLogEntry entry)
-    {
-        var action = NormalizeActionName(entry.Action);
-        return string.Equals(NormalizeStage(entry.Stage), "preflop", StringComparison.Ordinal)
-            && string.Equals(entry.Source?.Trim(), "forced", StringComparison.OrdinalIgnoreCase)
-            && (action == "small-blind" || action == "big-blind");
-    }
-
-    private static string ToG5Card(CardDto card)
-    {
-        var rank = (card.Rank ?? string.Empty).Trim().ToUpperInvariant();
-        rank = rank switch
-        {
-            "10" => "T",
-            "2" or "3" or "4" or "5" or "6" or "7" or "8" or "9" or "T" or "J" or "Q" or "K" or "A" => rank,
-            _ => throw new ServiceApiException(StatusCodes.Status400BadRequest, "invalid_card_rank", $"Unsupported card rank '{card.Rank}'"),
-        };
-
-        var suit = (card.Suit ?? string.Empty).Trim().ToLowerInvariant() switch
-        {
-            "clubs" => "c",
-            "diamonds" => "d",
-            "hearts" => "h",
-            "spades" => "s",
-            _ => throw new ServiceApiException(StatusCodes.Status400BadRequest, "invalid_card_suit", $"Unsupported card suit '{card.Suit}'"),
-        };
-
-        return $"{rank}{suit}";
-    }
-
     private static string? NormalizeAction(string rawActionType, int toCallBefore, List<string> warnings)
     {
         return rawActionType switch
@@ -1113,40 +1516,6 @@ internal sealed class G5RuntimeHost
             _ => null,
         };
     }
-
-    private sealed record PreparedReplayRequest(
-        PlayerSnapshot Hero,
-        int HeroIndex,
-        int ButtonIndex,
-        int BigBlindSize,
-        string[] PlayerNames,
-        int[] StackSizes,
-        IReadOnlyList<PlayerSnapshot> OrderedPlayers,
-        IReadOnlyDictionary<string, int> PlayerIdToIndex,
-        IReadOnlyList<ActionLogEntry> ReplayEntries,
-        ActionLogEntry TargetEntry,
-        string[] HeroCards,
-        List<string> Warnings,
-        RuntimeTableProfile Profile,
-        int SeatedPlayerCount,
-        string TargetStreet);
-
-    private sealed record TableProfileDefinition(
-        string Profile,
-        int PlayerCountMin,
-        int PlayerCountMax,
-        string TableType,
-        string OpponentStatsFile);
-
-    private sealed record RuntimeTableProfile(
-        string Profile,
-        int PlayerCountMin,
-        int PlayerCountMax,
-        string TableType,
-        string OpponentStatsFile,
-        object TableTypeEnumValue);
-
-    private sealed record RuntimeManifest(string BundleVersion, IReadOnlyList<TableProfileDefinition> TableProfiles);
 
     private sealed record InitializationState(string Stage, bool Ready, bool RuntimeLoaded, bool WarmModelReady, string? Error)
     {

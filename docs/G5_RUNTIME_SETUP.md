@@ -11,7 +11,7 @@ G5 is **not** run natively on macOS in this first step. The local workflow is:
 
 To build a local G5 runtime bundle from the pinned upstream source before installing it, see [G5_BUNDLE_BUILD.md](G5_BUNDLE_BUILD.md).
 
-To run the preflop-only G5 advisor service and the Learning Hub integration on top of the installed runtime, see [../g5-advisor-service/README.md](../g5-advisor-service/README.md).
+To run the full-street G5 advisor service and the Learning Hub integration on top of the installed runtime, see [../g5-advisor-service/README.md](../g5-advisor-service/README.md).
 
 ## Why This Exists
 
