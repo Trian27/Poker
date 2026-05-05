@@ -11,7 +11,7 @@ G5 is **not** run natively on macOS in this first step. The local workflow is:
 
 To build a local G5 runtime bundle from the pinned upstream source before installing it, see [G5_BUNDLE_BUILD.md](G5_BUNDLE_BUILD.md).
 
-To run the preflop-only standalone advisor service on top of the installed runtime, see [../g5-advisor-service/README.md](../g5-advisor-service/README.md).
+To run the preflop-only G5 advisor service and the Learning Hub integration on top of the installed runtime, see [../g5-advisor-service/README.md](../g5-advisor-service/README.md).
 
 ## Why This Exists
 
@@ -71,6 +71,7 @@ Future container mount point:
 The installer expects a prebuilt `linux-x64` archive that contains an app root with:
 
 - `bundle-manifest.json`
+- `full_stats_list_hu.bin`
 - `full_stats_list_6max.bin`
 - `PreFlopEquities.txt`
 - `PreFlopCharts/`
@@ -88,6 +89,23 @@ At minimum, the manifest must include:
   "bundle_version": "2026.05.03",
   "built_at_utc": "2026-05-03T20:15:00Z",
   "entrypoint_hint": "G5.Runtime.dll",
+  "table_profile_schema_version": 1,
+  "table_profiles": [
+    {
+      "profile": "heads_up",
+      "player_count_min": 2,
+      "player_count_max": 2,
+      "table_type": "HeadsUp",
+      "opponent_stats_file": "full_stats_list_hu.bin"
+    },
+    {
+      "profile": "six_max",
+      "player_count_min": 3,
+      "player_count_max": 6,
+      "table_type": "SixMax",
+      "opponent_stats_file": "full_stats_list_6max.bin"
+    }
+  ],
   "managed_assemblies": [
     "G5.Runtime.dll"
   ],
@@ -97,6 +115,7 @@ At minimum, the manifest must include:
   "dotnet_target": "net8.0",
   "required_files": [
     "bundle-manifest.json",
+    "full_stats_list_hu.bin",
     "full_stats_list_6max.bin",
     "PreFlopEquities.txt",
     "PreFlopCharts/"
@@ -105,6 +124,10 @@ At minimum, the manifest must include:
 ```
 
 The manifest is the source of truth for verification and smoke-test validation.
+
+This is an intentional contract break from the older single-profile runtime. After this PR:
+- old single-profile bundles fail `verify`
+- developers must rebuild and reinstall the G5 bundle before using the advisor service
 
 ### `metadata/install.json`
 
@@ -175,6 +198,11 @@ What `verify` checks:
 - `bundle-manifest.json` exists and is well-formed
 - manifest declares `engine == g5`
 - manifest declares `platform == linux-x64`
+- manifest declares `table_profile_schema_version == 1`
+- manifest declares exactly two `table_profiles`:
+  - `heads_up` covering `2..2`
+  - `six_max` covering `3..6`
+- each `table_profiles[].opponent_stats_file` is safe, relative, and present in `required_files`
 - all manifest-declared `required_files` entries exist
 - all manifest-declared `managed_assemblies` entries exist
 - all manifest-declared `native_libraries` entries exist
@@ -211,31 +239,39 @@ What `probe` does:
 - runs a tiny `.NET` console probe against the copied runtime
 
 Why the writable copies are required:
-- upstream G5 opens `full_stats_list_6max.bin` in a way that fails on a read-only runtime mount
+- upstream G5 opens its opponent-model stats files in a way that fails on a read-only runtime mount
 - `dotnet run` needs a writable project directory for build outputs
 
 What `probe` validates:
 - `bundle-manifest.json` is present and readable
-- `G5Gym.dll` loads from the installed runtime
+- dual-profile manifest metadata is valid
+- `G5.Logic.dll` loads from the installed runtime
 - managed dependencies resolve from the installed runtime directory
 - native dependencies resolve inside Linux Docker
-- `PythonAPI(6, 15)` constructs successfully
-- a minimal six-max preflop sequence reaches `calculateHeroAction`
+- direct `G5.Logic` execution succeeds for both profiles:
+  - heads-up using `full_stats_list_hu.bin` and `TableType.HeadsUp`
+  - six-max using `full_stats_list_6max.bin` and `TableType.SixMax`
+- each profile reaches a minimal preflop `calculateHeroAction` path
 
 Expected probe stages:
 - `manifest check`
-- `G5Gym.dll load`
+- `G5 runtime assembly load`
 - `dependency resolution`
-- `PythonAPI construction`
-- `createGame`
-- `startNewHand`
-- `dealHoleCards`
-- `calculateHeroAction`
+- `heads_up direct G5.Logic warm`
+- `heads_up BotGameState construction`
+- `heads_up startNewHand`
+- `heads_up dealHoleCards`
+- `heads_up calculateHeroAction`
+- `six_max direct G5.Logic warm`
+- `six_max BotGameState construction`
+- `six_max startNewHand`
+- `six_max dealHoleCards`
+- `six_max calculateHeroAction`
 
 Expected success output looks like:
 
 ```text
-probe success: actionType=... byAmount=... checkCallEV=... betRaiseEV=... timeSpentSeconds=... message=...
+probe success: heads_up.actionType=... ... six_max.actionType=... ...
 ```
 
 `probe` is stronger than `smoke-test`:
@@ -254,6 +290,9 @@ The service:
 - mounts `.runtime/engines/g5/current/app` read-only at `/opt/g5-bundle`
 - copies the runtime into writable container storage
 - dynamically loads G5 from the installed bundle
+- warms both G5 table profiles from manifest metadata:
+  - `heads_up`
+  - `six_max`
 - exposes:
   - `GET /health`
   - `POST /api/v1/advisor/g5/analyze-decision`

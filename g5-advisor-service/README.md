@@ -5,14 +5,19 @@ This service exposes the installed G5 runtime bundle as an internal HTTP advisor
 ## Current Scope
 
 v1 is intentionally narrow:
-- standalone service only
 - preflop-only hero decision analysis
-- no `poker-api`, UI, or bot wiring yet
 - dynamic loading from the installed runtime bundle
+- manifest-driven table-profile routing
+
+The service is already wired behind the Learning Hub flow through `poker-api`, but it remains preflop-only in this PR.
 
 ## Runtime Requirement
 
 The service expects the installed bundle to be mounted read-only at `/opt/g5-bundle` and copies it into writable container storage before loading G5.
+
+The installed runtime must contain both table profiles:
+- `heads_up` using `full_stats_list_hu.bin`
+- `six_max` using `full_stats_list_6max.bin`
 
 Default local startup:
 
@@ -36,8 +41,12 @@ Readiness endpoint. Returns `200` only after:
 - manifest validation
 - reflection binding
 - native resolution
-- warm `OpponentModeling` init
-- startup preflop self-check
+- warm `OpponentModeling` init for both profiles
+- startup preflop self-check for both profiles
+
+Health also exposes per-profile readiness metadata:
+- `profiles.heads_up`
+- `profiles.six_max`
 
 ### `POST /api/v1/advisor/g5/analyze-decision`
 
@@ -126,5 +135,8 @@ Possible `warnings` values:
 ## Important limitations
 
 - v1 only supports target actions where `stage == preflop`
+- profile selection is based on validated seated/dealt player count, not active players:
+  - `2` players => `heads_up`
+  - `3..6` players => `six_max`
 - amount semantics are still experimental pending replay-validation tests
 - the service is an infrastructure/runtime integration step, not a strategy-quality guarantee

@@ -190,7 +190,10 @@ internal sealed class AnalyzeDecisionDebug
 {
     public int ReplayedActionCount { get; init; }
     public string TargetStreet { get; init; } = string.Empty;
+    public string TableProfile { get; init; } = string.Empty;
+    public int SeatedPlayerCount { get; init; }
     public int ActivePlayers { get; init; }
+    public int ActiveNonAllInPlayers { get; init; }
     public int G5PlayerToActIndex { get; init; }
 }
 
@@ -204,6 +207,16 @@ internal sealed class HealthResponse
     public string? BundleVersion { get; init; }
     public bool RuntimeLoaded { get; init; }
     public bool WarmModelReady { get; init; }
+    public Dictionary<string, HealthProfileStatus> Profiles { get; init; } = new(StringComparer.Ordinal);
+}
+
+internal sealed class HealthProfileStatus
+{
+    public bool Ready { get; init; }
+    public int PlayerCountMin { get; init; }
+    public int PlayerCountMax { get; init; }
+    public string TableType { get; init; } = string.Empty;
+    public string OpponentStatsFile { get; init; } = string.Empty;
 }
 
 internal sealed class ErrorResponse

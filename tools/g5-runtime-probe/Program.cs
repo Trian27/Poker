@@ -33,8 +33,7 @@ internal static class Program
         var runtimeDir = ParseRuntimeDir(args);
 
         PrintStage("manifest check");
-        var manifestPath = Path.Combine(runtimeDir, "bundle-manifest.json");
-        ValidateManifest(manifestPath);
+        var manifest = LoadManifest(runtimeDir);
 
         var g5GymPath = Path.Combine(runtimeDir, "G5Gym.dll");
         if (!File.Exists(g5GymPath))
@@ -45,119 +44,116 @@ internal static class Program
         var loadContext = new RuntimeLoadContext(g5GymPath, runtimeDir);
         try
         {
-            PrintStage("G5Gym.dll load");
-            var g5GymAssembly = loadContext.LoadFromAssemblyPath(g5GymPath);
+            PrintStage("G5 runtime assembly load");
+            _ = loadContext.LoadFromAssemblyPath(g5GymPath);
 
             PrintStage("dependency resolution");
-            _ = loadContext.LoadFromAssemblyName(new AssemblyName("G5.Logic"));
+            var logicAssembly = loadContext.LoadFromAssemblyName(new AssemblyName("G5.Logic"));
+            var bindings = ProbeBindings.Create(logicAssembly);
 
-            var pythonApiType = g5GymAssembly.GetType("G5Gym.PythonAPI", throwOnError: true)
-                ?? throw new ProbeException("Failed to resolve type G5Gym.PythonAPI");
+            var results = new List<ProfileProbeResult>();
+            foreach (var profile in manifest.TableProfiles.OrderBy(profile => profile.PlayerCountMin))
+            {
+                results.Add(RunProfileProbe(bindings, runtimeDir, profile));
+            }
 
-            var constructor = FindConstructorOrThrow(pythonApiType, typeof(int), typeof(int));
+            Console.WriteLine(
+                "probe success: " +
+                string.Join(
+                    " ",
+                    results.Select(result =>
+                        $"{result.Profile}.actionType={FormatValue(result.ActionType)} " +
+                        $"{result.Profile}.byAmount={FormatValue(result.ByAmount)} " +
+                        $"{result.Profile}.checkCallEV={FormatValue(result.CheckCallEv)} " +
+                        $"{result.Profile}.betRaiseEV={FormatValue(result.BetRaiseEv)} " +
+                        $"{result.Profile}.timeSpentSeconds={FormatValue(result.TimeSpentSeconds)} " +
+                        $"{result.Profile}.message={FormatValue(result.Message)}")));
+        }
+        finally
+        {
+            loadContext.Unload();
+        }
+    }
 
-            PrintStage("PythonAPI construction");
-            var pythonApi = InvokeConstructor(constructor, 6, 15);
+    private static ProfileProbeResult RunProfileProbe(ProbeBindings bindings, string runtimeDir, TableProfileManifest profile)
+    {
+        PrintStage($"{profile.Profile} direct G5.Logic warm");
+        var opponentModeling = CreateOpponentModeling(bindings, runtimeDir, profile);
+        try
+        {
+            var modelingEstimator = bindings.ModelingEstimatorConstructor.Invoke(new[]
+            {
+                opponentModeling,
+                bindings.PokerClientPokerKingValue,
+            });
             try
             {
-                var createGameMethod = FindMethodOrThrow(
-                    pythonApiType,
-                    "createGame",
-                    typeof(string),
-                    typeof(string[]),
-                    typeof(int[]),
-                    typeof(int),
-                    typeof(int),
-                    typeof(int),
-                    typeof(bool),
-                    typeof(int));
-
-                var startNewHandMethod = FindMethodOrThrow(
-                    pythonApiType,
-                    "startNewHand",
-                    typeof(string),
-                    typeof(int),
-                    typeof(List<int>));
-
-                var dealHoleCardsMethod = FindMethodOrThrow(
-                    pythonApiType,
-                    "dealHoleCards",
-                    typeof(string),
-                    typeof(string),
-                    typeof(string));
-
-                var calculateHeroActionMethod = FindMethodOrThrow(
-                    pythonApiType,
-                    "calculateHeroAction",
-                    typeof(string));
-
-                var playerNames = new[] { "P1", "P2", "P3", "P4", "P5", "P6" };
-                var stackSizes = new[] { 10000, 10000, 10000, 10000, 10000, 10000 };
-                const string gameName = "probe-game";
-
-                PrintStage("createGame");
-                InvokeMethod(
-                    pythonApi,
-                    createGameMethod,
-                    "createGame",
-                    gameName,
-                    playerNames,
-                    stackSizes,
-                    3,
-                    0,
-                    100,
-                    false,
-                    4);
-
-                PrintStage("startNewHand");
-                InvokeMethod(
-                    pythonApi,
-                    startNewHandMethod,
-                    "startNewHand",
-                    gameName,
-                    0,
-                    new List<int>());
-
-                PrintStage("dealHoleCards");
-                InvokeMethod(
-                    pythonApi,
-                    dealHoleCardsMethod,
-                    "dealHoleCards",
-                    gameName,
-                    "As",
-                    "Kd");
-
-                PrintStage("calculateHeroAction");
-                var result = InvokeMethod(
-                    pythonApi,
-                    calculateHeroActionMethod,
-                    "calculateHeroAction",
-                    gameName);
-
-                if (result is null)
+                var scenario = profile.Profile switch
                 {
-                    throw new ProbeException("calculateHeroAction returned null");
+                    "heads_up" => CreateHeadsUpScenario(profile, bindings),
+                    "six_max" => CreateSixMaxScenario(profile, bindings),
+                    _ => throw new ProbeException($"Unsupported table profile '{profile.Profile}' in manifest"),
+                };
+
+                PrintStage($"{profile.Profile} BotGameState construction");
+                var botGameState = bindings.BotGameStateConstructor.Invoke(new object?[]
+                {
+                    scenario.PlayerNames,
+                    scenario.StackSizes,
+                    scenario.HeroIndex,
+                    scenario.ButtonIndex,
+                    scenario.BigBlindSize,
+                    bindings.PokerClientPokerKingValue,
+                    ResolveTableTypeValue(bindings, profile.TableType),
+                    modelingEstimator,
+                    false,
+                    4,
+                });
+                try
+                {
+                    PrintStage($"{profile.Profile} startNewHand");
+                    bindings.StartNewHandMethod.Invoke(botGameState, new object?[] { new List<int>() });
+
+                    PrintStage($"{profile.Profile} dealHoleCards");
+                    bindings.DealHoleCardsMethod.Invoke(
+                        botGameState,
+                        new[]
+                        {
+                            bindings.CardStringConstructor.Invoke(new object[] { scenario.HeroCards[0] }),
+                            bindings.CardStringConstructor.Invoke(new object[] { scenario.HeroCards[1] }),
+                        });
+
+                    PrintStage($"{profile.Profile} calculateHeroAction");
+                    var rawDecision = bindings.CalculateHeroActionMethod.Invoke(botGameState, null)
+                        ?? throw new ProbeException($"{profile.Profile} calculateHeroAction returned null");
+
+                    var actionType = bindings.DecisionActionTypeMember.Read(rawDecision);
+                    var byAmount = bindings.DecisionByAmountMember.Read(rawDecision);
+                    var checkCallEv = bindings.DecisionCheckCallEvMember.Read(rawDecision);
+                    var betRaiseEv = bindings.DecisionBetRaiseEvMember.Read(rawDecision);
+                    var timeSpentSeconds = bindings.DecisionTimeSpentSecondsMember.Read(rawDecision);
+                    var message = bindings.DecisionMessageMember.Read(rawDecision);
+
+                    return new ProfileProbeResult(
+                        profile.Profile,
+                        actionType,
+                        byAmount,
+                        checkCallEv,
+                        betRaiseEv,
+                        timeSpentSeconds,
+                        message);
                 }
-
-                var actionType = ReadRequiredProperty(result, "actionType");
-                var byAmount = ReadRequiredProperty(result, "byAmount");
-                var checkCallEv = ReadRequiredProperty(result, "checkCallEV");
-                var betRaiseEv = ReadRequiredProperty(result, "betRaiseEV");
-                var timeSpentSeconds = ReadRequiredProperty(result, "timeSpentSeconds");
-                var message = ReadRequiredProperty(result, "message");
-
-                Console.WriteLine(
-                    "probe success: " +
-                    $"actionType={FormatValue(actionType)} " +
-                    $"byAmount={FormatValue(byAmount)} " +
-                    $"checkCallEV={FormatValue(checkCallEv)} " +
-                    $"betRaiseEV={FormatValue(betRaiseEv)} " +
-                    $"timeSpentSeconds={FormatValue(timeSpentSeconds)} " +
-                    $"message={FormatValue(message)}");
+                finally
+                {
+                    if (botGameState is IDisposable disposable)
+                    {
+                        disposable.Dispose();
+                    }
+                }
             }
             finally
             {
-                if (pythonApi is IDisposable disposable)
+                if (modelingEstimator is IDisposable disposable)
                 {
                     disposable.Dispose();
                 }
@@ -165,8 +161,210 @@ internal static class Program
         }
         finally
         {
-            loadContext.Unload();
+            if (opponentModeling is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
         }
+    }
+
+    private static object CreateOpponentModeling(ProbeBindings bindings, string runtimeDir, TableProfileManifest profile)
+    {
+        var options = bindings.OpponentModelingOptionsConstructor.Invoke(Array.Empty<object>());
+        bindings.RecentHandsCountField.SetValue(options, 15);
+
+        var statsFile = Path.Combine(runtimeDir, profile.OpponentStatsFile.Replace('/', Path.DirectorySeparatorChar));
+        if (!File.Exists(statsFile))
+        {
+            throw new ProbeException($"Missing stats file for profile '{profile.Profile}': {statsFile}");
+        }
+
+        return bindings.OpponentModelingConstructor.Invoke(new object?[]
+        {
+            statsFile,
+            ResolveTableTypeValue(bindings, profile.TableType),
+            options,
+        });
+    }
+
+    private static object ResolveTableTypeValue(ProbeBindings bindings, string tableTypeName)
+    {
+        return tableTypeName switch
+        {
+            "HeadsUp" => bindings.TableTypeHeadsUpValue,
+            "SixMax" => bindings.TableTypeSixMaxValue,
+            _ => throw new ProbeException($"Unsupported table_type '{tableTypeName}' in manifest"),
+        };
+    }
+
+    private static ProbeScenario CreateHeadsUpScenario(TableProfileManifest profile, ProbeBindings bindings)
+    {
+        if (profile.PlayerCountMin != 2 || profile.PlayerCountMax != 2)
+        {
+            throw new ProbeException("heads_up manifest profile must cover exactly 2..2");
+        }
+
+        return new ProbeScenario(
+            PlayerNames: new[] { "HU1", "HU2" },
+            StackSizes: new[] { 10000, 10000 },
+            HeroIndex: 0,
+            ButtonIndex: 0,
+            BigBlindSize: 100,
+            HeroCards: new[] { "As", "Kd" });
+    }
+
+    private static ProbeScenario CreateSixMaxScenario(TableProfileManifest profile, ProbeBindings bindings)
+    {
+        if (profile.PlayerCountMin != 3 || profile.PlayerCountMax != 6)
+        {
+            throw new ProbeException("six_max manifest profile must cover exactly 3..6");
+        }
+
+        return new ProbeScenario(
+            PlayerNames: new[] { "P1", "P2", "P3", "P4", "P5", "P6" },
+            StackSizes: new[] { 10000, 10000, 10000, 10000, 10000, 10000 },
+            HeroIndex: 3,
+            ButtonIndex: 0,
+            BigBlindSize: 100,
+            HeroCards: new[] { "As", "Kd" });
+    }
+
+    private static RuntimeManifest LoadManifest(string runtimeDir)
+    {
+        var manifestPath = Path.Combine(runtimeDir, "bundle-manifest.json");
+        if (!File.Exists(manifestPath))
+        {
+            throw new ProbeException($"Missing bundle-manifest.json: {manifestPath}");
+        }
+
+        using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new ProbeException("bundle-manifest.json must contain a JSON object");
+        }
+
+        var engine = ReadRequiredString(root, "engine");
+        if (!string.Equals(engine, "g5", StringComparison.Ordinal))
+        {
+            throw new ProbeException($"bundle-manifest.json engine must be 'g5', got '{engine}'");
+        }
+
+        var platform = ReadRequiredString(root, "platform");
+        if (!string.Equals(platform, "linux-x64", StringComparison.Ordinal))
+        {
+            throw new ProbeException($"bundle-manifest.json platform must be 'linux-x64', got '{platform}'");
+        }
+
+        var requiredFiles = ReadRequiredStringArray(root, "required_files");
+        if (!requiredFiles.Contains("full_stats_list_hu.bin", StringComparer.Ordinal) || !requiredFiles.Contains("full_stats_list_6max.bin", StringComparer.Ordinal))
+        {
+            throw new ProbeException("bundle-manifest.json required_files must include both full_stats_list_hu.bin and full_stats_list_6max.bin");
+        }
+
+        if (!root.TryGetProperty("table_profile_schema_version", out var schemaVersionProperty) || schemaVersionProperty.ValueKind != JsonValueKind.Number || !schemaVersionProperty.TryGetInt32(out var schemaVersion) || schemaVersion != 1)
+        {
+            throw new ProbeException("bundle-manifest.json table_profile_schema_version must be integer 1");
+        }
+
+        if (!root.TryGetProperty("table_profiles", out var tableProfilesProperty) || tableProfilesProperty.ValueKind != JsonValueKind.Array || tableProfilesProperty.GetArrayLength() == 0)
+        {
+            throw new ProbeException("bundle-manifest.json table_profiles must be a non-empty array");
+        }
+
+        var tableProfiles = new List<TableProfileManifest>();
+        var seenProfiles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var profileElement in tableProfilesProperty.EnumerateArray())
+        {
+            if (profileElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new ProbeException("bundle-manifest.json table_profiles entries must be objects");
+            }
+
+            var profile = ReadRequiredString(profileElement, "profile");
+            if (!seenProfiles.Add(profile))
+            {
+                throw new ProbeException($"bundle-manifest.json contains duplicate table profile '{profile}'");
+            }
+
+            var playerCountMin = ReadRequiredInt(profileElement, "player_count_min");
+            var playerCountMax = ReadRequiredInt(profileElement, "player_count_max");
+            var tableType = ReadRequiredString(profileElement, "table_type");
+            var opponentStatsFile = ReadRequiredString(profileElement, "opponent_stats_file");
+
+            if (!requiredFiles.Contains(opponentStatsFile, StringComparer.Ordinal))
+            {
+                throw new ProbeException($"bundle-manifest.json table profile '{profile}' references stats file not present in required_files: {opponentStatsFile}");
+            }
+
+            var statsPath = Path.Combine(runtimeDir, opponentStatsFile.Replace('/', Path.DirectorySeparatorChar));
+            if (!File.Exists(statsPath))
+            {
+                throw new ProbeException($"bundle-manifest.json table profile '{profile}' stats file is missing: {opponentStatsFile}");
+            }
+
+            tableProfiles.Add(new TableProfileManifest(profile, playerCountMin, playerCountMax, tableType, opponentStatsFile));
+        }
+
+        if (tableProfiles.Count != 2 || !seenProfiles.SetEquals(new[] { "heads_up", "six_max" }))
+        {
+            throw new ProbeException("bundle-manifest.json table_profiles must include exactly heads_up and six_max");
+        }
+
+        return new RuntimeManifest(tableProfiles.OrderBy(profile => profile.PlayerCountMin).ToList());
+    }
+
+    private static string[] ReadRequiredStringArray(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.Array || property.GetArrayLength() == 0)
+        {
+            throw new ProbeException($"bundle-manifest.json field '{propertyName}' must be a non-empty array");
+        }
+
+        var values = new List<string>();
+        foreach (var item in property.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String)
+            {
+                throw new ProbeException($"bundle-manifest.json field '{propertyName}' entries must be strings");
+            }
+
+            var value = item.GetString()?.Trim();
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new ProbeException($"bundle-manifest.json field '{propertyName}' must not contain empty strings");
+            }
+
+            values.Add(value);
+        }
+
+        return values.ToArray();
+    }
+
+    private static string ReadRequiredString(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.String)
+        {
+            throw new ProbeException($"bundle-manifest.json missing required string field '{propertyName}'");
+        }
+
+        var value = property.GetString();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            throw new ProbeException($"bundle-manifest.json field '{propertyName}' must not be empty");
+        }
+
+        return value.Trim();
+    }
+
+    private static int ReadRequiredInt(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.Number || !property.TryGetInt32(out var value))
+        {
+            throw new ProbeException($"bundle-manifest.json missing required integer field '{propertyName}'");
+        }
+
+        return value;
     }
 
     private static string ParseRuntimeDir(string[] args)
@@ -191,55 +389,224 @@ internal static class Program
         throw new ProbeException("Usage: dotnet run --project tools/g5-runtime-probe -- --runtime-dir <path>");
     }
 
-    private static void ValidateManifest(string manifestPath)
-    {
-        if (!File.Exists(manifestPath))
-        {
-            throw new ProbeException($"Missing bundle-manifest.json: {manifestPath}");
-        }
-
-        using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
-        var root = document.RootElement;
-        if (root.ValueKind != JsonValueKind.Object)
-        {
-            throw new ProbeException("bundle-manifest.json must contain a JSON object");
-        }
-
-        var engine = ReadRequiredString(root, "engine");
-        if (!string.Equals(engine, "g5", StringComparison.Ordinal))
-        {
-            throw new ProbeException($"bundle-manifest.json engine must be 'g5', got '{engine}'");
-        }
-
-        var platform = ReadRequiredString(root, "platform");
-        if (!string.Equals(platform, "linux-x64", StringComparison.Ordinal))
-        {
-            throw new ProbeException($"bundle-manifest.json platform must be 'linux-x64', got '{platform}'");
-        }
-    }
-
-    private static string ReadRequiredString(JsonElement root, string propertyName)
-    {
-        if (!root.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.String)
-        {
-            throw new ProbeException($"bundle-manifest.json missing required string field '{propertyName}'");
-        }
-
-        var value = property.GetString();
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            throw new ProbeException($"bundle-manifest.json field '{propertyName}' must not be empty");
-        }
-
-        return value.Trim();
-    }
-
     private static void PrintStage(string stageName)
     {
         Console.WriteLine($"stage: {stageName}");
     }
 
-    private static ConstructorInfo FindConstructorOrThrow(Type type, params Type[] parameterTypes)
+    private static string FormatValue(object? value)
+    {
+        return value switch
+        {
+            null => "null",
+            string text => text.Replace('\n', ' ').Replace('\r', ' ').Trim(),
+            _ => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? value.ToString() ?? "null",
+        };
+    }
+
+    private static string DescribeException(Exception exception)
+    {
+        return $"{exception.GetType().FullName}: {exception.Message}";
+    }
+
+    private sealed record RuntimeManifest(IReadOnlyList<TableProfileManifest> TableProfiles);
+
+    private sealed record TableProfileManifest(
+        string Profile,
+        int PlayerCountMin,
+        int PlayerCountMax,
+        string TableType,
+        string OpponentStatsFile);
+
+    private sealed record ProbeScenario(
+        string[] PlayerNames,
+        int[] StackSizes,
+        int HeroIndex,
+        int ButtonIndex,
+        int BigBlindSize,
+        string[] HeroCards);
+
+    private sealed record ProfileProbeResult(
+        string Profile,
+        object? ActionType,
+        object? ByAmount,
+        object? CheckCallEv,
+        object? BetRaiseEv,
+        object? TimeSpentSeconds,
+        object? Message);
+}
+
+internal sealed class ProbeBindings
+{
+    public Type OpponentModelingOptionsType { get; }
+    public Type OpponentModelingType { get; }
+    public Type ModelingEstimatorType { get; }
+    public Type IActionEstimatorType { get; }
+    public Type BotGameStateType { get; }
+    public Type CardType { get; }
+    public Type TableTypeType { get; }
+    public Type PokerClientType { get; }
+
+    public ConstructorInfo OpponentModelingOptionsConstructor { get; }
+    public ConstructorInfo OpponentModelingConstructor { get; }
+    public ConstructorInfo ModelingEstimatorConstructor { get; }
+    public ConstructorInfo BotGameStateConstructor { get; }
+    public ConstructorInfo CardStringConstructor { get; }
+
+    public FieldInfo RecentHandsCountField { get; }
+
+    public MethodInfo StartNewHandMethod { get; }
+    public MethodInfo DealHoleCardsMethod { get; }
+    public MethodInfo CalculateHeroActionMethod { get; }
+
+    public BoundMember DecisionActionTypeMember { get; }
+    public BoundMember DecisionByAmountMember { get; }
+    public BoundMember DecisionCheckCallEvMember { get; }
+    public BoundMember DecisionBetRaiseEvMember { get; }
+    public BoundMember DecisionTimeSpentSecondsMember { get; }
+    public BoundMember DecisionMessageMember { get; }
+
+    public object TableTypeHeadsUpValue { get; }
+    public object TableTypeSixMaxValue { get; }
+    public object PokerClientPokerKingValue { get; }
+
+    private ProbeBindings(
+        Type opponentModelingOptionsType,
+        Type opponentModelingType,
+        Type modelingEstimatorType,
+        Type iActionEstimatorType,
+        Type botGameStateType,
+        Type cardType,
+        Type tableTypeType,
+        Type pokerClientType,
+        ConstructorInfo opponentModelingOptionsConstructor,
+        ConstructorInfo opponentModelingConstructor,
+        ConstructorInfo modelingEstimatorConstructor,
+        ConstructorInfo botGameStateConstructor,
+        ConstructorInfo cardStringConstructor,
+        FieldInfo recentHandsCountField,
+        MethodInfo startNewHandMethod,
+        MethodInfo dealHoleCardsMethod,
+        MethodInfo calculateHeroActionMethod,
+        BoundMember decisionActionTypeMember,
+        BoundMember decisionByAmountMember,
+        BoundMember decisionCheckCallEvMember,
+        BoundMember decisionBetRaiseEvMember,
+        BoundMember decisionTimeSpentSecondsMember,
+        BoundMember decisionMessageMember,
+        object tableTypeHeadsUpValue,
+        object tableTypeSixMaxValue,
+        object pokerClientPokerKingValue)
+    {
+        OpponentModelingOptionsType = opponentModelingOptionsType;
+        OpponentModelingType = opponentModelingType;
+        ModelingEstimatorType = modelingEstimatorType;
+        IActionEstimatorType = iActionEstimatorType;
+        BotGameStateType = botGameStateType;
+        CardType = cardType;
+        TableTypeType = tableTypeType;
+        PokerClientType = pokerClientType;
+        OpponentModelingOptionsConstructor = opponentModelingOptionsConstructor;
+        OpponentModelingConstructor = opponentModelingConstructor;
+        ModelingEstimatorConstructor = modelingEstimatorConstructor;
+        BotGameStateConstructor = botGameStateConstructor;
+        CardStringConstructor = cardStringConstructor;
+        RecentHandsCountField = recentHandsCountField;
+        StartNewHandMethod = startNewHandMethod;
+        DealHoleCardsMethod = dealHoleCardsMethod;
+        CalculateHeroActionMethod = calculateHeroActionMethod;
+        DecisionActionTypeMember = decisionActionTypeMember;
+        DecisionByAmountMember = decisionByAmountMember;
+        DecisionCheckCallEvMember = decisionCheckCallEvMember;
+        DecisionBetRaiseEvMember = decisionBetRaiseEvMember;
+        DecisionTimeSpentSecondsMember = decisionTimeSpentSecondsMember;
+        DecisionMessageMember = decisionMessageMember;
+        TableTypeHeadsUpValue = tableTypeHeadsUpValue;
+        TableTypeSixMaxValue = tableTypeSixMaxValue;
+        PokerClientPokerKingValue = pokerClientPokerKingValue;
+    }
+
+    public static ProbeBindings Create(Assembly logicAssembly)
+    {
+        var opponentModelingOptionsType = GetTypeOrThrow(logicAssembly, "G5.Logic.OpponentModeling+Options");
+        var opponentModelingType = GetTypeOrThrow(logicAssembly, "G5.Logic.OpponentModeling");
+        var modelingEstimatorType = GetTypeOrThrow(logicAssembly, "G5.Logic.Estimators.ModelingEstimator");
+        var iActionEstimatorType = GetTypeOrThrow(logicAssembly, "G5.Logic.Estimators.IActionEstimator");
+        var botGameStateType = GetTypeOrThrow(logicAssembly, "G5.Logic.BotGameState");
+        var cardType = GetTypeOrThrow(logicAssembly, "G5.Logic.Card");
+        var tableTypeType = GetTypeOrThrow(logicAssembly, "G5.Logic.TableType");
+        var pokerClientType = GetTypeOrThrow(logicAssembly, "G5.Logic.PokerClient");
+
+        var opponentModelingOptionsConstructor = GetConstructorOrThrow(opponentModelingOptionsType, Type.EmptyTypes);
+        var recentHandsCountField = GetFieldOrThrow(opponentModelingOptionsType, "recentHandsCount");
+        var opponentModelingConstructor = GetConstructorOrThrow(opponentModelingType, typeof(string), tableTypeType, opponentModelingOptionsType);
+        var modelingEstimatorConstructor = GetConstructorOrThrow(modelingEstimatorType, opponentModelingType, pokerClientType);
+        var botGameStateConstructor = GetConstructorOrThrow(
+            botGameStateType,
+            typeof(string[]),
+            typeof(int[]),
+            typeof(int),
+            typeof(int),
+            typeof(int),
+            pokerClientType,
+            tableTypeType,
+            iActionEstimatorType,
+            typeof(bool),
+            typeof(int));
+        var cardStringConstructor = GetConstructorOrThrow(cardType, typeof(string));
+
+        var startNewHandMethod = GetMethodOrThrow(botGameStateType, "startNewHand", typeof(List<int>));
+        var dealHoleCardsMethod = GetMethodOrThrow(botGameStateType, "dealHoleCards", cardType, cardType);
+        var calculateHeroActionMethod = GetMethodOrThrow(botGameStateType, "calculateHeroAction", Type.EmptyTypes);
+
+        var decisionType = calculateHeroActionMethod.ReturnType;
+        var decisionActionTypeMember = BoundMember.Create(decisionType, "actionType");
+        var decisionByAmountMember = BoundMember.Create(decisionType, "byAmount");
+        var decisionCheckCallEvMember = BoundMember.Create(decisionType, "checkCallEV");
+        var decisionBetRaiseEvMember = BoundMember.Create(decisionType, "betRaiseEV");
+        var decisionTimeSpentSecondsMember = BoundMember.Create(decisionType, "timeSpentSeconds");
+        var decisionMessageMember = BoundMember.Create(decisionType, "message");
+
+        var tableTypeHeadsUpValue = GetEnumValueOrThrow(tableTypeType, "HeadsUp");
+        var tableTypeSixMaxValue = GetEnumValueOrThrow(tableTypeType, "SixMax");
+        var pokerClientPokerKingValue = GetEnumValueOrThrow(pokerClientType, "PokerKing");
+
+        return new ProbeBindings(
+            opponentModelingOptionsType,
+            opponentModelingType,
+            modelingEstimatorType,
+            iActionEstimatorType,
+            botGameStateType,
+            cardType,
+            tableTypeType,
+            pokerClientType,
+            opponentModelingOptionsConstructor,
+            opponentModelingConstructor,
+            modelingEstimatorConstructor,
+            botGameStateConstructor,
+            cardStringConstructor,
+            recentHandsCountField,
+            startNewHandMethod,
+            dealHoleCardsMethod,
+            calculateHeroActionMethod,
+            decisionActionTypeMember,
+            decisionByAmountMember,
+            decisionCheckCallEvMember,
+            decisionBetRaiseEvMember,
+            decisionTimeSpentSecondsMember,
+            decisionMessageMember,
+            tableTypeHeadsUpValue,
+            tableTypeSixMaxValue,
+            pokerClientPokerKingValue);
+    }
+
+    private static Type GetTypeOrThrow(Assembly assembly, string fullName)
+    {
+        return assembly.GetType(fullName, throwOnError: false)
+            ?? throw new ProbeException($"Failed to bind reflected type {fullName}");
+    }
+
+    private static ConstructorInfo GetConstructorOrThrow(Type type, params Type[] parameterTypes)
     {
         var constructor = type.GetConstructor(parameterTypes);
         if (constructor is not null)
@@ -257,223 +624,154 @@ internal static class Program
             $"Available overloads: {string.Join("; ", overloads)}");
     }
 
-    private static MethodInfo FindMethodOrThrow(Type type, string methodName, params Type[] parameterTypes)
+    private static MethodInfo GetMethodOrThrow(Type type, string methodName, params Type[] parameterTypes)
     {
-        var methods = type
+        var method = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance, binder: null, parameterTypes, modifiers: null);
+        if (method is not null)
+        {
+            return method;
+        }
+
+        var overloads = type
             .GetMethods(BindingFlags.Public | BindingFlags.Instance)
-            .Where(method => method.Name == methodName)
+            .Where(candidate => candidate.Name == methodName)
+            .Select(FormatSignature)
             .ToArray();
 
-        foreach (var method in methods)
-        {
-            var parameters = method.GetParameters();
-            if (parameters.Length != parameterTypes.Length)
-            {
-                continue;
-            }
-
-            var allMatch = true;
-            for (var index = 0; index < parameters.Length; index += 1)
-            {
-                if (parameters[index].ParameterType != parameterTypes[index])
-                {
-                    allMatch = false;
-                    break;
-                }
-            }
-
-            if (allMatch)
-            {
-                return method;
-            }
-        }
-
-        var overloads = methods.Select(FormatSignature).ToArray();
-        var availableText = overloads.Length > 0
-            ? string.Join("; ", overloads)
-            : "(no public instance overloads found)";
-
         throw new ProbeException(
-            $"Failed to find method {type.FullName}.{methodName} with parameters ({FormatParameterTypes(parameterTypes)}). " +
-            $"Available overloads: {availableText}");
+            $"Failed to find method {type.FullName}.{methodName}({FormatParameterTypes(parameterTypes)}). " +
+            $"Available overloads: {string.Join("; ", overloads)}");
     }
 
-    private static object InvokeConstructor(ConstructorInfo constructor, params object[] args)
+    private static FieldInfo GetFieldOrThrow(Type type, string fieldName)
     {
-        try
-        {
-            return constructor.Invoke(args)
-                ?? throw new ProbeException($"Constructor returned null for {constructor.DeclaringType?.FullName}");
-        }
-        catch (TargetInvocationException ex) when (ex.InnerException is not null)
-        {
-            throw new ProbeException($"PythonAPI construction failure: {DescribeException(ex.InnerException)}");
-        }
+        return type.GetField(fieldName, BindingFlags.Public | BindingFlags.Instance)
+            ?? throw new ProbeException($"Failed to find field {type.FullName}.{fieldName}");
     }
 
-    private static object? InvokeMethod(object instance, MethodInfo method, string stageName, params object[] args)
+    private static object GetEnumValueOrThrow(Type enumType, string valueName)
     {
-        try
+        if (!enumType.IsEnum)
         {
-            return method.Invoke(instance, args);
+            throw new ProbeException($"Type {enumType.FullName} is not an enum");
         }
-        catch (TargetInvocationException ex) when (ex.InnerException is not null)
-        {
-            throw new ProbeException($"{stageName} failed: {DescribeException(ex.InnerException)}");
-        }
+
+        return Enum.Parse(enumType, valueName, ignoreCase: false);
     }
 
-    private static object? ReadRequiredProperty(object instance, string propertyName)
-    {
-        var property = instance.GetType().GetProperty(propertyName, BindingFlags.Public | BindingFlags.Instance);
-        if (property is null)
-        {
-            var available = instance
-                .GetType()
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Select(info => info.Name)
-                .OrderBy(name => name, StringComparer.Ordinal)
-                .ToArray();
-
-            throw new ProbeException(
-                $"calculateHeroAction result is missing property '{propertyName}'. " +
-                $"Available properties: {string.Join(", ", available)}");
-        }
-
-        return property.GetValue(instance);
-    }
-
-    private static string FormatSignature(MethodBase methodBase)
+    private static string FormatSignature(MethodBase method)
     {
         var parameters = string.Join(
             ", ",
-            methodBase
-                .GetParameters()
-                .Select(parameter => $"{FormatTypeName(parameter.ParameterType)} {parameter.Name}"));
-
-        return methodBase switch
+            method.GetParameters().Select(parameter => $"{parameter.ParameterType.FullName} {parameter.Name}"));
+        return method switch
         {
-            MethodInfo method => $"{FormatTypeName(method.ReturnType)} {method.Name}({parameters})",
-            ConstructorInfo constructor => $"{constructor.DeclaringType?.Name}({parameters})",
-            _ => methodBase.ToString() ?? "<unknown signature>",
+            ConstructorInfo constructor => $"{constructor.DeclaringType?.FullName}({parameters})",
+            MethodInfo methodInfo => $"{methodInfo.ReturnType.FullName} {methodInfo.DeclaringType?.FullName}.{methodInfo.Name}({parameters})",
+            _ => method.ToString() ?? method.Name,
         };
     }
 
     private static string FormatParameterTypes(IEnumerable<Type> parameterTypes)
     {
-        return string.Join(", ", parameterTypes.Select(FormatTypeName));
+        return string.Join(", ", parameterTypes.Select(type => type.FullName ?? type.Name));
+    }
+}
+
+internal sealed class BoundMember
+{
+    private BoundMember(string signature, Func<object, object?> reader)
+    {
+        Signature = signature;
+        _reader = reader;
     }
 
-    private static string FormatTypeName(Type type)
+    private readonly Func<object, object?> _reader;
+
+    public string Signature { get; }
+
+    public object? Read(object instance) => _reader(instance);
+
+    public static BoundMember Create(Type declaringType, string memberName)
     {
-        if (type.IsArray)
+        var property = declaringType.GetProperty(memberName, BindingFlags.Public | BindingFlags.Instance);
+        if (property is not null)
         {
-            return $"{FormatTypeName(type.GetElementType() ?? typeof(object))}[]";
+            return new BoundMember($"{property.PropertyType.FullName} {declaringType.FullName}.{property.Name}", instance => property.GetValue(instance));
         }
 
-        if (type.IsGenericType)
+        var field = declaringType.GetField(memberName, BindingFlags.Public | BindingFlags.Instance);
+        if (field is not null)
         {
-            var genericName = type.Name[..type.Name.IndexOf('`')];
-            var arguments = string.Join(", ", type.GetGenericArguments().Select(FormatTypeName));
-            return $"{genericName}<{arguments}>";
+            return new BoundMember($"{field.FieldType.FullName} {declaringType.FullName}.{field.Name}", instance => field.GetValue(instance));
         }
 
-        return type.Name;
+        throw new ProbeException($"Failed to bind decision member {declaringType.FullName}.{memberName}");
+    }
+}
+
+internal sealed class ProbeException : Exception
+{
+    public ProbeException(string message)
+        : base(message)
+    {
+    }
+}
+
+internal sealed class RuntimeLoadContext : AssemblyLoadContext
+{
+    private readonly AssemblyDependencyResolver _resolver;
+    private readonly string _runtimeDir;
+
+    public RuntimeLoadContext(string rootAssemblyPath, string runtimeDir)
+        : base(isCollectible: true)
+    {
+        _resolver = new AssemblyDependencyResolver(rootAssemblyPath);
+        _runtimeDir = runtimeDir;
     }
 
-    private static string FormatValue(object? value)
+    protected override Assembly? Load(AssemblyName assemblyName)
     {
-        if (value is null)
+        var resolvedPath = _resolver.ResolveAssemblyToPath(assemblyName);
+        if (resolvedPath is not null)
         {
-            return "null";
+            return LoadFromAssemblyPath(resolvedPath);
         }
 
-        return value switch
+        var candidatePath = Path.Combine(_runtimeDir, $"{assemblyName.Name}.dll");
+        if (File.Exists(candidatePath))
         {
-            string message => message.Replace("\r", " ").Replace("\n", " ").Trim(),
-            _ => Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? value.ToString() ?? "null",
-        };
+            return LoadFromAssemblyPath(candidatePath);
+        }
+
+        return null;
     }
 
-    private static string DescribeException(Exception exception)
+    protected override nint LoadUnmanagedDll(string unmanagedDllName)
     {
-        return $"{exception.GetType().FullName}: {exception.Message}";
+        var resolvedPath = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
+        if (resolvedPath is not null)
+        {
+            return LoadUnmanagedDllFromPath(resolvedPath);
+        }
+
+        foreach (var candidate in EnumerateUnmanagedCandidates(unmanagedDllName))
+        {
+            if (File.Exists(candidate))
+            {
+                return LoadUnmanagedDllFromPath(candidate);
+            }
+        }
+
+        return IntPtr.Zero;
     }
 
-    private sealed class RuntimeLoadContext : AssemblyLoadContext
+    private IEnumerable<string> EnumerateUnmanagedCandidates(string unmanagedDllName)
     {
-        private readonly AssemblyDependencyResolver _resolver;
-        private readonly string _runtimeDir;
-
-        public RuntimeLoadContext(string entryAssemblyPath, string runtimeDir)
-            : base(isCollectible: true)
+        yield return Path.Combine(_runtimeDir, unmanagedDllName);
+        if (!unmanagedDllName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
         {
-            _resolver = new AssemblyDependencyResolver(entryAssemblyPath);
-            _runtimeDir = runtimeDir;
-        }
-
-        protected override Assembly? Load(AssemblyName assemblyName)
-        {
-            var resolvedPath = _resolver.ResolveAssemblyToPath(assemblyName);
-            if (resolvedPath is not null)
-            {
-                return LoadFromAssemblyPath(resolvedPath);
-            }
-
-            var fallbackPath = Path.Combine(_runtimeDir, $"{assemblyName.Name}.dll");
-            if (File.Exists(fallbackPath))
-            {
-                return LoadFromAssemblyPath(fallbackPath);
-            }
-
-            return null;
-        }
-
-        protected override nint LoadUnmanagedDll(string unmanagedDllName)
-        {
-            var resolvedPath = _resolver.ResolveUnmanagedDllToPath(unmanagedDllName);
-            if (resolvedPath is not null)
-            {
-                return LoadUnmanagedDllFromPath(resolvedPath);
-            }
-
-            foreach (var candidate in GetNativeCandidates(unmanagedDllName))
-            {
-                if (File.Exists(candidate))
-                {
-                    return LoadUnmanagedDllFromPath(candidate);
-                }
-            }
-
-            return IntPtr.Zero;
-        }
-
-        private IEnumerable<string> GetNativeCandidates(string unmanagedDllName)
-        {
-            var names = new HashSet<string>(StringComparer.Ordinal)
-            {
-                unmanagedDllName,
-            };
-
-            if (!Path.HasExtension(unmanagedDllName))
-            {
-                names.Add($"{unmanagedDllName}.dll");
-                names.Add($"{unmanagedDllName}.so");
-                names.Add($"lib{unmanagedDllName}.so");
-            }
-
-            foreach (var name in names)
-            {
-                yield return Path.Combine(_runtimeDir, name);
-            }
-        }
-    }
-
-    private sealed class ProbeException : Exception
-    {
-        public ProbeException(string message)
-            : base(message)
-        {
+            yield return Path.Combine(_runtimeDir, $"{unmanagedDllName}.dll");
         }
     }
 }

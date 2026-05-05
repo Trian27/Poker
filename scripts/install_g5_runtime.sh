@@ -335,6 +335,23 @@ if data.get("engine") != "g5":
     fail("Manifest engine must be 'g5'")
 if data.get("platform") != "linux-x64":
     fail("Manifest platform must be 'linux-x64'")
+if data.get("table_profile_schema_version") != 1:
+    fail("Manifest table_profile_schema_version must be 1")
+
+required_files = data.get("required_files")
+if not isinstance(required_files, list) or not required_files:
+    fail("Manifest field 'required_files' must be a non-empty array")
+
+table_profiles = data.get("table_profiles")
+if not isinstance(table_profiles, list) or not table_profiles:
+    fail("Manifest field 'table_profiles' must be a non-empty array")
+
+expected_profiles = {
+    "heads_up": (2, 2, "HeadsUp"),
+    "six_max": (3, 6, "SixMax"),
+}
+seen_profiles = set()
+coverage = set()
 
 for field in ("required_files", "managed_assemblies", "native_libraries"):
     entries = data.get(field)
@@ -351,6 +368,40 @@ for field in ("required_files", "managed_assemblies", "native_libraries"):
                 fail(f"Missing required directory inside container: {normalized}")
         elif not os.path.exists(target):
             fail(f"Missing required path inside container: {normalized}")
+
+for profile in table_profiles:
+    if not isinstance(profile, dict):
+        fail("Manifest table_profiles entries must be objects")
+    profile_name = profile.get("profile")
+    if profile_name not in expected_profiles:
+        fail(f"Unsupported table profile: {profile_name}")
+    if profile_name in seen_profiles:
+        fail(f"Duplicate table profile: {profile_name}")
+    seen_profiles.add(profile_name)
+
+    player_count_min, player_count_max, table_type = expected_profiles[profile_name]
+    if profile.get("player_count_min") != player_count_min or profile.get("player_count_max") != player_count_max:
+        fail(f"Profile {profile_name} must cover exactly {player_count_min}..{player_count_max}")
+    if profile.get("table_type") != table_type:
+        fail(f"Profile {profile_name} must use table_type {table_type}")
+
+    stats_file = profile.get("opponent_stats_file")
+    normalized_stats, expects_dir = normalize_manifest_path(stats_file)
+    if expects_dir:
+        fail(f"Profile {profile_name} opponent_stats_file must be a file path")
+    if normalized_stats not in required_files:
+        fail(f"Profile {profile_name} opponent_stats_file must also appear in required_files")
+    target = os.path.join(app_root, *normalized_stats.split("/"))
+    if not os.path.isfile(target):
+        fail(f"Missing table profile stats file inside container: {normalized_stats}")
+
+    for player_count in range(player_count_min, player_count_max + 1):
+        coverage.add(player_count)
+
+if seen_profiles != set(expected_profiles):
+    fail("Manifest table_profiles must include exactly heads_up and six_max")
+if coverage != set(range(2, 7)):
+    fail("Manifest table_profiles must cover exactly player counts 2..6")
 
 print("G5 runtime smoke-test passed.")
 PY
