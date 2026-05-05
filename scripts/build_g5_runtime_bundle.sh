@@ -360,6 +360,7 @@ rm -rf /stage/*
 mkdir -p /stage
 cp -R "$managed_dir"/. /stage/
 cp /work/source/redist/PreFlopEquities.txt /stage/
+cp /work/source/redist/full_stats_list_hu.bin /stage/
 cp /work/source/redist/full_stats_list_6max.bin /stage/
 cp -R /work/source/redist/PreFlopCharts /stage/
 cp /work/source/src/DecisionMaking/libdec_making.so /stage/DecisionMaking.dll
@@ -379,18 +380,40 @@ MANAGED_ASSEMBLIES=("G5Gym.dll" "G5.Logic.dll")
 NATIVE_TBB_BASENAME="$(find "$TMP_STAGE_DIR" -maxdepth 1 -type f -name 'libtbb.so*' -print | sed 's#^.*/##' | head -n 1)"
 [ -n "$NATIVE_TBB_BASENAME" ] || die "Failed to locate bundled libtbb runtime in staged app"
 NATIVE_LIBRARIES=("DecisionMaking.dll" "$NATIVE_TBB_BASENAME")
-REQUIRED_FILES=("bundle-manifest.json" "full_stats_list_6max.bin" "PreFlopEquities.txt" "PreFlopCharts/")
+REQUIRED_FILES=("bundle-manifest.json" "full_stats_list_hu.bin" "full_stats_list_6max.bin" "PreFlopEquities.txt" "PreFlopCharts/")
 
 REQUIRED_FILES_JSON="$(json_array_from_args "${REQUIRED_FILES[@]}")"
 MANAGED_ASSEMBLIES_JSON="$(json_array_from_args "${MANAGED_ASSEMBLIES[@]}")"
 NATIVE_LIBRARIES_JSON="$(json_array_from_args "${NATIVE_LIBRARIES[@]}")"
 PATCHES_JSON="$(json_array_from_args "${PATCH_REL_PATHS[@]}")"
+TABLE_PROFILES_JSON="$(
+  python3 - <<'PY'
+import json
+
+print(json.dumps([
+    {
+        "profile": "heads_up",
+        "player_count_min": 2,
+        "player_count_max": 2,
+        "table_type": "HeadsUp",
+        "opponent_stats_file": "full_stats_list_hu.bin",
+    },
+    {
+        "profile": "six_max",
+        "player_count_min": 3,
+        "player_count_max": 6,
+        "table_type": "SixMax",
+        "opponent_stats_file": "full_stats_list_6max.bin",
+    },
+], sort_keys=True))
+PY
+)"
 
 MANIFEST_DRAFT="$TMP_ROOT/bundle-manifest.draft.json"
 export BUNDLE_VERSION BUILT_AT_UTC PIN_ENTRYPOINT_HINT MANAGED_ASSEMBLIES_JSON NATIVE_LIBRARIES_JSON
 export PIN_DOTNET_TARGET REQUIRED_FILES_JSON SOURCE_REPO SOURCE_REF SOURCE_COMMIT_RESOLVED
 export SOURCE_PIN_MODE PATCHES_JSON BUILDER_IMAGE_TAG BUILDER_BASE_IMAGE BUILDER_BASE_IMAGE_DIGEST
-export PIN_BUILDER_PLATFORM DOCKERFILE_SHA256 BUILD_SCRIPT_VERSION
+export PIN_BUILDER_PLATFORM DOCKERFILE_SHA256 BUILD_SCRIPT_VERSION TABLE_PROFILES_JSON
 python3 - "$MANIFEST_DRAFT" <<'PY'
 import json
 import os
@@ -407,6 +430,8 @@ payload = {
     "native_libraries": json.loads(os.environ["NATIVE_LIBRARIES_JSON"]),
     "dotnet_target": os.environ["PIN_DOTNET_TARGET"],
     "required_files": json.loads(os.environ["REQUIRED_FILES_JSON"]),
+    "table_profile_schema_version": 1,
+    "table_profiles": json.loads(os.environ["TABLE_PROFILES_JSON"]),
     "source_repo": os.environ["SOURCE_REPO"],
     "source_ref_requested": os.environ["SOURCE_REF"],
     "source_commit_resolved": os.environ["SOURCE_COMMIT_RESOLVED"],

@@ -15,6 +15,7 @@ Running the builder emits three files into a user-selected output directory:
 The archive contains an app root with:
 
 - `bundle-manifest.json`
+- `full_stats_list_hu.bin`
 - `full_stats_list_6max.bin`
 - `PreFlopEquities.txt`
 - `PreFlopCharts/`
@@ -79,7 +80,7 @@ The builder will:
 3. apply tracked local patches
 4. build inside a pinned `linux/amd64` Docker image
 5. assemble the runtime app root
-6. validate the runtime layout against the shared manifest rules
+6. validate the runtime layout and dual-profile manifest against the shared rules
 7. package a deterministic tarball
 8. write the matching `.sha256` and `.build.json`
 
@@ -163,11 +164,14 @@ export G5_RUNTIME_BUNDLE_SHA256="<sha256>"
 docker compose up g5-advisor-service
 ```
 
+After this dual-profile runtime change, any previously installed single-profile bundle is obsolete. Rebuild and reinstall before using `verify`, `probe`, or `g5-advisor-service`.
+
 ## Output Metadata
 
 The bundle archive contains `bundle-manifest.json` with:
 
 - runtime fields such as `engine`, `platform`, `bundle_version`, `required_files`, `managed_assemblies`, and `native_libraries`
+- dual-profile routing fields such as `table_profile_schema_version` and `table_profiles`
 - source/build trace fields such as `source_repo`, `source_ref_requested`, `source_commit_resolved`, `source_pin_mode`, `source_patches_applied`, `builder_image`, `builder_base_image`, `builder_base_image_digest`, `builder_platform`, `builder_dockerfile_sha256`, and `build_script_version`
 
 The sibling `.build.json` mirrors the same source/build trace data and adds:

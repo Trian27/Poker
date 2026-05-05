@@ -28,6 +28,7 @@ internal sealed class G5ReflectionBindings
     public MethodInfo CalculateHeroActionMethod { get; }
     public MethodInfo GetPlayerToActIndMethod { get; }
     public MethodInfo NumActivePlayersMethod { get; }
+    public MethodInfo NumActiveNonAllInPlayersMethod { get; }
 
     public BoundMember DecisionActionTypeMember { get; }
     public BoundMember DecisionByAmountMember { get; }
@@ -36,6 +37,7 @@ internal sealed class G5ReflectionBindings
     public BoundMember DecisionTimeSpentSecondsMember { get; }
     public BoundMember DecisionMessageMember { get; }
 
+    public object TableTypeHeadsUpValue { get; }
     public object TableTypeSixMaxValue { get; }
     public object PokerClientPokerKingValue { get; }
     public object ActionTypeNoActionValue { get; }
@@ -66,12 +68,14 @@ internal sealed class G5ReflectionBindings
         MethodInfo calculateHeroActionMethod,
         MethodInfo getPlayerToActIndMethod,
         MethodInfo numActivePlayersMethod,
+        MethodInfo numActiveNonAllInPlayersMethod,
         BoundMember decisionActionTypeMember,
         BoundMember decisionByAmountMember,
         BoundMember decisionCheckCallEvMember,
         BoundMember decisionBetRaiseEvMember,
         BoundMember decisionTimeSpentSecondsMember,
         BoundMember decisionMessageMember,
+        object tableTypeHeadsUpValue,
         object tableTypeSixMaxValue,
         object pokerClientPokerKingValue,
         object actionTypeNoActionValue,
@@ -100,12 +104,14 @@ internal sealed class G5ReflectionBindings
         CalculateHeroActionMethod = calculateHeroActionMethod;
         GetPlayerToActIndMethod = getPlayerToActIndMethod;
         NumActivePlayersMethod = numActivePlayersMethod;
+        NumActiveNonAllInPlayersMethod = numActiveNonAllInPlayersMethod;
         DecisionActionTypeMember = decisionActionTypeMember;
         DecisionByAmountMember = decisionByAmountMember;
         DecisionCheckCallEvMember = decisionCheckCallEvMember;
         DecisionBetRaiseEvMember = decisionBetRaiseEvMember;
         DecisionTimeSpentSecondsMember = decisionTimeSpentSecondsMember;
         DecisionMessageMember = decisionMessageMember;
+        TableTypeHeadsUpValue = tableTypeHeadsUpValue;
         TableTypeSixMaxValue = tableTypeSixMaxValue;
         PokerClientPokerKingValue = pokerClientPokerKingValue;
         ActionTypeNoActionValue = actionTypeNoActionValue;
@@ -150,6 +156,7 @@ internal sealed class G5ReflectionBindings
         var calculateHeroActionMethod = GetMethodOrThrow(botGameStateType, "calculateHeroAction", Type.EmptyTypes);
         var getPlayerToActIndMethod = GetMethodOrThrow(botGameStateType, "getPlayerToActInd", Type.EmptyTypes);
         var numActivePlayersMethod = GetMethodOrThrow(botGameStateType, "numActivePlayers", Type.EmptyTypes);
+        var numActiveNonAllInPlayersMethod = GetMethodOrThrow(botGameStateType, "numActiveNonAllInPlayers", Type.EmptyTypes);
 
         var decisionType = calculateHeroActionMethod.ReturnType;
         var decisionActionTypeMember = CreateBoundMember(decisionType, "actionType");
@@ -159,6 +166,7 @@ internal sealed class G5ReflectionBindings
         var decisionTimeSpentSecondsMember = CreateBoundMember(decisionType, "timeSpentSeconds");
         var decisionMessageMember = CreateBoundMember(decisionType, "message");
 
+        var tableTypeHeadsUpValue = GetEnumValueOrThrow(tableTypeType, "HeadsUp");
         var tableTypeSixMaxValue = GetEnumValueOrThrow(tableTypeType, "SixMax");
         var pokerClientPokerKingValue = GetEnumValueOrThrow(pokerClientType, "PokerKing");
         var actionTypeNoActionValue = GetEnumValueOrThrow(actionTypeType, "NoAction");
@@ -184,12 +192,14 @@ internal sealed class G5ReflectionBindings
             $"Method {FormatSignature(calculateHeroActionMethod)}",
             $"Method {FormatSignature(getPlayerToActIndMethod)}",
             $"Method {FormatSignature(numActivePlayersMethod)}",
+            $"Method {FormatSignature(numActiveNonAllInPlayersMethod)}",
             $"Member {decisionActionTypeMember.Signature}",
             $"Member {decisionByAmountMember.Signature}",
             $"Member {decisionCheckCallEvMember.Signature}",
             $"Member {decisionBetRaiseEvMember.Signature}",
             $"Member {decisionTimeSpentSecondsMember.Signature}",
             $"Member {decisionMessageMember.Signature}",
+            $"Enum {tableTypeType.FullName}.HeadsUp={(int)tableTypeHeadsUpValue}",
             $"Enum {tableTypeType.FullName}.SixMax={(int)tableTypeSixMaxValue}",
             $"Enum {pokerClientType.FullName}.PokerKing={(int)pokerClientPokerKingValue}",
             $"Enum {actionTypeType.FullName}.NoAction={(int)actionTypeNoActionValue}",
@@ -219,12 +229,14 @@ internal sealed class G5ReflectionBindings
             calculateHeroActionMethod,
             getPlayerToActIndMethod,
             numActivePlayersMethod,
+            numActiveNonAllInPlayersMethod,
             decisionActionTypeMember,
             decisionByAmountMember,
             decisionCheckCallEvMember,
             decisionBetRaiseEvMember,
             decisionTimeSpentSecondsMember,
             decisionMessageMember,
+            tableTypeHeadsUpValue,
             tableTypeSixMaxValue,
             pokerClientPokerKingValue,
             actionTypeNoActionValue,

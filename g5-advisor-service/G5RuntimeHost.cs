@@ -16,7 +16,10 @@ internal sealed class G5RuntimeHost
 
     private G5RuntimeLoadContext? _loadContext;
     private G5ReflectionBindings? _bindings;
-    private object? _sharedOpponentModeling;
+    private Dictionary<string, TableProfileDefinition> _profileDefinitions = new(StringComparer.Ordinal);
+    private Dictionary<string, RuntimeTableProfile> _runtimeProfiles = new(StringComparer.Ordinal);
+    private Dictionary<string, object> _warmedOpponentModeling = new(StringComparer.Ordinal);
+    private Dictionary<string, HealthProfileStatus> _profileHealth = new(StringComparer.Ordinal);
     private string? _runtimeDir;
     private string? _bundleVersion;
 
@@ -47,6 +50,17 @@ internal sealed class G5RuntimeHost
                 BundleVersion = _bundleVersion,
                 RuntimeLoaded = _state.RuntimeLoaded,
                 WarmModelReady = _state.WarmModelReady,
+                Profiles = _profileHealth.ToDictionary(
+                    pair => pair.Key,
+                    pair => new HealthProfileStatus
+                    {
+                        Ready = pair.Value.Ready,
+                        PlayerCountMin = pair.Value.PlayerCountMin,
+                        PlayerCountMax = pair.Value.PlayerCountMax,
+                        TableType = pair.Value.TableType,
+                        OpponentStatsFile = pair.Value.OpponentStatsFile,
+                    },
+                    StringComparer.Ordinal),
             };
         }
     }
@@ -95,6 +109,7 @@ internal sealed class G5RuntimeHost
             UpdateStage("manifest_validation");
             var manifest = ValidateManifestAndLayout(runtimeDir);
             _bundleVersion = manifest.BundleVersion;
+            SetProfileDefinitions(manifest.TableProfiles);
 
             UpdateStage("assembly_load");
             var g5GymAssemblyPath = Path.Combine(runtimeDir, "G5Gym.dll");
@@ -120,11 +135,21 @@ internal sealed class G5RuntimeHost
                 _logger.LogInformation("G5 binding: {Binding}", binding);
             }
 
+            _runtimeProfiles = BuildRuntimeProfiles(manifest.TableProfiles, _bindings)
+                .ToDictionary(profile => profile.Profile, profile => profile, StringComparer.Ordinal);
+
             UpdateStage("warm_model_initialization", runtimeLoaded: true);
-            _sharedOpponentModeling = WarmOpponentModeling(runtimeDir, _bindings, _options.RecentHandsCount);
+            var warmedModels = new Dictionary<string, object>(StringComparer.Ordinal);
+            foreach (var profile in manifest.TableProfiles.OrderBy(profile => profile.PlayerCountMin))
+            {
+                var runtimeProfile = _runtimeProfiles[profile.Profile];
+                warmedModels[profile.Profile] = WarmOpponentModeling(runtimeDir, _bindings, _options.RecentHandsCount, runtimeProfile);
+                MarkProfileReady(profile.Profile, true);
+            }
+            _warmedOpponentModeling = warmedModels;
 
             UpdateStage("startup_self_check", runtimeLoaded: true, warmModelReady: true);
-            await RunStartupSelfCheckAsync(_bindings, _sharedOpponentModeling, stoppingToken);
+            await RunStartupSelfCheckAsync(stoppingToken);
 
             lock (_stateLock)
             {
@@ -151,14 +176,17 @@ internal sealed class G5RuntimeHost
     {
         ArgumentNullException.ThrowIfNull(request);
         var bindings = _bindings ?? throw new ServiceApiException(StatusCodes.Status503ServiceUnavailable, "runtime_unready", "G5 bindings are not ready");
-        var sharedOpponentModeling = _sharedOpponentModeling ?? throw new ServiceApiException(StatusCodes.Status503ServiceUnavailable, "runtime_unready", "G5 opponent model is not ready");
 
         var prepared = PrepareReplayRequest(request);
+        var sharedOpponentModeling = GetWarmedOpponentModeling(prepared.Profile.Profile);
+
         _logger.LogInformation(
-            "Analyzing preflop decision: sequence={Sequence} hero={HeroPlayerId} replayed_actions={ActionCount}",
+            "Analyzing preflop decision: sequence={Sequence} hero={HeroPlayerId} replayed_actions={ActionCount} profile={Profile} seated_players={SeatedPlayers}",
             prepared.TargetEntry.Sequence,
             prepared.Hero.PlayerId,
-            prepared.ReplayEntries.Count);
+            prepared.ReplayEntries.Count,
+            prepared.Profile.Profile,
+            prepared.SeatedPlayerCount);
 
         var modelingEstimator = CreateModelingEstimator(bindings, sharedOpponentModeling);
         try
@@ -210,6 +238,7 @@ internal sealed class G5RuntimeHost
                 }
 
                 var activePlayers = ConvertToInt(bindings.NumActivePlayersMethod.Invoke(botGameState, null), "numActivePlayers result");
+                var activeNonAllInPlayers = ConvertToInt(bindings.NumActiveNonAllInPlayersMethod.Invoke(botGameState, null), "numActiveNonAllInPlayers result");
                 var rawDecision = bindings.CalculateHeroActionMethod.Invoke(botGameState, null)
                     ?? throw new ServiceApiException(StatusCodes.Status500InternalServerError, "g5_null_decision", "G5 returned a null decision object");
 
@@ -242,8 +271,11 @@ internal sealed class G5RuntimeHost
                         ? new AnalyzeDecisionDebug
                         {
                             ReplayedActionCount = replayedActionCount,
-                            TargetStreet = "preflop",
+                            TargetStreet = prepared.TargetStreet,
+                            TableProfile = prepared.Profile.Profile,
+                            SeatedPlayerCount = prepared.SeatedPlayerCount,
                             ActivePlayers = activePlayers,
+                            ActiveNonAllInPlayers = activeNonAllInPlayers,
                             G5PlayerToActIndex = playerToActIndex,
                         }
                         : null,
@@ -274,11 +306,6 @@ internal sealed class G5RuntimeHost
         }
 
         var players = request.HandData.Players ?? new List<PlayerSnapshot>();
-        if (players.Count < 2)
-        {
-            throw new ServiceApiException(StatusCodes.Status400BadRequest, "invalid_players", "hand_data.players must contain at least two players");
-        }
-
         var orderedPlayers = players
             .OrderBy(player => player.SeatNumber ?? int.MaxValue)
             .ToList();
@@ -299,6 +326,9 @@ internal sealed class G5RuntimeHost
                 throw new ServiceApiException(StatusCodes.Status400BadRequest, "duplicate_seat_number", $"Duplicate seat_number {player.SeatNumber.Value}");
             }
         }
+
+        var seatedPlayerCount = orderedPlayers.Count;
+        var profile = SelectRuntimeProfile(seatedPlayerCount);
 
         var playerIdToIndex = orderedPlayers
             .Select((player, index) => new { player.PlayerId, Index = index })
@@ -360,7 +390,8 @@ internal sealed class G5RuntimeHost
             throw new ServiceApiException(StatusCodes.Status400BadRequest, "decision_not_hero_action", $"Sequence {request.DecisionSequence} does not belong to hero_player_id {hero.PlayerId}");
         }
 
-        if (!string.Equals(NormalizeStage(targetEntry.Stage), "preflop", StringComparison.Ordinal))
+        var targetStreet = NormalizeStage(targetEntry.Stage);
+        if (!string.Equals(targetStreet, "preflop", StringComparison.Ordinal))
         {
             throw new ServiceApiException(StatusCodes.Status422UnprocessableEntity, "unsupported_street", "v1 only supports target actions where stage == preflop");
         }
@@ -417,7 +448,50 @@ internal sealed class G5RuntimeHost
             ReplayEntries: replayEntries,
             TargetEntry: targetEntry,
             HeroCards: new[] { ToG5Card(hero.HoleCards[0]), ToG5Card(hero.HoleCards[1]) },
-            Warnings: warnings);
+            Warnings: warnings,
+            Profile: profile,
+            SeatedPlayerCount: seatedPlayerCount,
+            TargetStreet: targetStreet);
+    }
+
+    private RuntimeTableProfile SelectRuntimeProfile(int seatedPlayerCount)
+    {
+        if (seatedPlayerCount < 2 || seatedPlayerCount > 6)
+        {
+            throw new ServiceApiException(
+                StatusCodes.Status422UnprocessableEntity,
+                "unsupported_player_count",
+                $"G5 currently supports only hands with 2-6 validated participants. Received {seatedPlayerCount}.");
+        }
+
+        lock (_stateLock)
+        {
+            foreach (var profile in _runtimeProfiles.Values.OrderBy(profile => profile.PlayerCountMin))
+            {
+                if (seatedPlayerCount >= profile.PlayerCountMin && seatedPlayerCount <= profile.PlayerCountMax)
+                {
+                    return profile;
+                }
+            }
+        }
+
+        throw new ServiceApiException(
+            StatusCodes.Status422UnprocessableEntity,
+            "unsupported_player_count",
+            $"No G5 table profile is configured for {seatedPlayerCount} validated participants.");
+    }
+
+    private object GetWarmedOpponentModeling(string profileName)
+    {
+        lock (_stateLock)
+        {
+            if (_warmedOpponentModeling.TryGetValue(profileName, out var sharedOpponentModeling))
+            {
+                return sharedOpponentModeling;
+            }
+        }
+
+        throw new ServiceApiException(StatusCodes.Status503ServiceUnavailable, "runtime_unready", $"G5 opponent model '{profileName}' is not ready");
     }
 
     private object CreateModelingEstimator(G5ReflectionBindings bindings, object sharedOpponentModeling)
@@ -439,7 +513,7 @@ internal sealed class G5RuntimeHost
             prepared.ButtonIndex,
             prepared.BigBlindSize,
             bindings.PokerClientPokerKingValue,
-            bindings.TableTypeSixMaxValue,
+            prepared.Profile.TableTypeEnumValue,
             modelingEstimator,
             false,
             _options.PreflopChartsLevel,
@@ -497,27 +571,72 @@ internal sealed class G5RuntimeHost
         }
     }
 
-    private object WarmOpponentModeling(string runtimeDir, G5ReflectionBindings bindings, int recentHandsCount)
+    private object WarmOpponentModeling(string runtimeDir, G5ReflectionBindings bindings, int recentHandsCount, RuntimeTableProfile profile)
     {
         var options = bindings.OpponentModelingOptionsConstructor.Invoke(Array.Empty<object>());
         bindings.RecentHandsCountField.SetValue(options, recentHandsCount);
-        var statsFile = Path.Combine(runtimeDir, "full_stats_list_6max.bin");
+        var statsFile = Path.Combine(runtimeDir, profile.OpponentStatsFile.Replace('/', Path.DirectorySeparatorChar));
         if (!File.Exists(statsFile))
         {
-            throw new InvalidOperationException($"Missing six-max stats file: {statsFile}");
+            throw new InvalidOperationException($"Missing stats file for profile '{profile.Profile}': {statsFile}");
         }
 
         return bindings.OpponentModelingConstructor.Invoke(new object?[]
         {
             statsFile,
-            bindings.TableTypeSixMaxValue,
+            profile.TableTypeEnumValue,
             options,
         });
     }
 
-    private async Task RunStartupSelfCheckAsync(G5ReflectionBindings bindings, object sharedOpponentModeling, CancellationToken stoppingToken)
+    private async Task RunStartupSelfCheckAsync(CancellationToken stoppingToken)
     {
-        var request = new AnalyzeDecisionRequest
+        await Task.Yield();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        linkedCts.CancelAfter(TimeSpan.FromSeconds(30));
+
+        foreach (var request in CreateStartupSelfCheckRequests())
+        {
+            var response = AnalyzeCore(request);
+            if (string.IsNullOrWhiteSpace(response.RawActionType))
+            {
+                throw new InvalidOperationException("Startup self-check returned an empty raw action type");
+            }
+        }
+    }
+
+    private IEnumerable<AnalyzeDecisionRequest> CreateStartupSelfCheckRequests()
+    {
+        yield return new AnalyzeDecisionRequest
+        {
+            HeroPlayerId = "hu_player_1",
+            DecisionSequence = 3,
+            HandData = new HandData
+            {
+                Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
+                DealerPlayerId = "hu_player_1",
+                SmallBlindPlayerId = "hu_player_1",
+                BigBlindPlayerId = "hu_player_2",
+                Players = new List<PlayerSnapshot>
+                {
+                    new() { PlayerId = "hu_player_1", Username = "HU1", SeatNumber = 1, HoleCards = new List<CardDto> { new() { Rank = "A", Suit = "spades" }, new() { Rank = "K", Suit = "diamonds" } } },
+                    new() { PlayerId = "hu_player_2", Username = "HU2", SeatNumber = 2 },
+                },
+                StartingStacks = new Dictionary<string, int>(StringComparer.Ordinal)
+                {
+                    ["hu_player_1"] = 10000,
+                    ["hu_player_2"] = 10000,
+                },
+                ActionLog = new List<ActionLogEntry>
+                {
+                    new() { Sequence = 1, Stage = "preflop", PlayerId = "hu_player_1", Action = "small-blind", Source = "forced", RequestedAmount = 50, CommittedChips = 50, PotBefore = 0, ToCallBefore = 0 },
+                    new() { Sequence = 2, Stage = "preflop", PlayerId = "hu_player_2", Action = "big-blind", Source = "forced", RequestedAmount = 100, CommittedChips = 100, PotBefore = 50, ToCallBefore = 0 },
+                    new() { Sequence = 3, Stage = "preflop", PlayerId = "hu_player_1", Action = "call", Source = "player", RequestedAmount = 50, CommittedChips = 100, ToCallBefore = 50 },
+                },
+            },
+        };
+
+        yield return new AnalyzeDecisionRequest
         {
             HeroPlayerId = "player_4",
             DecisionSequence = 3,
@@ -553,15 +672,6 @@ internal sealed class G5RuntimeHost
                 },
             },
         };
-
-        await Task.Yield();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        linkedCts.CancelAfter(TimeSpan.FromSeconds(30));
-        var response = AnalyzeCore(request);
-        if (string.IsNullOrWhiteSpace(response.RawActionType))
-        {
-            throw new InvalidOperationException("Startup self-check returned an empty raw action type");
-        }
     }
 
     private RuntimeManifest ValidateManifestAndLayout(string runtimeDir)
@@ -592,20 +702,23 @@ internal sealed class G5RuntimeHost
         }
 
         var bundleVersion = ReadRequiredString(root, "bundle_version");
-        ValidateManifestEntries(runtimeDir, root, "required_files", requireFile: false);
-        ValidateManifestEntries(runtimeDir, root, "managed_assemblies", requireFile: true);
-        ValidateManifestEntries(runtimeDir, root, "native_libraries", requireFile: true);
+        var requiredFiles = ReadAndValidateManifestEntries(runtimeDir, root, "required_files", requireFile: false);
+        _ = ReadAndValidateManifestEntries(runtimeDir, root, "managed_assemblies", requireFile: true);
+        _ = ReadAndValidateManifestEntries(runtimeDir, root, "native_libraries", requireFile: true);
+        var profiles = ReadTableProfiles(runtimeDir, root, requiredFiles);
 
-        return new RuntimeManifest(bundleVersion);
+        return new RuntimeManifest(bundleVersion, profiles);
     }
 
-    private static void ValidateManifestEntries(string runtimeDir, JsonElement root, string fieldName, bool requireFile)
+    private static IReadOnlyList<string> ReadAndValidateManifestEntries(string runtimeDir, JsonElement root, string fieldName, bool requireFile)
     {
         if (!root.TryGetProperty(fieldName, out var property) || property.ValueKind != JsonValueKind.Array || property.GetArrayLength() == 0)
         {
             throw new InvalidOperationException($"Runtime manifest field '{fieldName}' must be a non-empty array");
         }
 
+        var normalizedEntries = new List<string>();
+        var seenEntries = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in property.EnumerateArray())
         {
             if (entry.ValueKind != JsonValueKind.String)
@@ -615,8 +728,14 @@ internal sealed class G5RuntimeHost
 
             var rawPath = entry.GetString() ?? string.Empty;
             var (normalized, expectsDirectory) = NormalizeManifestPath(rawPath);
-            var target = Path.Combine(runtimeDir, normalized.Replace('/', Path.DirectorySeparatorChar));
+            var rendered = expectsDirectory ? normalized + "/" : normalized;
+            if (!seenEntries.Add(rendered))
+            {
+                continue;
+            }
+            normalizedEntries.Add(rendered);
 
+            var target = Path.Combine(runtimeDir, normalized.Replace('/', Path.DirectorySeparatorChar));
             if (requireFile)
             {
                 if (!File.Exists(target))
@@ -638,6 +757,103 @@ internal sealed class G5RuntimeHost
                 throw new InvalidOperationException($"Missing runtime path declared in {fieldName}: {rawPath}");
             }
         }
+
+        return normalizedEntries;
+    }
+
+    private static IReadOnlyList<TableProfileDefinition> ReadTableProfiles(string runtimeDir, JsonElement root, IReadOnlyList<string> requiredFiles)
+    {
+        if (!root.TryGetProperty("table_profile_schema_version", out var schemaProperty) || schemaProperty.ValueKind != JsonValueKind.Number || !schemaProperty.TryGetInt32(out var schemaVersion))
+        {
+            throw new InvalidOperationException("Runtime manifest field 'table_profile_schema_version' must be an integer");
+        }
+        if (schemaVersion != 1)
+        {
+            throw new InvalidOperationException("Runtime manifest field 'table_profile_schema_version' must be 1");
+        }
+
+        if (!root.TryGetProperty("table_profiles", out var profilesProperty) || profilesProperty.ValueKind != JsonValueKind.Array || profilesProperty.GetArrayLength() == 0)
+        {
+            throw new InvalidOperationException("Runtime manifest field 'table_profiles' must be a non-empty array");
+        }
+
+        var profiles = new List<TableProfileDefinition>();
+        var seenProfiles = new HashSet<string>(StringComparer.Ordinal);
+        var coverage = new HashSet<int>();
+        var requiredFilesSet = new HashSet<string>(requiredFiles, StringComparer.Ordinal);
+
+        foreach (var profileElement in profilesProperty.EnumerateArray())
+        {
+            if (profileElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidOperationException("Runtime manifest table_profiles entries must be objects");
+            }
+
+            var profileName = ReadRequiredString(profileElement, "profile");
+            if (!seenProfiles.Add(profileName))
+            {
+                throw new InvalidOperationException($"Runtime manifest contains duplicate table profile '{profileName}'");
+            }
+
+            var (expectedMin, expectedMax, expectedTableType) = profileName switch
+            {
+                "heads_up" => (2, 2, "HeadsUp"),
+                "six_max" => (3, 6, "SixMax"),
+                _ => throw new InvalidOperationException($"Runtime manifest contains unsupported table profile '{profileName}'"),
+            };
+
+            var playerCountMin = ReadRequiredInt(profileElement, "player_count_min");
+            var playerCountMax = ReadRequiredInt(profileElement, "player_count_max");
+            if (playerCountMin != expectedMin || playerCountMax != expectedMax)
+            {
+                throw new InvalidOperationException($"Runtime manifest profile '{profileName}' must cover exactly {expectedMin}..{expectedMax}");
+            }
+
+            var tableType = ReadRequiredString(profileElement, "table_type");
+            if (!string.Equals(tableType, expectedTableType, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"Runtime manifest profile '{profileName}' must use table_type '{expectedTableType}'");
+            }
+
+            var rawStatsFile = ReadRequiredString(profileElement, "opponent_stats_file");
+            var (statsFile, expectsDirectory) = NormalizeManifestPath(rawStatsFile);
+            if (expectsDirectory)
+            {
+                throw new InvalidOperationException($"Runtime manifest profile '{profileName}' opponent_stats_file must be a file path");
+            }
+            if (!requiredFilesSet.Contains(statsFile))
+            {
+                throw new InvalidOperationException($"Runtime manifest profile '{profileName}' opponent_stats_file must also appear in required_files: {statsFile}");
+            }
+
+            var statsPath = Path.Combine(runtimeDir, statsFile.Replace('/', Path.DirectorySeparatorChar));
+            if (!File.Exists(statsPath))
+            {
+                throw new InvalidOperationException($"Missing runtime stats file for profile '{profileName}': {statsFile}");
+            }
+
+            for (var playerCount = playerCountMin; playerCount <= playerCountMax; playerCount += 1)
+            {
+                if (!coverage.Add(playerCount))
+                {
+                    throw new InvalidOperationException("Runtime manifest table_profiles contain overlapping player-count coverage");
+                }
+            }
+
+            profiles.Add(new TableProfileDefinition(profileName, playerCountMin, playerCountMax, tableType, statsFile));
+        }
+
+        if (!seenProfiles.SetEquals(new[] { "heads_up", "six_max" }))
+        {
+            throw new InvalidOperationException("Runtime manifest table_profiles must include exactly heads_up and six_max");
+        }
+
+        if (!coverage.SetEquals(Enumerable.Range(2, 5)))
+        {
+            throw new InvalidOperationException("Runtime manifest table_profiles must cover exactly player counts 2..6");
+        }
+
+        return profiles.OrderBy(profile => profile.PlayerCountMin).ToList();
     }
 
     private static (string NormalizedPath, bool ExpectsDirectory) NormalizeManifestPath(string rawPath)
@@ -684,6 +900,16 @@ internal sealed class G5RuntimeHost
         return value;
     }
 
+    private static int ReadRequiredInt(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.Number || !property.TryGetInt32(out var value))
+        {
+            throw new InvalidOperationException($"Runtime manifest is missing required integer field '{propertyName}'");
+        }
+
+        return value;
+    }
+
     private static string CopyRuntimeBundle(string sourceDir, string destinationDir)
     {
         if (!Directory.Exists(sourceDir))
@@ -712,6 +938,62 @@ internal sealed class G5RuntimeHost
         foreach (var file in source.GetFiles())
         {
             file.CopyTo(Path.Combine(destination.FullName, file.Name), overwrite: true);
+        }
+    }
+
+    private IEnumerable<RuntimeTableProfile> BuildRuntimeProfiles(IEnumerable<TableProfileDefinition> profiles, G5ReflectionBindings bindings)
+    {
+        foreach (var profile in profiles)
+        {
+            yield return new RuntimeTableProfile(
+                profile.Profile,
+                profile.PlayerCountMin,
+                profile.PlayerCountMax,
+                profile.TableType,
+                profile.OpponentStatsFile,
+                profile.TableType switch
+                {
+                    "HeadsUp" => bindings.TableTypeHeadsUpValue,
+                    "SixMax" => bindings.TableTypeSixMaxValue,
+                    _ => throw new InvalidOperationException($"Unsupported runtime table type '{profile.TableType}' in manifest profile '{profile.Profile}'"),
+                });
+        }
+    }
+
+    private void SetProfileDefinitions(IEnumerable<TableProfileDefinition> profiles)
+    {
+        lock (_stateLock)
+        {
+            _profileDefinitions = profiles.ToDictionary(profile => profile.Profile, profile => profile, StringComparer.Ordinal);
+            _profileHealth = _profileDefinitions.Values.ToDictionary(
+                profile => profile.Profile,
+                profile => new HealthProfileStatus
+                {
+                    Ready = false,
+                    PlayerCountMin = profile.PlayerCountMin,
+                    PlayerCountMax = profile.PlayerCountMax,
+                    TableType = profile.TableType,
+                    OpponentStatsFile = profile.OpponentStatsFile,
+                },
+                StringComparer.Ordinal);
+        }
+    }
+
+    private void MarkProfileReady(string profileName, bool ready)
+    {
+        lock (_stateLock)
+        {
+            if (_profileHealth.TryGetValue(profileName, out var profileHealth))
+            {
+                _profileHealth[profileName] = new HealthProfileStatus
+                {
+                    Ready = ready,
+                    PlayerCountMin = profileHealth.PlayerCountMin,
+                    PlayerCountMax = profileHealth.PlayerCountMax,
+                    TableType = profileHealth.TableType,
+                    OpponentStatsFile = profileHealth.OpponentStatsFile,
+                };
+            }
         }
     }
 
@@ -844,9 +1126,27 @@ internal sealed class G5RuntimeHost
         IReadOnlyList<ActionLogEntry> ReplayEntries,
         ActionLogEntry TargetEntry,
         string[] HeroCards,
-        List<string> Warnings);
+        List<string> Warnings,
+        RuntimeTableProfile Profile,
+        int SeatedPlayerCount,
+        string TargetStreet);
 
-    private sealed record RuntimeManifest(string BundleVersion);
+    private sealed record TableProfileDefinition(
+        string Profile,
+        int PlayerCountMin,
+        int PlayerCountMax,
+        string TableType,
+        string OpponentStatsFile);
+
+    private sealed record RuntimeTableProfile(
+        string Profile,
+        int PlayerCountMin,
+        int PlayerCountMax,
+        string TableType,
+        string OpponentStatsFile,
+        object TableTypeEnumValue);
+
+    private sealed record RuntimeManifest(string BundleVersion, IReadOnlyList<TableProfileDefinition> TableProfiles);
 
     private sealed record InitializationState(string Stage, bool Ready, bool RuntimeLoaded, bool WarmModelReady, string? Error)
     {

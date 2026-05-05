@@ -30,7 +30,10 @@ STRICT_STRING_FIELDS = (
     "builder_dockerfile_sha256",
     "build_script_version",
 )
-STRICT_LIST_FIELDS = ("source_patches_applied",)
+EXPECTED_TABLE_PROFILES = {
+    "heads_up": {"player_count_min": 2, "player_count_max": 2, "table_type": "HeadsUp"},
+    "six_max": {"player_count_min": 3, "player_count_max": 6, "table_type": "SixMax"},
+}
 
 
 def fail(message: str) -> None:
@@ -123,6 +126,110 @@ def normalize_string_list_field(
     return normalized
 
 
+def normalize_table_profiles_field(
+    data: dict[str, Any],
+    manifest_path: str,
+    *,
+    required_files: list[str],
+) -> tuple[int, list[dict[str, Any]]]:
+    schema_version = data.get("table_profile_schema_version")
+    if not isinstance(schema_version, int):
+        fail(f"{manifest_path}: field 'table_profile_schema_version' must be an integer")
+    if schema_version != 1:
+        fail(f"{manifest_path}: table_profile_schema_version must be 1")
+
+    raw_profiles = data.get("table_profiles")
+    if not isinstance(raw_profiles, list) or not raw_profiles:
+        fail(f"{manifest_path}: field 'table_profiles' must be a non-empty array")
+
+    normalized_profiles: list[dict[str, Any]] = []
+    seen_profiles: set[str] = set()
+    coverage: set[int] = set()
+    required_files_set = set(required_files)
+
+    for index, raw_profile in enumerate(raw_profiles):
+        if not isinstance(raw_profile, dict):
+            fail(f"{manifest_path}: table_profiles[{index}] must be an object")
+
+        profile_name = raw_profile.get("profile")
+        if not isinstance(profile_name, str) or not profile_name.strip():
+            fail(f"{manifest_path}: table_profiles[{index}].profile must be a non-empty string")
+        profile_name = profile_name.strip()
+        if profile_name in seen_profiles:
+            fail(f"{manifest_path}: duplicate table profile '{profile_name}'")
+        if profile_name not in EXPECTED_TABLE_PROFILES:
+            fail(f"{manifest_path}: unsupported table profile '{profile_name}'")
+        seen_profiles.add(profile_name)
+
+        player_count_min = raw_profile.get("player_count_min")
+        player_count_max = raw_profile.get("player_count_max")
+        if not isinstance(player_count_min, int) or not isinstance(player_count_max, int):
+            fail(f"{manifest_path}: table_profiles[{index}] player count bounds must be integers")
+        if player_count_min <= 0 or player_count_max <= 0 or player_count_min > player_count_max:
+            fail(f"{manifest_path}: table_profiles[{index}] has invalid player count bounds")
+
+        table_type = raw_profile.get("table_type")
+        if not isinstance(table_type, str) or not table_type.strip():
+            fail(f"{manifest_path}: table_profiles[{index}].table_type must be a non-empty string")
+        table_type = table_type.strip()
+
+        opponent_stats_file_raw = raw_profile.get("opponent_stats_file")
+        opponent_stats_file = normalize_manifest_path(opponent_stats_file_raw)
+        if opponent_stats_file.endswith("/"):
+            fail(f"{manifest_path}: table_profiles[{index}].opponent_stats_file must be a file path")
+        if opponent_stats_file not in required_files_set:
+            fail(
+                f"{manifest_path}: table_profiles[{index}].opponent_stats_file must also appear in required_files: {opponent_stats_file}"
+            )
+
+        expected = EXPECTED_TABLE_PROFILES[profile_name]
+        if player_count_min != expected["player_count_min"] or player_count_max != expected["player_count_max"]:
+            fail(
+                f"{manifest_path}: profile '{profile_name}' must cover exactly {expected['player_count_min']}..{expected['player_count_max']}"
+            )
+        if table_type != expected["table_type"]:
+            fail(f"{manifest_path}: profile '{profile_name}' must use table_type '{expected['table_type']}'")
+
+        for player_count in range(player_count_min, player_count_max + 1):
+            if player_count in coverage:
+                fail(f"{manifest_path}: table_profiles contain overlapping player count coverage")
+            coverage.add(player_count)
+
+        normalized_profiles.append(
+            {
+                "profile": profile_name,
+                "player_count_min": player_count_min,
+                "player_count_max": player_count_max,
+                "table_type": table_type,
+                "opponent_stats_file": opponent_stats_file,
+            }
+        )
+
+    if seen_profiles != set(EXPECTED_TABLE_PROFILES):
+        missing = sorted(set(EXPECTED_TABLE_PROFILES) - seen_profiles)
+        extra = sorted(seen_profiles - set(EXPECTED_TABLE_PROFILES))
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if extra:
+            details.append(f"unexpected {', '.join(extra)}")
+        fail(f"{manifest_path}: table_profiles must include exactly heads_up and six_max ({'; '.join(details)})")
+
+    expected_coverage = set(range(2, 7))
+    if coverage != expected_coverage:
+        missing = sorted(expected_coverage - coverage)
+        extra = sorted(coverage - expected_coverage)
+        details = []
+        if missing:
+            details.append(f"missing coverage for {missing}")
+        if extra:
+            details.append(f"unexpected coverage for {extra}")
+        fail(f"{manifest_path}: table_profiles must cover exactly player counts 2..6 ({'; '.join(details)})")
+
+    normalized_profiles.sort(key=lambda item: item["player_count_min"])
+    return schema_version, normalized_profiles
+
+
 def validate_manifest(data: dict[str, Any], manifest_path: str, *, require_build_metadata: bool) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
 
@@ -147,6 +254,14 @@ def validate_manifest(data: dict[str, Any], manifest_path: str, *, require_build
         )
         assert value is not None
         normalized[field] = value
+
+    table_profile_schema_version, table_profiles = normalize_table_profiles_field(
+        data,
+        manifest_path,
+        required_files=normalized["required_files"],
+    )
+    normalized["table_profile_schema_version"] = table_profile_schema_version
+    normalized["table_profiles"] = table_profiles
 
     for field in STRICT_STRING_FIELDS:
         value = normalize_string_field(data, field, manifest_path, required=require_build_metadata)
