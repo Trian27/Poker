@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
+    # Internal services
+    GAME_SERVER_URL: str = "http://game-server:3000"
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug_value(cls, value):

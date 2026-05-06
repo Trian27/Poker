@@ -198,6 +198,16 @@ def get_current_user(
     return payload
 
 
+async def post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+    base_url = settings.GAME_SERVER_URL.rstrip("/")
+    async with httpx.AsyncClient() as client:
+        return await client.post(
+            f"{base_url}{path}",
+            json=payload,
+            timeout=timeout,
+        )
+
+
 def _is_league_admin(db: Session, league_id: int, user_id: int) -> bool:
     return db.query(LeagueAdmin.id).filter(
         LeagueAdmin.league_id == league_id,
@@ -3342,39 +3352,37 @@ async def join_table(
 
         # Idempotent rejoin: ensure game server has this seat mapping (important after game-server restarts).
         try:
-            async with httpx.AsyncClient() as client:
-                game_server_url = "http://game-server:3000/_internal/seat-player"
-                seat_request = SeatPlayerRequest(
-                    table_id=table_id,
-                    user_id=user_id,
-                    username=username,
-                    stack=join_stack_amount,
-                    seat_number=request.seat_number,
-                    community_id=table.community_id,
-                    table_name=table.name,
-                )
+            seat_request = SeatPlayerRequest(
+                table_id=table_id,
+                user_id=user_id,
+                username=username,
+                stack=join_stack_amount,
+                seat_number=request.seat_number,
+                community_id=table.community_id,
+                table_name=table.name,
+            )
 
-                response = await client.post(
-                    game_server_url,
-                    json=seat_request.model_dump(),
-                    timeout=10.0
-                )
+            response = await post_game_server_json(
+                "/_internal/seat-player",
+                seat_request.model_dump(),
+                timeout=10.0
+            )
 
-                if response.status_code != 200:
-                    response_text = response.text or ""
-                    try:
-                        response_json = response.json()
-                        if isinstance(response_json, dict) and response_json.get("error"):
-                            response_text = str(response_json.get("error"))
-                    except Exception:
-                        pass
+            if response.status_code != 200:
+                response_text = response.text or ""
+                try:
+                    response_json = response.json()
+                    if isinstance(response_json, dict) and response_json.get("error"):
+                        response_text = str(response_json.get("error"))
+                except Exception:
+                    pass
 
-                    # The player may already exist in game state, which is fine for rejoin.
-                    if not (response.status_code == 400 and "already seated" in response_text.lower()):
-                        raise HTTPException(
-                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                            detail=f"Failed to rejoin table: {response_text}"
-                        )
+                # The player may already exist in game state, which is fine for rejoin.
+                if not (response.status_code == 400 and "already seated" in response_text.lower()):
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=f"Failed to rejoin table: {response_text}"
+                    )
         except httpx.RequestError as e:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -3484,40 +3492,38 @@ async def join_table(
     
     # Step 7: Seat player in game server (internal HTTP call)
     try:
-        async with httpx.AsyncClient() as client:
-            game_server_url = "http://game-server:3000/_internal/seat-player"
-            seat_request = SeatPlayerRequest(
-                table_id=table_id,
-                user_id=user_id,
-                username=username,
-                stack=join_stack_amount,
-                seat_number=request.seat_number,
-                community_id=table.community_id,
-                table_name=table.name,
+        seat_request = SeatPlayerRequest(
+            table_id=table_id,
+            user_id=user_id,
+            username=username,
+            stack=join_stack_amount,
+            seat_number=request.seat_number,
+            community_id=table.community_id,
+            table_name=table.name,
+        )
+        
+        response = await post_game_server_json(
+            "/_internal/seat-player",
+            seat_request.model_dump(),
+            timeout=10.0
+        )
+
+        if response.status_code != 200:
+            # Rollback: credit wallet back and free seat
+            if should_debit_wallet and wallet:
+                wallet.balance += join_stack_amount
+            seat.user_id = None
+            seat.occupied_at = None
+            if new_session:
+                persisted_session = db.query(TableSession).filter(TableSession.id == new_session.id).first()
+                if persisted_session:
+                    db.delete(persisted_session)
+            db.commit()
+            logger.error(f"Failed to seat player. Rolling back wallet debit and seat occupation. Response: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to join table: {response.text}"
             )
-            
-            response = await client.post(
-                game_server_url,
-                json=seat_request.model_dump(),
-                timeout=10.0
-            )
-            
-            if response.status_code != 200:
-                # Rollback: credit wallet back and free seat
-                if should_debit_wallet and wallet:
-                    wallet.balance += join_stack_amount
-                seat.user_id = None
-                seat.occupied_at = None
-                if new_session:
-                    persisted_session = db.query(TableSession).filter(TableSession.id == new_session.id).first()
-                    if persisted_session:
-                        db.delete(persisted_session)
-                db.commit()
-                logger.error(f"Failed to seat player. Rolling back wallet debit and seat occupation. Response: {response.text}")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"Failed to join table: {response.text}"
-                )
     
     except httpx.RequestError as e:
         # Rollback: credit wallet back and free seat
@@ -3893,49 +3899,47 @@ async def unseat_player(table_id: int, user_id: int, db: Session = Depends(get_d
         
         # Notify game server to seat the player
         try:
-            async with httpx.AsyncClient() as client:
-                game_server_url = "http://game-server:3000/_internal/seat-player"
-                seat_request = SeatPlayerRequest(
-                    table_id=table_id,
-                    user_id=queued_user_id,
-                    username=queued_user.username,
-                    stack=buy_in_amount,
-                    seat_number=freed_seat_number,
-                    community_id=table.community_id,
-                    table_name=table.name,
-                )
-                
-                response = await client.post(
-                    game_server_url,
-                    json=seat_request.model_dump(),
-                    timeout=5.0
-                )
-                
-                if response.status_code == 200:
-                    logger.info(f"Successfully seated queued player {queued_user.username} in game server")
-                    return {
-                        "success": True,
-                        "message": f"Player unseated from seat {freed_seat_number}",
-                        "auto_seated": {
-                            "user_id": queued_user_id,
-                            "username": queued_user.username,
-                            "seat_number": freed_seat_number,
-                            "buy_in": buy_in_amount
-                        }
+            seat_request = SeatPlayerRequest(
+                table_id=table_id,
+                user_id=queued_user_id,
+                username=queued_user.username,
+                stack=buy_in_amount,
+                seat_number=freed_seat_number,
+                community_id=table.community_id,
+                table_name=table.name,
+            )
+            
+            response = await post_game_server_json(
+                "/_internal/seat-player",
+                seat_request.model_dump(),
+                timeout=5.0
+            )
+
+            if response.status_code == 200:
+                logger.info(f"Successfully seated queued player {queued_user.username} in game server")
+                return {
+                    "success": True,
+                    "message": f"Player unseated from seat {freed_seat_number}",
+                    "auto_seated": {
+                        "user_id": queued_user_id,
+                        "username": queued_user.username,
+                        "seat_number": freed_seat_number,
+                        "buy_in": buy_in_amount
                     }
-                else:
-                    logger.error(f"Failed to seat player in game server: {response.text}")
-                    # Rollback the seat assignment since game server failed
-                    seat.user_id = None
-                    seat.occupied_at = None
-                    wallet.balance += buy_in_amount
-                    db.query(TableSession).filter(
-                        TableSession.user_id == queued_user_id,
-                        TableSession.table_id == table_id,
-                        TableSession.left_at.is_(None)
-                    ).update({"left_at": func.now()})
-                    db.commit()
-                    return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
+                }
+            else:
+                logger.error(f"Failed to seat player in game server: {response.text}")
+                # Rollback the seat assignment since game server failed
+                seat.user_id = None
+                seat.occupied_at = None
+                wallet.balance += buy_in_amount
+                db.query(TableSession).filter(
+                    TableSession.user_id == queued_user_id,
+                    TableSession.table_id == table_id,
+                    TableSession.left_at.is_(None)
+                ).update({"left_at": func.now()})
+                db.commit()
+                return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
                     
         except Exception as e:
             logger.error(f"Error notifying game server: {e}")
