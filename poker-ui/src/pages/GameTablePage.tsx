@@ -3,7 +3,6 @@
  */
 import React, { useCallback, useMemo, useRef, useState, useEffect, type CSSProperties } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { io, Socket } from 'socket.io-client';
 import { useAuth } from '../auth-context';
 import { ActionTimer } from '../components/ActionTimer';
 import RulesScrollHelp from '../components/RulesScrollHelp';
@@ -11,6 +10,7 @@ import { tablesApi, skinsApi, playerNotesApi } from '../api';
 import type { GameState, GameAction, Card, ChatMessage, HandResult, TableSeat } from '../types';
 import { getApiErrorMessage } from '../utils/error';
 import { suppressAutoRejoinForMs } from '../utils/activeSeatRejoin';
+import { createGameSocket, type GameSocket } from '../gameSocket';
 import './GameTable.css';
 
 const GAME_SERVER_URL = import.meta.env.VITE_GAME_SERVER_URL || 'http://localhost:3000';
@@ -89,7 +89,7 @@ const normalizePhase = (rawPhase: unknown): GameState['phase'] => {
 export const GameTablePage: React.FC = () => {
   const params = useParams<{ tableId?: string; communityId?: string }>();
   const tableIdParam = params.tableId ?? params.communityId;
-  const [socket, setSocket] = useState<Socket | null>(null);
+  const [socket, setSocket] = useState<GameSocket | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
@@ -485,13 +485,11 @@ export const GameTablePage: React.FC = () => {
   useEffect(() => {
     if (!token || !tableIdParam) return;
 
-    const newSocket = io(GAME_SERVER_URL, {
-      auth: {
-        token,
-        spectator: spectateRequested,
-        tableId: Number.isFinite(tableId) ? tableId : undefined,
-      },
-      transports: ['websocket', 'polling'],
+    const newSocket = createGameSocket({
+      serverUrl: GAME_SERVER_URL,
+      token,
+      spectator: spectateRequested,
+      tableId: Number.isFinite(tableId) ? tableId : undefined,
     });
 
     newSocket.on('connect', () => {
@@ -1232,7 +1230,7 @@ export const GameTablePage: React.FC = () => {
       <div className="game-container" style={tableThemeStyles} ref={gameContainerRef}>
         <div className="connecting-overlay">
           <div className="spinner"></div>
-          <p>Connecting to game server...</p>
+          <p>{reconnecting ? 'Reconnecting to game...' : 'Connecting to game server...'}</p>
           {error && <p className="error">{error}</p>}
           <button onClick={handleLeaveGame} className="btn-secondary">
             Back to Lobby
