@@ -2,30 +2,22 @@ import axios from 'axios';
 import { PokerServer } from '../server';
 import { Game } from '../engine/Game';
 import { Player } from '../engine/Player';
-import { GameStateStorage, redis } from '../redis';
+import { GameStateStorage, closeRedis } from '../redis';
 
 const TEST_PORT = 3006;
 
 describe('Agent API Endpoints', () => {
   let server: PokerServer;
-  let serverInstance: any;
   const gameId = `table_${Date.now()}`;
 
   beforeAll((done) => {
     server = new PokerServer(TEST_PORT);
-    serverInstance = server['server'];
     setTimeout(done, 120);
   });
 
-  afterAll((done) => {
-    serverInstance?.close(async () => {
-      try {
-        await redis.quit();
-      } catch {
-        // Ignore if already closed by another cleanup path.
-      }
-      done();
-    });
+  afterAll(async () => {
+    await server.close();
+    await closeRedis();
   });
 
   afterEach(async () => {
@@ -75,5 +67,31 @@ describe('Agent API Endpoints', () => {
     expect(postActionStateResponse.status).toBe(200);
     expect(postActionStateResponse.data.botUserIds).toContain(userOneId);
     expect(postActionStateResponse.data.botUserIds).toContain(activePlayerUserId);
+
+    const preflopState = postActionStateResponse.data.gameState;
+    expect(preflopState.stage).toBe('preflop');
+    expect(preflopState.currentPlayerIndex).toBe(preflopState.bigBlindIndex);
+
+    const preflopPlayers = Array.isArray(preflopState.players) ? preflopState.players : [];
+    const bbPlayerIdText = preflopPlayers[preflopState.currentPlayerIndex]?.id as string | undefined;
+    const bbPlayerUserId = Number((bbPlayerIdText || '').match(/^player_(\d+)_/)?.[1]);
+    expect(Number.isFinite(bbPlayerUserId)).toBe(true);
+
+    const bbCheckResponse = await axios.post(`http://localhost:${TEST_PORT}/_internal/agent-action`, {
+      userId: bbPlayerUserId,
+      gameId,
+      action: 'check',
+    });
+
+    expect(bbCheckResponse.status).toBe(200);
+    expect(bbCheckResponse.data.success).toBe(true);
+
+    const flopStateResponse = await axios.get(`http://localhost:${TEST_PORT}/_internal/game/${gameId}/state`, {
+      params: { userId: userOneId },
+    });
+
+    expect(flopStateResponse.status).toBe(200);
+    expect(flopStateResponse.data.gameState.stage).toBe('flop');
+    expect(flopStateResponse.data.gameState.currentPlayerIndex).toBe(flopStateResponse.data.gameState.bigBlindIndex);
   });
 });

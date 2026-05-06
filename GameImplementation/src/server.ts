@@ -90,6 +90,9 @@ export class PokerServer {
   private readonly RECONNECT_TIMEOUT = 30000; // 30 seconds to reconnect
   private readonly HAND_RESULT_DELAY = 7000; // 7 seconds to show showdown results
   private staleTableSweepTimer?: NodeJS.Timeout;
+  private shuttingDown = false;
+  private closePromise?: Promise<void>;
+  private pendingDisconnects: Set<Promise<void>> = new Set();
   private server: any; // HTTP server instance
   private app: express.Application; // Express app
 
@@ -152,6 +155,76 @@ export class PokerServer {
       void runSweep();
     }, intervalMs);
     this.staleTableSweepTimer.unref?.();
+  }
+
+  private trackPendingDisconnect(work: Promise<void>): void {
+    this.pendingDisconnects.add(work);
+    work.finally(() => {
+      this.pendingDisconnects.delete(work);
+    });
+  }
+
+  private async waitForPendingDisconnects(): Promise<void> {
+    if (this.pendingDisconnects.size === 0) {
+      return;
+    }
+    await Promise.allSettled(Array.from(this.pendingDisconnects));
+  }
+
+  private clearSpectatorSocketState(socketId: string, userId?: number): void {
+    this.removeSpectatorSocket(socketId);
+    this.connectedPlayers.delete(socketId);
+    this.disconnectedPlayers.delete(socketId);
+    this.clearDisconnectCleanupTimer(socketId);
+    if (userId !== undefined && this.userIdToSocketId.get(userId) === socketId) {
+      this.userIdToSocketId.delete(userId);
+    }
+  }
+
+  private cleanupSocketStateForShutdown(socketId: string, userId: number): void {
+    this.clearSpectatorSocketState(socketId, userId);
+    this.lobby = this.lobby.filter((queuedSocketId) => queuedSocketId !== socketId);
+    for (const [, tableState] of this.tableReadiness.entries()) {
+      tableState.connectedPlayers.delete(userId.toString());
+    }
+  }
+
+  public async close(): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+
+    this.closePromise = (async () => {
+      this.shuttingDown = true;
+      this.clearAllActionTimers();
+      this.clearAllDisconnectCleanupTimers();
+      if (this.staleTableSweepTimer) {
+        clearInterval(this.staleTableSweepTimer);
+        this.staleTableSweepTimer = undefined;
+      }
+
+      this.io.local.disconnectSockets(true);
+
+      await new Promise<void>((resolve) => {
+        this.io.close(() => resolve());
+      });
+
+      await this.waitForPendingDisconnects();
+
+      if (this.server?.listening) {
+        await new Promise<void>((resolve, reject) => {
+          this.server.close((error?: Error) => {
+            if (error && error.message !== 'Server is not running.') {
+              reject(error);
+              return;
+            }
+            resolve();
+          });
+        });
+      }
+    })();
+
+    return this.closePromise;
   }
 
   /**
@@ -556,6 +629,72 @@ export class PokerServer {
     return undefined;
   }
 
+  private async tryRecoverRequestedTableFromRedis(
+    user: AuthenticatedUser,
+    socketId: string,
+    gameId: string,
+  ): Promise<boolean> {
+    const gameData = await GameStateStorage.loadGameState(gameId);
+    if (!gameData) {
+      return false;
+    }
+
+    const game = Game.fromJSON(gameData);
+    const players = game.getPlayers();
+    const requestedPlayer = players.find((player) => this.extractUserIdFromPlayerId(player.id) === user.id);
+    if (!requestedPlayer) {
+      return false;
+    }
+
+    let tableState = this.tableReadiness.get(gameId);
+    if (!tableState) {
+      tableState = {
+        gameId,
+        seatedPlayers: new Set(),
+        connectedPlayers: new Set(),
+        playerIds: new Map(),
+        gameStarted: false,
+      };
+      this.tableReadiness.set(gameId, tableState);
+    }
+
+    if (!tableState.playerIds) {
+      tableState.playerIds = new Map();
+    }
+
+    for (const player of players) {
+      const mappedUserId = this.extractUserIdFromPlayerId(player.id);
+      if (mappedUserId !== null) {
+        tableState.seatedPlayers.add(mappedUserId.toString());
+        tableState.playerIds.set(mappedUserId.toString(), player.id);
+        this.playerGameMap.set(player.id, gameId);
+      }
+    }
+
+    tableState.connectedPlayers.add(user.id.toString());
+
+    const socket = this.io.sockets.sockets.get(socketId);
+    if (socket) {
+      socket.join(gameId);
+      console.log(`♻️  Recovered requested table ${gameId} for ${user.username}`);
+    }
+
+    const existing = this.connectedPlayers.get(socketId);
+    this.connectedPlayers.set(socketId, {
+      ...existing,
+      socketId,
+      playerId: requestedPlayer.id,
+      playerName: user.username,
+      userId: user.id,
+      communityId: tableState.communityId,
+      gameId,
+    });
+
+    this.emitPlayerState(socketId, gameId, requestedPlayer.id, game);
+    await this.checkAndStartGame(gameId);
+    return true;
+  }
+
   private async handlePlayerWebSocketConnectionForGame(
     user: AuthenticatedUser,
     socketId: string,
@@ -649,6 +788,10 @@ export class PokerServer {
     }
 
     if (requestedGameId && !matchedRequestedGame) {
+      const recovered = await this.tryRecoverRequestedTableFromRedis(user, socketId, requestedGameId);
+      if (recovered) {
+        return;
+      }
       const socket = this.io.sockets.sockets.get(socketId);
       if (socket) {
         this.io.to(socket.id).emit('error', {
@@ -818,9 +961,10 @@ export class PokerServer {
     console.log(`✅ ${user.username} reconnected to game ${gameId}`);
 
     this.recentlyReconnected.add(updatedPlayerInfo.playerId);
-    setTimeout(() => {
+    const recentlyReconnectedTimer = setTimeout(() => {
       this.recentlyReconnected.delete(updatedPlayerInfo.playerId);
     }, 5000);
+    recentlyReconnectedTimer.unref?.();
   }
 
   /**
@@ -1000,7 +1144,10 @@ export class PokerServer {
 
       socket.on('disconnect', (reason) => {
         console.log(`❌ Player disconnected: ${user.username} (${socket.id}) reason=${reason}`);
-        this.handleDisconnect(socket, reason);
+        const disconnectWork = this.handleDisconnect(socket, reason).catch((error) => {
+          console.error(`❌ Failed to handle disconnect for ${user.username}:`, error);
+        });
+        this.trackPendingDisconnect(disconnectWork);
       });
     });
   }
@@ -1721,7 +1868,7 @@ export class PokerServer {
     await this.processGamePayouts(gameId, game);
     this.clearActionTimer(gameId);
 
-    setTimeout(async () => {
+    const handCompleteTimer = setTimeout(async () => {
       const latestData = await GameStateStorage.loadGameState(gameId);
       if (!latestData) {
         return;
@@ -1765,6 +1912,7 @@ export class PokerServer {
 
       await this.broadcastGameState(gameId);
     }, this.HAND_RESULT_DELAY);
+    handCompleteTimer.unref?.();
   }
 
   private async broadcastGameState(gameId: string): Promise<void> {
@@ -1828,6 +1976,7 @@ export class PokerServer {
     const timerId = setTimeout(async () => {
       await this.handleActionTimeout(gameId);
     }, safeTimeoutMs);
+    timerId.unref?.();
 
     this.actionTimers.set(gameId, timerId);
   }
@@ -2047,13 +2196,12 @@ export class PokerServer {
     const user = socket.data.user;
 
     if (this.spectatorReadOnlySockets.has(socketId)) {
-      this.removeSpectatorSocket(socketId);
-      this.connectedPlayers.delete(socketId);
-      this.disconnectedPlayers.delete(socketId);
-      this.clearDisconnectCleanupTimer(socketId);
-      if (this.userIdToSocketId.get(user.id) === socketId) {
-        this.userIdToSocketId.delete(user.id);
-      }
+      this.clearSpectatorSocketState(socketId, user.id);
+      return;
+    }
+
+    if (this.shuttingDown) {
+      this.cleanupSocketStateForShutdown(socketId, user.id);
       return;
     }
 
