@@ -312,12 +312,15 @@ describe('Game', () => {
       const bbPlayer = state.players[state.bigBlindIndex];
       
       // Complete pre-flop: SB acts first in heads-up
-      game.handleAction(sbPlayer.id, 'call'); // SB calls BB
-      game.handleAction(bbPlayer.id, 'check'); // BB checks
+      expect(game.handleAction(sbPlayer.id, 'call').valid).toBe(true);
+      expect(game.getGameState().stage).toBe('preflop');
+      expect(game.getGameState().currentPlayerIndex).toBe(state.bigBlindIndex);
+      expect(game.handleAction(bbPlayer.id, 'check').valid).toBe(true);
+      expect(game.getGameState().stage).toBe('flop');
     });
 
     it('should reject opening bet smaller than big blind', () => {
-      // Post-flop, SB acts first - get current player
+      // Post-flop, the big blind acts first in heads-up.
       const state = game.getGameState();
       const currentPlayerId = state.players[state.currentPlayerIndex].id;
       
@@ -441,8 +444,165 @@ describe('Game', () => {
     });
   });
 
+  describe('Short All-In Reopen Rules', () => {
+    const advanceHeadsUpToFlop = (targetGame: Game) => {
+      const preflopState = targetGame.getGameState();
+      const sbId = preflopState.players[preflopState.smallBlindIndex].id;
+      const bbId = preflopState.players[preflopState.bigBlindIndex].id;
+      expect(targetGame.handleAction(sbId, 'call').valid).toBe(true);
+      expect(targetGame.handleAction(bbId, 'check').valid).toBe(true);
+      return targetGame.getGameState();
+    };
+
+    const advanceThreePlayersToFlop = (targetGame: Game) => {
+      let state = targetGame.getGameState();
+      expect(targetGame.handleAction(state.players[state.currentPlayerIndex].id, 'call').valid).toBe(true);
+
+      state = targetGame.getGameState();
+      expect(targetGame.handleAction(state.players[state.currentPlayerIndex].id, 'call').valid).toBe(true);
+
+      state = targetGame.getGameState();
+      expect(targetGame.handleAction(state.players[state.currentPlayerIndex].id, 'check').valid).toBe(true);
+
+      return targetGame.getGameState();
+    };
+
+    it('should not reopen betting after a short all-in heads-up', () => {
+      const shortAllInGame = new Game(config);
+      const deepStack = new Player('p1', 'Alice', 1000, 1);
+      const shortStack = new Player('p2', 'Bob', 150, 2);
+      shortAllInGame.addPlayer(deepStack);
+      shortAllInGame.addPlayer(shortStack);
+      shortAllInGame.startHand();
+
+      const flopState = advanceHeadsUpToFlop(shortAllInGame);
+      const bettorId = flopState.players[flopState.currentPlayerIndex].id;
+      const shortStackId = flopState.players[(flopState.currentPlayerIndex + 1) % 2].id;
+
+      expect(shortAllInGame.handleAction(bettorId, 'bet', 100).valid).toBe(true);
+      expect(shortAllInGame.handleAction(shortStackId, 'all-in').valid).toBe(true);
+
+      const afterShortAllIn = shortAllInGame.getGameState();
+      expect(afterShortAllIn.stage).toBe('flop');
+      expect(afterShortAllIn.currentBet).toBe(130);
+      expect(afterShortAllIn.minRaiseSize).toBe(100);
+      expect(afterShortAllIn.players[afterShortAllIn.currentPlayerIndex].id).toBe(bettorId);
+
+      const noReopenRaise = shortAllInGame.handleAction(bettorId, 'raise', 100);
+      expect(noReopenRaise.valid).toBe(false);
+      expect(noReopenRaise.error).toContain('not been reopened');
+
+      const callResult = shortAllInGame.handleAction(bettorId, 'call');
+      expect(callResult.valid).toBe(true);
+
+      const afterCall = shortAllInGame.getGameState();
+      expect(afterCall.stage).toBe('complete');
+      expect(afterCall.currentBet).toBe(0);
+    });
+
+    it('should reopen betting after cumulative short all-ins reach a full raise', () => {
+      const cumulativeGame = new Game(config);
+      const firstShort = new Player('p1', 'Alice', 150, 1);
+      const secondShort = new Player('p2', 'Bob', 220, 2);
+      const deepStack = new Player('p3', 'Charlie', 1000, 3);
+      cumulativeGame.addPlayer(firstShort);
+      cumulativeGame.addPlayer(secondShort);
+      cumulativeGame.addPlayer(deepStack);
+      cumulativeGame.startHand();
+
+      const flopState = advanceThreePlayersToFlop(cumulativeGame);
+      const originalBettorId = flopState.players[flopState.currentPlayerIndex].id;
+
+      expect(cumulativeGame.handleAction(originalBettorId, 'bet', 100).valid).toBe(true);
+
+      let state = cumulativeGame.getGameState();
+      expect(cumulativeGame.handleAction(state.players[state.currentPlayerIndex].id, 'all-in').valid).toBe(true);
+
+      state = cumulativeGame.getGameState();
+      expect(state.currentBet).toBe(130);
+      expect(state.minRaiseSize).toBe(100);
+      expect(cumulativeGame.handleAction(state.players[state.currentPlayerIndex].id, 'all-in').valid).toBe(true);
+
+      state = cumulativeGame.getGameState();
+      expect(state.currentBet).toBe(200);
+      expect(state.minRaiseSize).toBe(100);
+      expect(state.players[state.currentPlayerIndex].id).toBe(originalBettorId);
+
+      const reopenedRaise = cumulativeGame.handleAction(originalBettorId, 'raise', 100);
+      expect(reopenedRaise.valid).toBe(true);
+
+      const afterRaise = cumulativeGame.getGameState();
+      expect(afterRaise.stage).toBe('complete');
+      expect(afterRaise.currentBet).toBe(0);
+    });
+
+    it('should keep betting closed when cumulative short all-ins stay below a full raise', () => {
+      const cumulativeGame = new Game(config);
+      const firstShort = new Player('p1', 'Alice', 150, 1);
+      const secondShort = new Player('p2', 'Bob', 200, 2);
+      const deepStack = new Player('p3', 'Charlie', 1000, 3);
+      cumulativeGame.addPlayer(firstShort);
+      cumulativeGame.addPlayer(secondShort);
+      cumulativeGame.addPlayer(deepStack);
+      cumulativeGame.startHand();
+
+      const flopState = advanceThreePlayersToFlop(cumulativeGame);
+      const originalBettorId = flopState.players[flopState.currentPlayerIndex].id;
+
+      expect(cumulativeGame.handleAction(originalBettorId, 'bet', 100).valid).toBe(true);
+
+      let state = cumulativeGame.getGameState();
+      expect(cumulativeGame.handleAction(state.players[state.currentPlayerIndex].id, 'all-in').valid).toBe(true);
+
+      state = cumulativeGame.getGameState();
+      expect(cumulativeGame.handleAction(state.players[state.currentPlayerIndex].id, 'all-in').valid).toBe(true);
+
+      const afterSecondShortAllIn = cumulativeGame.getGameState();
+      expect(afterSecondShortAllIn.currentBet).toBe(180);
+      expect(afterSecondShortAllIn.minRaiseSize).toBe(100);
+      expect(afterSecondShortAllIn.players[afterSecondShortAllIn.currentPlayerIndex].id).toBe(originalBettorId);
+
+      const closedRaise = cumulativeGame.handleAction(originalBettorId, 'raise', 100);
+      expect(closedRaise.valid).toBe(false);
+      expect(closedRaise.error).toContain('not been reopened');
+    });
+
+    it('should keep the minimum raise threshold after a short all-in opener below the street minimum', () => {
+      const openerGame = new Game(config);
+      const shortOpener = new Player('p1', 'Alice', 35, 1);
+      const deepStack = new Player('p2', 'Bob', 1000, 2);
+      openerGame.addPlayer(shortOpener);
+      openerGame.addPlayer(deepStack);
+      openerGame.startHand();
+
+      const flopState = advanceHeadsUpToFlop(openerGame);
+      const openerId = flopState.players[flopState.currentPlayerIndex].id;
+      const responderId = flopState.players[(flopState.currentPlayerIndex + 1) % 2].id;
+
+      const shortOpen = openerGame.handleAction(openerId, 'all-in');
+      expect(shortOpen.valid).toBe(true);
+
+      let state = openerGame.getGameState();
+      expect(state.stage).toBe('flop');
+      expect(state.currentBet).toBe(15);
+      expect(state.minRaiseSize).toBe(20);
+      expect(state.players[state.currentPlayerIndex].id).toBe(responderId);
+
+      const tooSmallRaise = openerGame.handleAction(responderId, 'raise', 15);
+      expect(tooSmallRaise.valid).toBe(false);
+      expect(tooSmallRaise.error).toContain('Minimum raise is $20');
+
+      const legalRaise = openerGame.handleAction(responderId, 'raise', 20);
+      expect(legalRaise.valid).toBe(true);
+
+      state = openerGame.getGameState();
+      expect(state.stage).toBe('complete');
+      expect(state.currentBet).toBe(0);
+    });
+  });
+
   describe('Post-Flop Action Order', () => {
-    it('should start post-flop betting at small blind position', () => {
+    it('should start post-flop betting at big blind position in heads-up', () => {
       game.addPlayer(player1);
       game.addPlayer(player2);
       game.startHand();
@@ -451,16 +611,22 @@ describe('Game', () => {
       const sbId = preState.players[preState.smallBlindIndex].id;
       const bbId = preState.players[preState.bigBlindIndex].id;
       
-      // Complete pre-flop (SB acts first in heads-up)
-      game.handleAction(sbId, 'call');
-      game.handleAction(bbId, 'check');
+      const sbCall = game.handleAction(sbId, 'call');
+      expect(sbCall.valid).toBe(true);
+      const afterSbCall = game.getGameState();
+      expect(afterSbCall.stage).toBe('preflop');
+      expect(afterSbCall.currentPlayerIndex).toBe(afterSbCall.bigBlindIndex);
+
+      const bbCheck = game.handleAction(bbId, 'check');
+      expect(bbCheck.valid).toBe(true);
       
-      // Post-flop should start with small blind
+      // Post-flop should start with big blind.
       const postState = game.getGameState();
-      expect(postState.currentPlayerIndex).toBe(postState.smallBlindIndex);
+      expect(postState.stage).toBe('flop');
+      expect(postState.currentPlayerIndex).toBe(postState.bigBlindIndex);
     });
 
-    it('should maintain small-blind-first order through all streets', () => {
+    it('should maintain big-blind-first order through all streets in heads-up', () => {
       game.addPlayer(player1);
       game.addPlayer(player2);
       game.startHand();
@@ -470,28 +636,30 @@ describe('Game', () => {
       const bbId = preState.players[preState.bigBlindIndex].id;
       
       // Pre-flop
-      game.handleAction(sbId, 'call');
-      game.handleAction(bbId, 'check');
+      expect(game.handleAction(sbId, 'call').valid).toBe(true);
+      expect(game.getGameState().stage).toBe('preflop');
+      expect(game.getGameState().currentPlayerIndex).toBe(game.getGameState().bigBlindIndex);
+      expect(game.handleAction(bbId, 'check').valid).toBe(true);
       
-      // Flop - should start at SB
+      // Flop - should start at BB
       let state = game.getGameState();
-      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
+      expect(state.currentPlayerIndex).toBe(state.bigBlindIndex);
       const currentId1 = state.players[state.currentPlayerIndex].id;
       const nextId1 = state.players[(state.currentPlayerIndex + 1) % 2].id;
-      game.handleAction(currentId1, 'check');
-      game.handleAction(nextId1, 'check');
+      expect(game.handleAction(currentId1, 'check').valid).toBe(true);
+      expect(game.handleAction(nextId1, 'check').valid).toBe(true);
       
-      // Turn - should start at SB
+      // Turn - should start at BB
       state = game.getGameState();
-      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
+      expect(state.currentPlayerIndex).toBe(state.bigBlindIndex);
       const currentId2 = state.players[state.currentPlayerIndex].id;
       const nextId2 = state.players[(state.currentPlayerIndex + 1) % 2].id;
-      game.handleAction(currentId2, 'check');
-      game.handleAction(nextId2, 'check');
+      expect(game.handleAction(currentId2, 'check').valid).toBe(true);
+      expect(game.handleAction(nextId2, 'check').valid).toBe(true);
       
-      // River - should start at SB
+      // River - should start at BB
       state = game.getGameState();
-      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
+      expect(state.currentPlayerIndex).toBe(state.bigBlindIndex);
     });
   });
 
@@ -532,16 +700,21 @@ describe('Game', () => {
       expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
     });
 
-    it('should have dealer act last post-flop in heads-up', () => {
+    it('should have big blind act first post-flop in heads-up', () => {
       headsUpGame.startHand();
-      
-      // Complete pre-flop
-      headsUpGame.handleAction('p1', 'call'); // SB calls
-      headsUpGame.handleAction('p2', 'check'); // BB checks
-      
-      // Post-flop, small blind acts first (which is also dealer in heads-up)
+      const preState = headsUpGame.getGameState();
+      const sbId = preState.players[preState.smallBlindIndex].id;
+      const bbId = preState.players[preState.bigBlindIndex].id;
+
+      expect(headsUpGame.handleAction(sbId, 'call').valid).toBe(true);
+      const afterSbCall = headsUpGame.getGameState();
+      expect(afterSbCall.stage).toBe('preflop');
+      expect(afterSbCall.currentPlayerIndex).toBe(afterSbCall.bigBlindIndex);
+
+      expect(headsUpGame.handleAction(bbId, 'check').valid).toBe(true);
       const state = headsUpGame.getGameState();
-      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
+      expect(state.stage).toBe('flop');
+      expect(state.currentPlayerIndex).toBe(state.bigBlindIndex);
     });
 
     it('should rotate positions correctly over multiple hands', () => {
@@ -562,6 +735,124 @@ describe('Game', () => {
       expect(dealer2).toBe((dealer1 + 1) % 2);
       // Dealer should still be SB
       expect(state2.dealerIndex).toBe(state2.smallBlindIndex);
+    });
+  });
+
+  describe('Preflop Blind Response Rights', () => {
+    it('should keep preflop open until the big blind responds heads-up', () => {
+      game.addPlayer(player1);
+      game.addPlayer(player2);
+      game.startHand();
+
+      const initialState = game.getGameState();
+      const sbId = initialState.players[initialState.smallBlindIndex].id;
+      const bbId = initialState.players[initialState.bigBlindIndex].id;
+
+      const sbCall = game.handleAction(sbId, 'call');
+      expect(sbCall.valid).toBe(true);
+
+      const afterSbCall = game.getGameState();
+      expect(afterSbCall.stage).toBe('preflop');
+      expect(afterSbCall.currentPlayerIndex).toBe(afterSbCall.bigBlindIndex);
+      expect(afterSbCall.players[afterSbCall.currentPlayerIndex].id).toBe(bbId);
+
+      const bbCheck = game.handleAction(bbId, 'check');
+      expect(bbCheck.valid).toBe(true);
+
+      const afterBbCheck = game.getGameState();
+      expect(afterBbCheck.stage).toBe('flop');
+      expect(afterBbCheck.currentPlayerIndex).toBe(afterBbCheck.bigBlindIndex);
+    });
+
+    it('should keep preflop open until small blind and big blind both respond in three-player hands', () => {
+      const threePlayerGame = new Game(config);
+      const p1 = new Player('p1', 'Alice', 1000, 1);
+      const p2 = new Player('p2', 'Bob', 1000, 2);
+      const p3 = new Player('p3', 'Charlie', 1000, 3);
+      threePlayerGame.addPlayer(p1);
+      threePlayerGame.addPlayer(p2);
+      threePlayerGame.addPlayer(p3);
+      threePlayerGame.startHand();
+
+      let state = threePlayerGame.getGameState();
+      const utgId = state.players[state.currentPlayerIndex].id;
+      expect(threePlayerGame.handleAction(utgId, 'call').valid).toBe(true);
+
+      state = threePlayerGame.getGameState();
+      expect(state.stage).toBe('preflop');
+      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
+      expect(threePlayerGame.handleAction(state.players[state.currentPlayerIndex].id, 'call').valid).toBe(true);
+
+      state = threePlayerGame.getGameState();
+      expect(state.stage).toBe('preflop');
+      expect(state.currentPlayerIndex).toBe(state.bigBlindIndex);
+      expect(threePlayerGame.handleAction(state.players[state.currentPlayerIndex].id, 'check').valid).toBe(true);
+
+      state = threePlayerGame.getGameState();
+      expect(state.stage).toBe('flop');
+      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
+    });
+  });
+
+  describe('Live Participant Action Order', () => {
+    it('should treat two active players plus one waiting seat as heads-up for action order', () => {
+      const liveGame = new Game(config);
+      const p1 = new Player('p1', 'Alice', 1000, 1);
+      const p2 = new Player('p2', 'Bob', 1000, 3);
+      const queuedP3 = new Player('p3', 'Charlie', 1000, 5);
+      liveGame.addPlayer(p1);
+      liveGame.addPlayer(p2);
+      liveGame.startHand();
+      liveGame.addPlayer(queuedP3);
+
+      const finishFirstHand = liveGame.getGameState();
+      expect(liveGame.handleAction(finishFirstHand.players[finishFirstHand.currentPlayerIndex].id, 'fold').valid).toBe(true);
+
+      liveGame.startHand();
+      const preflopState = liveGame.getGameState();
+      expect(preflopState.players[preflopState.dealerIndex].waitingForBigBlind).toBe(false);
+      expect(preflopState.players[preflopState.smallBlindIndex].waitingForBigBlind).toBe(false);
+      expect(preflopState.players[preflopState.bigBlindIndex].waitingForBigBlind).toBe(false);
+      expect(preflopState.players.find((player) => player.id === 'p3')?.waitingForBigBlind).toBe(true);
+      expect(preflopState.currentPlayerIndex).toBe(preflopState.smallBlindIndex);
+
+      const sbId = preflopState.players[preflopState.smallBlindIndex].id;
+      const bbId = preflopState.players[preflopState.bigBlindIndex].id;
+      expect(liveGame.handleAction(sbId, 'call').valid).toBe(true);
+
+      const afterSbCall = liveGame.getGameState();
+      expect(afterSbCall.stage).toBe('preflop');
+      expect(afterSbCall.currentPlayerIndex).toBe(afterSbCall.bigBlindIndex);
+      expect(afterSbCall.players[afterSbCall.currentPlayerIndex].id).toBe(bbId);
+
+      expect(liveGame.handleAction(bbId, 'check').valid).toBe(true);
+      const flopState = liveGame.getGameState();
+      expect(flopState.stage).toBe('flop');
+      expect(flopState.currentPlayerIndex).toBe(flopState.bigBlindIndex);
+    });
+
+    it('should keep live blinds and first action correct with a seat gap between active players', () => {
+      const gapGame = new Game(config);
+      const p1 = new Player('p1', 'Alice', 1000, 1);
+      const p2 = new Player('p2', 'Bob', 1000, 5);
+      const waitingP3 = new Player('p3', 'Charlie', 1000, 7);
+      gapGame.addPlayer(p1);
+      gapGame.addPlayer(p2);
+      gapGame.startHand();
+      gapGame.addPlayer(waitingP3);
+
+      const firstHand = gapGame.getGameState();
+      expect(gapGame.handleAction(firstHand.players[firstHand.currentPlayerIndex].id, 'fold').valid).toBe(true);
+
+      gapGame.startHand();
+      const state = gapGame.getGameState();
+      const liveBlindIds = new Set([
+        state.players[state.dealerIndex].id,
+        state.players[state.smallBlindIndex].id,
+        state.players[state.bigBlindIndex].id,
+      ]);
+      expect(liveBlindIds.has('p3')).toBe(false);
+      expect(state.currentPlayerIndex).toBe(state.smallBlindIndex);
     });
   });
 
