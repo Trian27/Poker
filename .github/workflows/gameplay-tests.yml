@@ -6,6 +6,8 @@ on:
       - 'GameImplementation/**'
       - 'poker-api/**'
       - 'poker-ui/**'
+      - 'docker-compose.yml'
+      - 'scripts/test_autonomous_bot_gameplay.py'
       - 'scripts/test-gameplay.sh'
       - '.github/workflows/gameplay-tests.yml'
   workflow_dispatch:
@@ -113,3 +115,28 @@ jobs:
           cache-dependency-path: GameImplementation/package-lock.json
       - run: npm ci
       - run: npm run test:chaos
+
+  compose-autonomous-e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: gameplay-compose-e2e
+      cancel-in-progress: false
+    env:
+      PYTHON_BIN: python
+      COMPOSE_PROJECT_NAME: gameplay-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r poker-agent-api/requirements.txt
+      - run: ./scripts/test-gameplay.sh compose-autonomous
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-autonomous-e2e-artifacts
+          path: logs/compose-autonomous
+          if-no-files-found: ignore

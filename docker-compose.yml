@@ -2,13 +2,13 @@ services:
   # PostgreSQL Database
   postgres-db:
     image: postgres:15-alpine
-    container_name: poker-postgres
+    container_name: ${COMPOSE_PROJECT_NAME:-poker}-postgres
     environment:
       POSTGRES_DB: poker_db
       POSTGRES_USER: poker_user
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-poker_dev_password}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,10 +22,10 @@ services:
   # Redis Cache
   redis-cache:
     image: redis:7-alpine
-    container_name: poker-redis
+    container_name: ${COMPOSE_PROJECT_NAME:-poker}-redis
     command: redis-server --appendonly no
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -39,7 +39,7 @@ services:
     build:
       context: ./poker-api
       dockerfile: Dockerfile
-    container_name: poker-auth-api
+    container_name: ${COMPOSE_PROJECT_NAME:-poker}-auth-api
     environment:
       DATABASE_URL: postgresql://poker_user:${POSTGRES_PASSWORD:-poker_dev_password}@postgres-db:5432/poker_db
       SECRET_KEY: ${JWT_SECRET_KEY:-your-secret-key-change-in-production}
@@ -56,8 +56,9 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ADMIN_RESET_PASSWORD: ${ADMIN_RESET_PASSWORD:-false}
+      ENABLE_TEST_FIXTURE_API: ${ENABLE_TEST_FIXTURE_API:-false}
     ports:
-      - "8000:8000"
+      - "${AUTH_API_HOST_PORT:-8000}:8000"
     depends_on:
       postgres-db:
         condition: service_healthy
@@ -70,12 +71,12 @@ services:
     build:
       context: ./poker-agent-api
       dockerfile: Dockerfile
-    container_name: poker-agent-api
+    container_name: ${COMPOSE_PROJECT_NAME:-poker}-agent-api
     environment:
       GAME_SERVER_URL: http://game-server:3000
       FASTAPI_AUTH_URL: http://auth-api:8000
     ports:
-      - "8001:8001"
+      - "${AGENT_API_HOST_PORT:-8001}:8001"
     depends_on:
       - game-server
       - auth-api
@@ -88,7 +89,7 @@ services:
     build:
       context: ./GameImplementation
       dockerfile: Dockerfile
-    container_name: poker-game-server
+    container_name: ${COMPOSE_PROJECT_NAME:-poker}-game-server
     environment:
       REDIS_HOST: redis-cache
       REDIS_PORT: 6379
@@ -96,7 +97,7 @@ services:
       PORT: 3000
       NODE_ENV: production
     ports:
-      - "3000:3000"
+      - "${GAME_SERVER_HOST_PORT:-3000}:3000"
     depends_on:
       redis-cache:
         condition: service_healthy
@@ -112,11 +113,11 @@ services:
       context: ./poker-ui
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: http://localhost:8000
-        VITE_GAME_SERVER_URL: http://localhost:3000
-    container_name: poker-react-ui
+        VITE_API_URL: http://localhost:${AUTH_API_HOST_PORT:-8000}
+        VITE_GAME_SERVER_URL: http://localhost:${GAME_SERVER_HOST_PORT:-3000}
+    container_name: ${COMPOSE_PROJECT_NAME:-poker}-react-ui
     ports:
-      - "5173:80"
+      - "${REACT_UI_HOST_PORT:-5173}:80"
     depends_on:
       - auth-api
       - game-server
