@@ -3976,7 +3976,7 @@ def get_table_seats(
     Requires authentication
     """
     partition = _get_partition_context_for_user_id(db, current_user.get("user_id"))
-    _get_visible_table_or_404(db, table_id, partition)
+    table = _get_visible_table_or_404(db, table_id, partition)
 
     _maybe_start_tournament_table(db, table)
     

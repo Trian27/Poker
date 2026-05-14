@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-End-to-end autonomous bot gameplay smoke test.
+Autonomous gameplay E2E driver.
 
-This script provisions a disposable league/community/table, seats players,
-starts autonomous bot client(s), and verifies that at least one hand is
-recorded for each participant.
-
-Modes:
-- bot-vs-bot: Fully automated (two autonomous bots)
-- human-vs-bot: Creates one human account + one autonomous bot and waits for
-  you to play from the UI while the bot runs.
+This script provisions a fixture stack via the admin fixture API, logs in the
+fixture users through the ordinary auth flow, drives autonomous bot gameplay
+against the real game server, asserts persisted hand history and partition
+isolation, then cleans the run up.
 """
 
 from __future__ import annotations
@@ -17,66 +13,236 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import secrets
+import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from queue import Empty, Queue
+from typing import Any, Iterable, Optional
+
+RUN_TAG_PATTERN = r"^[A-Za-z0-9._:-]{1,128}$"
+DEFAULT_TIMEOUT_SECONDS = 240
+DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_SUMMARY_STATUS = "running"
+SECRET_KEYS = {
+    "password",
+    "admin_password",
+    "token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+}
+
+
+class SmokeTestError(RuntimeError):
+    """Raised for deterministic gameplay E2E failures."""
+
+
+class InterruptedRun(SmokeTestError):
+    """Raised when a termination signal interrupts the run."""
+
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__(f"Received signal {signum}; cleanup will be attempted")
+
+
+class HTTPRequestError(SmokeTestError):
+    """Raised when an HTTP response status is unexpected."""
+
+    def __init__(self, method: str, url: str, status_code: int, response_text: str):
+        self.method = method
+        self.url = url
+        self.status_code = status_code
+        self.response_text = _redact_plaintext(response_text.strip())
+        super().__init__(
+            f"{method} {url} failed with {status_code}.\n"
+            f"Response body:\n{self.response_text}"
+        )
+
 
 try:
     import requests
 except ModuleNotFoundError as exc:  # pragma: no cover - startup dependency guard
     raise SystemExit(
-        "Missing dependency 'requests'. Activate the project virtualenv (e.g. `workon poker`) "
-        "or install requirements before running this script."
+        "Missing dependency 'requests'. Use ~/.virtualenvs/poker/bin/python or set PYTHON_BIN "
+        "to an interpreter with the documented requirements installed."
     ) from exc
 
 try:
     from jose import jwt
 except ModuleNotFoundError as exc:  # pragma: no cover - startup dependency guard
     raise SystemExit(
-        "Missing dependency 'python-jose'. Activate the project virtualenv (e.g. `workon poker`) "
-        "or install requirements before running this script."
+        "Missing dependency 'python-jose'. Use ~/.virtualenvs/poker/bin/python or set PYTHON_BIN "
+        "to an interpreter with the documented requirements installed."
     ) from exc
 
-# Allow importing poker-agent-api/agent_websocket.py from this top-level script.
+try:
+    import socketio
+except ModuleNotFoundError as exc:  # pragma: no cover - startup dependency guard
+    raise SystemExit(
+        "Missing dependency 'python-socketio[client]'. Use ~/.virtualenvs/poker/bin/python or set PYTHON_BIN "
+        "to an interpreter with the documented requirements installed."
+    ) from exc
+
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-AGENT_DIR = PROJECT_ROOT / "poker-agent-api"
-if str(AGENT_DIR) not in sys.path:
-    sys.path.insert(0, str(AGENT_DIR))
+AGENT_FILE = PROJECT_ROOT / "poker-agent-api" / "agent_websocket.py"
+if not AGENT_FILE.exists():
+    raise SystemExit(
+        f"Missing {AGENT_FILE}. Run this script from the repository checkout, "
+        "or ensure poker-agent-api is present."
+    )
 
-from agent_websocket import WebSocketPokerAgent  # type: ignore  # noqa: E402
 
-
-class SmokeTestError(RuntimeError):
-    """Raised for deterministic smoke-test failures."""
+def _load_websocket_poker_agent() -> type[Any]:
+    agent_dir = str(AGENT_FILE.parent)
+    if agent_dir not in sys.path:
+        sys.path.insert(0, agent_dir)
+    try:
+        from agent_websocket import WebSocketPokerAgent  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            "Could not import poker-agent-api/agent_websocket.py. Use ~/.virtualenvs/poker/bin/python "
+            "or set PYTHON_BIN to an interpreter with the documented requirements installed."
+        ) from exc
+    return WebSocketPokerAgent
 
 
 @dataclass
 class SessionUser:
-    username: str
-    password: str
-    email: str
-    token: str
     user_id: int
+    username: str
+    email: str
+    password: str
+    token: str
     is_bot: bool
+    seat_number: Optional[int] = None
+    queue_position: Optional[int] = None
 
 
-def _validate_username_password_pair(parser: argparse.ArgumentParser, username: str | None, password: str | None, *, label: str) -> None:
-    if (username and not password) or (password and not username):
-        parser.error(f"{label}: provide both username and password together.")
+@dataclass
+class BotHandle:
+    user: SessionUser
+    agent: Any
+    thread: threading.Thread
+
+
+@dataclass
+class CleanupSummary:
+    attempted: bool = False
+    succeeded: bool = False
+    deleted_counts: dict[str, int] = field(default_factory=dict)
+    error: Optional[str] = None
+
+
+@dataclass
+class RunSummary:
+    mode: str
+    run_tag: Optional[str] = None
+    phase: str = "starting"
+    status: str = DEFAULT_SUMMARY_STATUS
+    error: Optional[str] = None
+    admin_username: Optional[str] = None
+    league_id: Optional[int] = None
+    community_id: Optional[int] = None
+    table_id: Optional[int] = None
+    game_id: Optional[str] = None
+    fixture_usernames: list[str] = field(default_factory=list)
+    common_hand_id: Optional[str] = None
+    cleanup: CleanupSummary = field(default_factory=CleanupSummary)
+    phase_timings: dict[str, float] = field(default_factory=dict)
+
+
+class PhaseTracker:
+    def __init__(self, summary: RunSummary):
+        self.summary = summary
+        self._phase_started_at: Optional[float] = None
+        self._current_phase: Optional[str] = None
+
+    def start(self, phase: str) -> None:
+        now = time.monotonic()
+        if self._current_phase is not None and self._phase_started_at is not None:
+            self.summary.phase_timings[self._current_phase] = round(now - self._phase_started_at, 3)
+        self.summary.phase = phase
+        self._current_phase = phase
+        self._phase_started_at = now
+
+    def finish(self) -> None:
+        now = time.monotonic()
+        if self._current_phase is not None and self._phase_started_at is not None:
+            self.summary.phase_timings[self._current_phase] = round(now - self._phase_started_at, 3)
+            self._current_phase = None
+            self._phase_started_at = None
+
+
+class InterruptState:
+    def __init__(self) -> None:
+        self.signum: Optional[int] = None
+
+    def install(self) -> dict[int, Any]:
+        previous: dict[int, Any] = {}
+
+        def _handle(signum: int, _frame: Any) -> None:
+            if self.signum is None:
+                self.signum = signum
+                print(f"\nReceived signal {signum}; cleanup will be attempted.", flush=True)
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, _handle)
+        return previous
+
+    def restore(self, previous: dict[int, Any]) -> None:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+    def raise_if_interrupted(self) -> None:
+        if self.signum is not None:
+            raise InterruptedRun(self.signum)
+
+
+@dataclass
+class FixtureStack:
+    run_tag: str
+    league_id: int
+    community_id: int
+    table_id: int
+    table_name: str
+    game_id: str
+    users: list[dict[str, Any]]
 
 
 def _strip_trailing_slash(value: str) -> str:
     return value.rstrip("/")
 
 
-def _fmt_json(value: Any) -> str:
+def _redact_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key.lower() in SECRET_KEYS:
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_secrets(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_secrets(item) for item in value]
+    return value
+
+
+def _redact_plaintext(text: str) -> str:
+    if not text:
+        return text
     try:
-        return json.dumps(value, indent=2, ensure_ascii=True)
+        parsed = json.loads(text)
     except Exception:
-        return str(value)
+        return text
+    return json.dumps(_redact_secrets(parsed), ensure_ascii=True)
 
 
 def _request_json(
@@ -87,46 +253,36 @@ def _request_json(
     timeout_seconds: float = 15,
     **kwargs: Any,
 ) -> Any:
-    response = requests.request(method, url, timeout=timeout_seconds, **kwargs)
-    if response.status_code not in set(expected_statuses):
-        body_text = response.text.strip()
-        raise SmokeTestError(
-            f"{method} {url} failed with {response.status_code}.\n"
-            f"Response body:\n{body_text}"
-        )
-    if response.content:
+    try:
+        response = requests.request(method, url, timeout=timeout_seconds, **kwargs)
+    except requests.RequestException as exc:
+        raise SmokeTestError(f"{method} {url} failed: {exc}") from exc
+
+    expected = set(expected_statuses)
+    if response.status_code not in expected:
+        raise HTTPRequestError(method, url, response.status_code, response.text)
+    if not response.content:
+        return None
+    try:
         return response.json()
-    return None
+    except ValueError as exc:
+        raise SmokeTestError(f"{method} {url} returned non-JSON response") from exc
+
+
+def _auth_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _health_check(url: str, label: str) -> None:
-    try:
-        payload = _request_json("GET", f"{url}/health", expected_statuses=(200,), timeout_seconds=5)
-    except Exception as exc:
-        raise SmokeTestError(f"{label} health check failed at {url}/health: {exc}") from exc
+    payload = _request_json("GET", f"{url}/health", expected_statuses=(200,), timeout_seconds=5)
     status = payload.get("status")
-    if status not in {"ok", "healthy"}:
-        raise SmokeTestError(f"{label} unhealthy status from {url}/health: {payload}")
+    if status not in {"healthy", "ok"}:
+        raise SmokeTestError(f"{label} health check returned unexpected payload: {payload}")
 
 
 def _decode_user_id(access_token: str) -> int:
     payload = jwt.decode(access_token, key="", options={"verify_signature": False})
-    user_id = int(payload["user_id"])
-    return user_id
-
-
-def _register_user(auth_api_url: str, username: str, email: str, password: str) -> None:
-    payload = _request_json(
-        "POST",
-        f"{auth_api_url}/auth/register",
-        expected_statuses=(201,),
-        json={"username": username, "email": email, "password": password},
-    )
-    if isinstance(payload, dict) and payload.get("requires_verification"):
-        raise SmokeTestError(
-            "Registration requires email verification in this environment. "
-            "Run smoke tests in dev mode or use pre-verified users."
-        )
+    return int(payload["user_id"])
 
 
 def _login_user(auth_api_url: str, username: str, password: str) -> tuple[str, int]:
@@ -138,138 +294,158 @@ def _login_user(auth_api_url: str, username: str, password: str) -> tuple[str, i
     )
     if payload.get("requires_2fa"):
         raise SmokeTestError(
-            f"User {username} requires admin 2FA verification. "
-            "Use non-admin accounts for bot smoke tests."
+            f"Login for {username} requires admin 2FA. Run this E2E flow with ENV_MODE=dev."
         )
     token = payload.get("access_token")
     if not token:
-        raise SmokeTestError(f"Login did not return access_token for user {username}: {payload}")
+        raise SmokeTestError(f"Login did not return access_token for {username}")
     return token, _decode_user_id(token)
 
 
-def _auth_headers(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+def _login_user_with_retry(auth_api_url: str, username: str, password: str, timeout_seconds: int = 90) -> tuple[str, int]:
+    deadline = time.time() + timeout_seconds
+    last_error: Optional[Exception] = None
+    while time.time() < deadline:
+        try:
+            return _login_user(auth_api_url, username, password)
+        except SmokeTestError as exc:
+            last_error = exc
+            time.sleep(2)
+    raise SmokeTestError(f"Admin login failed after readiness retry window: {last_error}")
 
 
-def _create_league(auth_api_url: str, token: str, run_tag: str) -> int:
-    payload = _request_json(
-        "POST",
-        f"{auth_api_url}/api/leagues",
-        expected_statuses=(201,),
-        headers=_auth_headers(token),
-        json={
-            "name": f"Bot Smoke League {run_tag}",
-            "description": "Temporary league for autonomous bot gameplay smoke test",
-        },
-    )
-    return int(payload["id"])
+def _validate_run_tag(run_tag: str) -> str:
+    normalized = run_tag.strip()
+    if not re.fullmatch(RUN_TAG_PATTERN, normalized):
+        raise SmokeTestError(
+            f"Invalid run tag '{run_tag}'. It must match {RUN_TAG_PATTERN}."
+        )
+    return normalized
 
 
-def _create_community(auth_api_url: str, token: str, league_id: int, run_tag: str, starting_balance: int) -> int:
-    payload = _request_json(
-        "POST",
-        f"{auth_api_url}/api/leagues/{league_id}/communities",
-        expected_statuses=(201,),
-        headers=_auth_headers(token),
-        json={
-            "name": f"Bot Smoke Community {run_tag}",
-            "description": "Temporary community for autonomous bot gameplay smoke test",
-            "starting_balance": starting_balance,
-        },
-    )
-    return int(payload["id"])
+def _generate_run_tag(mode: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    github_run_id = os.getenv("GITHUB_RUN_ID")
+    github_run_attempt = os.getenv("GITHUB_RUN_ATTEMPT")
+    mode_fragment = mode.replace("_", "-")
+    if github_run_id and github_run_attempt:
+        candidate = f"e2e-{mode_fragment}-gh-{github_run_id}-{github_run_attempt}"
+    else:
+        candidate = f"e2e-{mode_fragment}-{timestamp}-{secrets.token_hex(3)}"
+    return _validate_run_tag(candidate)
 
 
-def _create_table(
+def _create_fixture_stack(
     auth_api_url: str,
-    token: str,
-    community_id: int,
-    run_tag: str,
+    admin_token: str,
     *,
+    run_tag: str,
+    starting_balance: int,
     buy_in: int,
     small_blind: int,
     big_blind: int,
-    max_seats: int,
     action_timeout_seconds: int,
-) -> tuple[int, str]:
+) -> FixtureStack:
     payload = _request_json(
         "POST",
-        f"{auth_api_url}/api/communities/{community_id}/tables",
+        f"{auth_api_url}/api/admin/test-fixtures/gameplay-stack",
         expected_statuses=(201,),
-        headers=_auth_headers(token),
+        headers=_auth_headers(admin_token),
         json={
-            "name": f"Bot Smoke Table {run_tag}",
-            "game_type": "cash",
-            "max_seats": max_seats,
+            "run_tag": run_tag,
+            "player_count": 2,
+            "queued_player_count": 0,
+            "starting_balance": starting_balance,
+            "buy_in": buy_in,
             "small_blind": small_blind,
             "big_blind": big_blind,
-            "buy_in": buy_in,
-            "agents_allowed": True,
+            "max_seats": 2,
+            "max_queue_size": 0,
             "action_timeout_seconds": action_timeout_seconds,
-            "is_permanent": False,
         },
     )
-    table_id = int(payload["id"])
-    table_name = str(payload["name"])
-    return table_id, table_name
-
-
-def _join_community(auth_api_url: str, token: str, community_id: int) -> None:
-    _request_json(
-        "POST",
-        f"{auth_api_url}/api/communities/{community_id}/join",
-        expected_statuses=(200,),
-        headers=_auth_headers(token),
+    return FixtureStack(
+        run_tag=str(payload["run_tag"]),
+        league_id=int(payload["league_id"]),
+        community_id=int(payload["community_id"]),
+        table_id=int(payload["table_id"]),
+        table_name=str(payload["table_name"]),
+        game_id=str(payload["game_id"]),
+        users=list(payload["users"]),
     )
 
 
-def _join_table(auth_api_url: str, token: str, table_id: int, buy_in: int, seat_number: int) -> None:
-    _request_json(
-        "POST",
-        f"{auth_api_url}/api/tables/{table_id}/join",
+def _cleanup_fixture_stack(auth_api_url: str, admin_token: str, run_tag: str) -> tuple[str, dict[str, int]]:
+    payload = _request_json(
+        "DELETE",
+        f"{auth_api_url}/api/admin/test-fixtures/runs/{run_tag}",
         expected_statuses=(200,),
-        headers=_auth_headers(token),
-        json={"buy_in_amount": buy_in, "seat_number": seat_number},
+        headers=_auth_headers(admin_token),
+    )
+    return str(payload["status"]), dict(payload.get("deleted", {}))
+
+
+def _create_session_user(auth_api_url: str, fixture_user: dict[str, Any], *, is_bot: bool) -> SessionUser:
+    token, user_id = _login_user(auth_api_url, str(fixture_user["username"]), str(fixture_user["password"]))
+    return SessionUser(
+        user_id=user_id,
+        username=str(fixture_user["username"]),
+        email=str(fixture_user["email"]),
+        password=str(fixture_user["password"]),
+        token=token,
+        is_bot=is_bot,
+        seat_number=fixture_user.get("seat_number"),
+        queue_position=fixture_user.get("queue_position"),
     )
 
 
-def _wait_for_hands(
+def _assert_fixture_access(
     auth_api_url: str,
-    users: list[SessionUser],
-    *,
-    expected_table_name: str,
-    timeout_seconds: int,
-    poll_interval_seconds: float,
-) -> dict[str, int]:
-    deadline = time.time() + timeout_seconds
-    hands_seen: dict[str, int] = {user.username: 0 for user in users}
-
-    while time.time() < deadline:
-        all_users_have_hand = True
-        for user in users:
-            payload = _request_json(
-                "GET",
-                f"{auth_api_url}/api/me/hands",
-                expected_statuses=(200,),
-                headers=_auth_headers(user.token),
-                params={"limit": 25, "offset": 0},
-            )
-            matching_hands = [row for row in payload if row.get("table_name") == expected_table_name]
-            hands_seen[user.username] = len(matching_hands)
-            if not matching_hands:
-                all_users_have_hand = False
-
-        if all_users_have_hand:
-            return hands_seen
-        time.sleep(poll_interval_seconds)
-
-    raise SmokeTestError(
-        "Timed out waiting for recorded hand history.\n"
-        f"Counts by user: {_fmt_json(hands_seen)}"
+    viewer: SessionUser,
+    fixture: FixtureStack,
+    expected_users: list[SessionUser],
+) -> None:
+    communities = _request_json(
+        "GET",
+        f"{auth_api_url}/api/communities",
+        expected_statuses=(200,),
+        headers=_auth_headers(viewer.token),
     )
+    if fixture.community_id not in {int(item["id"]) for item in communities}:
+        raise SmokeTestError(f"User {viewer.username} cannot see fixture community {fixture.community_id}")
+
+    tables = _request_json(
+        "GET",
+        f"{auth_api_url}/api/communities/{fixture.community_id}/tables",
+        expected_statuses=(200,),
+        headers=_auth_headers(viewer.token),
+    )
+    if fixture.table_id not in {int(item["id"]) for item in tables}:
+        raise SmokeTestError(f"User {viewer.username} cannot see fixture table {fixture.table_id}")
+
+    seats = _request_json(
+        "GET",
+        f"{auth_api_url}/api/tables/{fixture.table_id}/seats",
+        expected_statuses=(200,),
+        headers=_auth_headers(viewer.token),
+    )
+    occupied = {int(seat["user_id"]): seat for seat in seats if seat.get("user_id") is not None}
+    for expected_user in expected_users:
+        if expected_user.user_id not in occupied:
+            raise SmokeTestError(
+                f"User {viewer.username} does not see seated fixture user {expected_user.username} on table {fixture.table_id}"
+            )
 
 
-def _start_bot_agent(bot_user: SessionUser, game_server_url: str, game_id: str) -> tuple[WebSocketPokerAgent, threading.Thread]:
+def _start_bot_agent(
+    bot_user: SessionUser,
+    game_server_url: str,
+    game_id: str,
+    *,
+    stop_event: threading.Event,
+    error_queue: Queue[BaseException],
+) -> BotHandle:
+    WebSocketPokerAgent = _load_websocket_poker_agent()
     agent = WebSocketPokerAgent(
         token=bot_user.token,
         game_id=game_id,
@@ -280,320 +456,529 @@ def _start_bot_agent(bot_user: SessionUser, game_server_url: str, game_id: str) 
     def _run() -> None:
         try:
             agent.connect_and_play()
-        except SystemExit:
-            # The shared agent class exits on disconnect/error; do not fail this script from thread context.
-            return
+            if not stop_event.is_set():
+                error_queue.put(SmokeTestError(f"Bot agent {bot_user.username} exited unexpectedly"))
+        except SystemExit as exc:
+            exit_code = exc.code if isinstance(exc.code, int) else 1 if exc.code else 0
+            if not stop_event.is_set() and exit_code not in (0, None):
+                error_queue.put(SmokeTestError(f"Bot agent {bot_user.username} exited with code {exit_code}"))
+        except BaseException as exc:  # pragma: no cover - defensive thread failure handling
+            if not stop_event.is_set():
+                error_queue.put(SmokeTestError(f"Bot agent {bot_user.username} crashed: {exc}"))
 
     thread = threading.Thread(target=_run, daemon=True, name=f"bot-agent-{bot_user.username}")
     thread.start()
-    return agent, thread
+    return BotHandle(user=bot_user, agent=agent, thread=thread)
 
 
-def _wait_for_bot_connections(agents: list[WebSocketPokerAgent], timeout_seconds: int = 20) -> None:
+def _raise_bot_error_if_any(error_queue: Queue[BaseException]) -> None:
+    try:
+        error = error_queue.get_nowait()
+    except Empty:
+        return
+    if isinstance(error, SmokeTestError):
+        raise error
+    raise SmokeTestError(str(error)) from error
+
+
+def _wait_for_bot_connections(
+    bot_handles: list[BotHandle],
+    *,
+    error_queue: Queue[BaseException],
+    interrupt_state: InterruptState,
+    timeout_seconds: int = 20,
+) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if all(agent.connected for agent in agents):
+        interrupt_state.raise_if_interrupted()
+        _raise_bot_error_if_any(error_queue)
+        if all(handle.agent.connected for handle in bot_handles):
             return
         time.sleep(0.2)
-    raise SmokeTestError("Timed out waiting for bot websocket connections.")
+    raise SmokeTestError("Timed out waiting for bot websocket connections")
 
 
-def _disconnect_agents(agents: list[WebSocketPokerAgent]) -> None:
-    for agent in agents:
+def _disconnect_bots(bot_handles: list[BotHandle], stop_event: threading.Event) -> None:
+    stop_event.set()
+    for handle in bot_handles:
         try:
-            if agent.connected:
-                agent.sio.disconnect()
+            if handle.agent.connected:
+                handle.agent.sio.disconnect()
         except Exception:
             continue
+    for handle in bot_handles:
+        handle.thread.join(timeout=5)
 
 
-def _create_session_user(auth_api_url: str, username: str, email: str, password: str, is_bot: bool) -> SessionUser:
-    _register_user(auth_api_url, username, email, password)
-    token, user_id = _login_user(auth_api_url, username, password)
-    return SessionUser(
-        username=username,
-        password=password,
-        email=email,
-        token=token,
-        user_id=user_id,
-        is_bot=is_bot,
+def _validate_common_hand_detail(detail: dict[str, Any], fixture: FixtureStack, expected_users: list[SessionUser]) -> bool:
+    if int(detail.get("table_id") or 0) != fixture.table_id:
+        return False
+    hand_data = detail.get("hand_data") or {}
+    action_log = hand_data.get("action_log") or []
+    if not action_log:
+        return False
+    players = hand_data.get("players") or []
+    user_ids = {int(player.get("user_id")) for player in players if player.get("user_id") is not None}
+    expected_user_ids = {user.user_id for user in expected_users}
+    return expected_user_ids.issubset(user_ids)
+
+
+def _wait_for_common_hand(
+    auth_api_url: str,
+    users: list[SessionUser],
+    fixture: FixtureStack,
+    *,
+    timeout_seconds: int,
+    poll_interval_seconds: float,
+    bot_handles: list[BotHandle],
+    error_queue: Queue[BaseException],
+    interrupt_state: InterruptState,
+    human_mode: bool,
+) -> tuple[str, dict[str, Any]]:
+    deadline = time.time() + timeout_seconds
+    last_status_log = 0.0
+    while time.time() < deadline:
+        interrupt_state.raise_if_interrupted()
+        _raise_bot_error_if_any(error_queue)
+        for handle in bot_handles:
+            if not handle.thread.is_alive():
+                raise SmokeTestError(f"Bot agent thread for {handle.user.username} is no longer running")
+            if not handle.agent.connected:
+                raise SmokeTestError(f"Bot agent {handle.user.username} disconnected before hand completion")
+
+        hand_rows_by_user: list[list[dict[str, Any]]] = []
+        for user in users:
+            payload = _request_json(
+                "GET",
+                f"{auth_api_url}/api/me/hands",
+                expected_statuses=(200,),
+                headers=_auth_headers(user.token),
+                params={"limit": 50, "offset": 0},
+            )
+            hand_rows_by_user.append(list(payload))
+
+        common_ids = set(str(row["id"]) for row in hand_rows_by_user[0])
+        for rows in hand_rows_by_user[1:]:
+            common_ids &= {str(row["id"]) for row in rows}
+
+        if common_ids:
+            ordered_candidates = [
+                str(row["id"]) for row in hand_rows_by_user[0] if str(row["id"]) in common_ids
+            ]
+            for hand_id in ordered_candidates:
+                detail_payloads = []
+                for user in users:
+                    detail = _request_json(
+                        "GET",
+                        f"{auth_api_url}/api/hands/{hand_id}",
+                        expected_statuses=(200,),
+                        headers=_auth_headers(user.token),
+                    )
+                    detail_payloads.append(detail)
+                if all(_validate_common_hand_detail(detail, fixture, users) for detail in detail_payloads):
+                    return hand_id, detail_payloads[0]
+
+        if human_mode and time.time() - last_status_log >= 10:
+            print("waiting for common hand; cleanup will run on timeout or Ctrl-C", flush=True)
+            last_status_log = time.time()
+        time.sleep(poll_interval_seconds)
+
+    raise SmokeTestError("Timed out waiting for a persisted common hand for all expected participants")
+
+
+def _assert_admin_outsider_checks(
+    auth_api_url: str,
+    game_server_url: str,
+    admin_user: SessionUser,
+    fixture: FixtureStack,
+    common_hand_id: str,
+) -> None:
+    leagues = _request_json(
+        "GET",
+        f"{auth_api_url}/api/leagues",
+        expected_statuses=(200,),
+        headers=_auth_headers(admin_user.token),
     )
+    if fixture.league_id in {int(item["id"]) for item in leagues}:
+        raise SmokeTestError(f"Admin unexpectedly sees fixture league {fixture.league_id}")
 
-
-def _login_existing_session_user(auth_api_url: str, username: str, password: str, *, is_bot: bool) -> SessionUser:
-    token, user_id = _login_user(auth_api_url, username, password)
-    return SessionUser(
-        username=username,
-        password=password,
-        email=f"{username}@existing.local",
-        token=token,
-        user_id=user_id,
-        is_bot=is_bot,
+    communities = _request_json(
+        "GET",
+        f"{auth_api_url}/api/communities",
+        expected_statuses=(200,),
+        headers=_auth_headers(admin_user.token),
     )
+    if fixture.community_id in {int(item["id"]) for item in communities}:
+        raise SmokeTestError(f"Admin unexpectedly sees fixture community {fixture.community_id}")
+
+    _request_json(
+        "GET",
+        f"{auth_api_url}/api/communities/{fixture.community_id}/tables",
+        expected_statuses=(404,),
+        headers=_auth_headers(admin_user.token),
+    )
+    _request_json(
+        "GET",
+        f"{auth_api_url}/api/tables/{fixture.table_id}/seats",
+        expected_statuses=(404,),
+        headers=_auth_headers(admin_user.token),
+    )
+    _request_json(
+        "POST",
+        f"{auth_api_url}/api/tables/{fixture.table_id}/join",
+        expected_statuses=(404,),
+        headers=_auth_headers(admin_user.token),
+        json={"buy_in_amount": 1000, "seat_number": 1},
+    )
+    _request_json(
+        "GET",
+        f"{auth_api_url}/api/hands/{common_hand_id}",
+        expected_statuses=(404,),
+        headers=_auth_headers(admin_user.token),
+    )
+    _assert_admin_spectator_denied(game_server_url, admin_user.token, fixture.table_id)
 
 
-def run() -> int:
-    parser = argparse.ArgumentParser(description="Autonomous bot gameplay smoke test")
+def _assert_admin_spectator_denied(game_server_url: str, admin_token: str, table_id: int, timeout_seconds: float = 5.0) -> None:
+    sio = socketio.Client(logger=False, engineio_logger=False)
+    response_event = threading.Event()
+    response_payload: dict[str, Any] = {}
+
+    @sio.on("connected")
+    def _on_connected(_payload: Any) -> None:
+        sio.emit("spectate_table", {"tableId": table_id})
+
+    @sio.on("error")
+    def _on_error(payload: Any) -> None:
+        response_payload["event"] = "error"
+        response_payload["payload"] = payload
+        response_event.set()
+
+    @sio.on("spectator_mode")
+    def _on_spectator_mode(payload: Any) -> None:
+        response_payload["event"] = "spectator_mode"
+        response_payload["payload"] = payload
+        response_event.set()
+
+    @sio.on("game_state_update")
+    def _on_game_state_update(payload: Any) -> None:
+        response_payload["event"] = "game_state_update"
+        response_payload["payload"] = payload
+        response_event.set()
+
+    @sio.event
+    def connect_error(payload: Any) -> None:
+        response_payload["event"] = "connect_error"
+        response_payload["payload"] = payload
+        response_event.set()
+
+    try:
+        sio.connect(
+            game_server_url,
+            auth={"token": admin_token, "spectator": True},
+            wait_timeout=10,
+        )
+        if not response_event.wait(timeout_seconds):
+            raise SmokeTestError("Expected table_not_found for admin spectate_table, got no response")
+        if response_payload.get("event") != "error":
+            raise SmokeTestError(
+                f"Expected admin spectator denial, got {response_payload.get('event')}: {response_payload.get('payload')}"
+            )
+        payload = response_payload.get("payload") or {}
+        if payload.get("code") != "table_not_found":
+            raise SmokeTestError(f"Expected table_not_found spectator denial, got {payload}")
+    finally:
+        try:
+            if sio.connected:
+                sio.disconnect()
+        except Exception:
+            pass
+
+
+def _write_human_credentials_file(
+    human_user: SessionUser,
+    *,
+    run_tag: str,
+    ui_url: str,
+    community_id: int,
+    table_id: int,
+) -> Path:
+    directory = PROJECT_ROOT / ".tmp" / "human-fixtures" / run_tag
+    directory.mkdir(parents=True, exist_ok=True)
+    credentials_path = directory / "human_credentials.txt"
+    contents = (
+        f"username={human_user.username}\n"
+        f"password={human_user.password}\n"
+        f"community_url={ui_url}/community/{community_id}\n"
+        f"game_url={ui_url}/game/{table_id}?communityId={community_id}\n"
+    )
+    fd = os.open(credentials_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(contents)
+    return credentials_path
+
+
+def _write_summary(artifact_dir: Optional[Path], summary: RunSummary) -> None:
+    if artifact_dir is None:
+        return
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = artifact_dir / "summary.json"
+    summary_payload = _redact_secrets(asdict(summary))
+    summary_path.write_text(json.dumps(summary_payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Autonomous gameplay E2E driver")
     parser.add_argument(
         "--mode",
         choices=("bot-vs-bot", "human-vs-bot"),
         default="bot-vs-bot",
-        help="bot-vs-bot is fully automated; human-vs-bot waits for you to play from UI",
+        help="bot-vs-bot is automated; human-vs-bot waits for a real human to play the second seat",
     )
     parser.add_argument("--auth-api-url", default=os.getenv("AUTH_API_URL", "http://localhost:8000"))
     parser.add_argument("--game-server-url", default=os.getenv("GAME_SERVER_URL", "http://localhost:3000"))
     parser.add_argument("--ui-url", default=os.getenv("UI_URL", "http://localhost:5173"))
-    parser.add_argument("--password", default="BotSmokePass123!")
+    parser.add_argument("--admin-username", default=os.getenv("ADMIN_USERNAME"))
+    parser.add_argument("--admin-password", default=os.getenv("ADMIN_PASSWORD"))
+    parser.add_argument("--run-tag", default=None)
+    parser.add_argument("--artifact-dir", default=None)
     parser.add_argument("--starting-balance", type=int, default=10000)
     parser.add_argument("--buy-in", type=int, default=1000)
     parser.add_argument("--small-blind", type=int, default=10)
     parser.add_argument("--big-blind", type=int, default=20)
     parser.add_argument("--action-timeout-seconds", type=int, default=10)
-    parser.add_argument("--timeout-seconds", type=int, default=240)
-    parser.add_argument("--poll-interval-seconds", type=float, default=2.0)
-    parser.add_argument("--setup-username", default=None, help="Use existing setup user instead of auto-register")
-    parser.add_argument("--setup-user-password", default=None)
-    parser.add_argument("--human-username", default=None, help="Use existing human user for human-vs-bot mode")
-    parser.add_argument("--human-password", default=None)
-    parser.add_argument("--bot1-username", default=None, help="Use existing bot1 user instead of auto-register")
-    parser.add_argument("--bot1-password", default=None)
-    parser.add_argument("--bot2-username", default=None, help="Use existing bot2 user for bot-vs-bot mode")
-    parser.add_argument("--bot2-password", default=None)
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--human-timeout-seconds", type=int, default=None)
+    parser.add_argument("--poll-interval-seconds", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
     args = parser.parse_args()
+    if not args.admin_username or not args.admin_password:
+        parser.error("--admin-username and --admin-password are required (or set ADMIN_USERNAME / ADMIN_PASSWORD)")
+    return args
 
-    _validate_username_password_pair(
-        parser, args.setup_username, args.setup_user_password, label="setup user"
-    )
-    _validate_username_password_pair(
-        parser, args.human_username, args.human_password, label="human user"
-    )
-    _validate_username_password_pair(
-        parser, args.bot1_username, args.bot1_password, label="bot1 user"
-    )
-    _validate_username_password_pair(
-        parser, args.bot2_username, args.bot2_password, label="bot2 user"
-    )
 
+def run() -> int:
+    args = _parse_args()
     auth_api_url = _strip_trailing_slash(args.auth_api_url)
     game_server_url = _strip_trailing_slash(args.game_server_url)
     ui_url = _strip_trailing_slash(args.ui_url)
-    run_tag = str(int(time.time()))
+    run_tag = _validate_run_tag(args.run_tag) if args.run_tag else _generate_run_tag(args.mode)
+    artifact_dir = Path(args.artifact_dir).resolve() if args.artifact_dir else None
+    summary = RunSummary(mode=args.mode, run_tag=run_tag, admin_username=args.admin_username)
+    tracker = PhaseTracker(summary)
+    interrupt_state = InterruptState()
+    previous_handlers = interrupt_state.install()
+    stop_event = threading.Event()
+    bot_error_queue: Queue[BaseException] = Queue()
+    bot_handles: list[BotHandle] = []
+    exit_code = 0
+    admin_user: Optional[SessionUser] = None
+    fixture: Optional[FixtureStack] = None
+    fixture_users: list[SessionUser] = []
+    fixture_create_dispatched = False
+    cleanup_permitted = False
 
-    print("=" * 84)
-    print("AUTONOMOUS BOT GAMEPLAY SMOKE TEST")
-    print("=" * 84)
-    print(f"Mode: {args.mode}")
-    print(f"Auth API: {auth_api_url}")
-    print(f"Game Server: {game_server_url}")
-    print(f"UI: {ui_url}")
-    print()
+    try:
+        print("=" * 84)
+        print("AUTONOMOUS GAMEPLAY E2E")
+        print("=" * 84)
+        print(f"Mode: {args.mode}")
+        print(f"Auth API: {auth_api_url}")
+        print(f"Game Server: {game_server_url}")
+        print(f"UI: {ui_url}")
+        print(f"Run tag: {run_tag}")
+        print()
 
-    _health_check(auth_api_url, "Auth API")
-    _health_check(game_server_url, "Game Server")
-    print("✅ Service health checks passed")
+        tracker.start("health_check")
+        _health_check(auth_api_url, "Auth API")
+        _health_check(game_server_url, "Game Server")
+        interrupt_state.raise_if_interrupted()
+        print("service health checks passed", flush=True)
 
-    if args.setup_username:
-        setup_user = _login_existing_session_user(
-            auth_api_url=auth_api_url,
-            username=args.setup_username,
-            password=args.setup_user_password,
+        tracker.start("admin_login")
+        admin_token, admin_user_id = _login_user_with_retry(auth_api_url, args.admin_username, args.admin_password)
+        admin_user = SessionUser(
+            user_id=admin_user_id,
+            username=args.admin_username,
+            email=f"{args.admin_username}@local.invalid",
+            password=args.admin_password,
+            token=admin_token,
             is_bot=False,
         )
-    else:
+        interrupt_state.raise_if_interrupted()
+        print(f"admin login ready: {admin_user.username} (id={admin_user.user_id})", flush=True)
+
+        tracker.start("fixture_create")
+        fixture_create_dispatched = True
+        cleanup_permitted = True
         try:
-            setup_user = _create_session_user(
-                auth_api_url=auth_api_url,
-                username=f"bot_smoke_setup_{run_tag}",
-                email=f"bot_smoke_setup_{run_tag}@example.com",
-                password=args.password,
-                is_bot=False,
+            fixture = _create_fixture_stack(
+                auth_api_url,
+                admin_user.token,
+                run_tag=run_tag,
+                starting_balance=args.starting_balance,
+                buy_in=args.buy_in,
+                small_blind=args.small_blind,
+                big_blind=args.big_blind,
+                action_timeout_seconds=args.action_timeout_seconds,
             )
-        except SmokeTestError as exc:
-            if "requires email verification" in str(exc):
-                raise SmokeTestError(
-                    "Registration requires email verification in this environment.\n"
-                    "Rerun using an existing verified setup account:\n"
-                    "  --setup-username <username> --setup-user-password <password>"
-                ) from exc
+        except HTTPRequestError as exc:
+            if exc.status_code == 409:
+                cleanup_permitted = False
             raise
-    print(f"✅ Setup user created: {setup_user.username} (id={setup_user.user_id})")
+        summary.league_id = fixture.league_id
+        summary.community_id = fixture.community_id
+        summary.table_id = fixture.table_id
+        summary.game_id = fixture.game_id
+        summary.fixture_usernames = [str(user["username"]) for user in fixture.users]
+        print(
+            f"fixture provisioned: league={fixture.league_id} community={fixture.community_id} "
+            f"table={fixture.table_id} game={fixture.game_id}",
+            flush=True,
+        )
 
-    league_id = _create_league(auth_api_url, setup_user.token, run_tag)
-    community_id = _create_community(
-        auth_api_url, setup_user.token, league_id, run_tag, args.starting_balance
-    )
-    table_id, table_name = _create_table(
-        auth_api_url,
-        setup_user.token,
-        community_id,
-        run_tag,
-        buy_in=args.buy_in,
-        small_blind=args.small_blind,
-        big_blind=args.big_blind,
-        max_seats=2,
-        action_timeout_seconds=args.action_timeout_seconds,
-    )
-    game_id = f"table_{table_id}"
-    print(f"✅ Provisioned table: id={table_id} game_id={game_id} community_id={community_id}")
+        tracker.start("fixture_user_login")
+        sorted_users = sorted(fixture.users, key=lambda item: int(item.get("seat_number") or 99))
+        if args.mode == "bot-vs-bot":
+            fixture_users = [
+                _create_session_user(auth_api_url, sorted_users[0], is_bot=True),
+                _create_session_user(auth_api_url, sorted_users[1], is_bot=True),
+            ]
+        else:
+            fixture_users = [
+                _create_session_user(auth_api_url, sorted_users[0], is_bot=False),
+                _create_session_user(auth_api_url, sorted_users[1], is_bot=True),
+            ]
+        print(
+            "fixture users logged in: " + ", ".join(user.username for user in fixture_users),
+            flush=True,
+        )
 
-    users: list[SessionUser] = []
-    if args.mode == "bot-vs-bot":
-        try:
-            if args.bot1_username:
-                users.append(
-                    _login_existing_session_user(
-                        auth_api_url=auth_api_url,
-                        username=args.bot1_username,
-                        password=args.bot1_password,
-                        is_bot=True,
-                    )
-                )
-            else:
-                users.append(
-                    _create_session_user(
-                        auth_api_url=auth_api_url,
-                        username=f"bot_smoke_bot1_{run_tag}",
-                        email=f"bot_smoke_bot1_{run_tag}@example.com",
-                        password=args.password,
-                        is_bot=True,
-                    )
-                )
-            if args.bot2_username:
-                users.append(
-                    _login_existing_session_user(
-                        auth_api_url=auth_api_url,
-                        username=args.bot2_username,
-                        password=args.bot2_password,
-                        is_bot=True,
-                    )
-                )
-            else:
-                users.append(
-                    _create_session_user(
-                        auth_api_url=auth_api_url,
-                        username=f"bot_smoke_bot2_{run_tag}",
-                        email=f"bot_smoke_bot2_{run_tag}@example.com",
-                        password=args.password,
-                        is_bot=True,
-                    )
-                )
-        except SmokeTestError as exc:
-            if "requires email verification" in str(exc):
-                raise SmokeTestError(
-                    "Registration requires email verification in this environment.\n"
-                    "Rerun with existing verified bot users:\n"
-                    "  --bot1-username <u1> --bot1-password <p1> --bot2-username <u2> --bot2-password <p2>"
-                ) from exc
-            raise
-    else:
-        try:
-            if args.human_username:
-                users.append(
-                    _login_existing_session_user(
-                        auth_api_url=auth_api_url,
-                        username=args.human_username,
-                        password=args.human_password,
-                        is_bot=False,
-                    )
-                )
-            else:
-                users.append(
-                    _create_session_user(
-                        auth_api_url=auth_api_url,
-                        username=f"bot_smoke_human_{run_tag}",
-                        email=f"bot_smoke_human_{run_tag}@example.com",
-                        password=args.password,
-                        is_bot=False,
-                    )
-                )
-            if args.bot1_username:
-                users.append(
-                    _login_existing_session_user(
-                        auth_api_url=auth_api_url,
-                        username=args.bot1_username,
-                        password=args.bot1_password,
-                        is_bot=True,
-                    )
-                )
-            else:
-                users.append(
-                    _create_session_user(
-                        auth_api_url=auth_api_url,
-                        username=f"bot_smoke_bot1_{run_tag}",
-                        email=f"bot_smoke_bot1_{run_tag}@example.com",
-                        password=args.password,
-                        is_bot=True,
-                    )
-                )
-        except SmokeTestError as exc:
-            if "requires email verification" in str(exc):
-                raise SmokeTestError(
-                    "Registration requires email verification in this environment.\n"
-                    "Rerun with existing verified users:\n"
-                    "  --human-username <human> --human-password <hp> --bot1-username <bot> --bot1-password <bp>"
-                ) from exc
-            raise
+        tracker.start("positive_access_checks")
+        for viewer in fixture_users:
+            _assert_fixture_access(auth_api_url, viewer, fixture, fixture_users)
+        print("fixture-user access checks passed", flush=True)
 
-    for seat_number, user in enumerate(users, start=1):
-        _join_community(auth_api_url, user.token, community_id)
-        _join_table(auth_api_url, user.token, table_id, args.buy_in, seat_number)
-        role = "bot" if user.is_bot else "human"
-        print(f"✅ Seated {role} user {user.username} at seat {seat_number}")
+        tracker.start("bot_connect")
+        bot_users = [user for user in fixture_users if user.is_bot]
+        for bot_user in bot_users:
+            bot_handle = _start_bot_agent(
+                bot_user,
+                game_server_url,
+                fixture.game_id,
+                stop_event=stop_event,
+                error_queue=bot_error_queue,
+            )
+            bot_handles.append(bot_handle)
+            print(f"started bot agent for {bot_user.username}", flush=True)
+        _wait_for_bot_connections(
+            bot_handles,
+            error_queue=bot_error_queue,
+            interrupt_state=interrupt_state,
+        )
+        print("bot websocket connections established", flush=True)
 
-    bot_users = [user for user in users if user.is_bot]
-    agents: list[WebSocketPokerAgent] = []
-    threads: list[threading.Thread] = []
+        human_timeout = args.human_timeout_seconds or args.timeout_seconds or DEFAULT_HUMAN_TIMEOUT_SECONDS
+        timeout_seconds = human_timeout if args.mode == "human-vs-bot" else args.timeout_seconds
+        if args.mode == "human-vs-bot":
+            human_user = next(user for user in fixture_users if not user.is_bot)
+            credentials_path = _write_human_credentials_file(
+                human_user,
+                run_tag=run_tag,
+                ui_url=ui_url,
+                community_id=fixture.community_id,
+                table_id=fixture.table_id,
+            )
+            print("interactive mode; cleanup will run on completion, timeout, or Ctrl-C", flush=True)
+            print(f"credentials file: {credentials_path}", flush=True)
+            print(f"community URL: {ui_url}/community/{fixture.community_id}", flush=True)
+            print(f"direct game URL: {ui_url}/game/{fixture.table_id}?communityId={fixture.community_id}", flush=True)
+            print(f"run tag: {run_tag}; table_id={fixture.table_id}; game_id={fixture.game_id}", flush=True)
 
-    for bot_user in bot_users:
-        agent, thread = _start_bot_agent(bot_user, game_server_url, game_id)
-        agents.append(agent)
-        threads.append(thread)
-        print(f"🤖 Started bot agent thread for {bot_user.username}")
+        tracker.start("wait_for_common_hand")
+        common_hand_id, _common_hand_detail = _wait_for_common_hand(
+            auth_api_url,
+            fixture_users,
+            fixture,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=args.poll_interval_seconds,
+            bot_handles=bot_handles,
+            error_queue=bot_error_queue,
+            interrupt_state=interrupt_state,
+            human_mode=args.mode == "human-vs-bot",
+        )
+        summary.common_hand_id = common_hand_id
+        print(f"common persisted hand found: {common_hand_id}", flush=True)
 
-    _wait_for_bot_connections(agents)
-    print("✅ Bot websocket connections established")
+        tracker.start("admin_outsider_checks")
+        _assert_admin_outsider_checks(auth_api_url, game_server_url, admin_user, fixture, common_hand_id)
+        print("ordinary-admin outsider checks passed", flush=True)
 
-    if args.mode == "human-vs-bot":
-        human_user = next(user for user in users if not user.is_bot)
-        game_url = f"{ui_url}/game/{table_id}?communityId={community_id}"
-        print()
-        print("-" * 84)
-        print("HUMAN TESTER ACTION REQUIRED")
-        print("-" * 84)
-        print(f"Login username: {human_user.username}")
-        print(f"Login password: {human_user.password}")
-        print(f"Community lobby URL: {ui_url}/community/{community_id}")
-        print(f"Direct game URL: {game_url}")
-        print("Open the UI, login as the human user above, and play at least one full hand.")
-        print("This script will keep running and pass once both users have recorded hand history.")
-        print("-" * 84)
-        print()
+        summary.status = "passed"
+        tracker.start("done")
+        print("AUTONOMOUS GAMEPLAY E2E PASSED", flush=True)
+        return 0
+    except InterruptedRun as exc:
+        summary.status = "interrupted"
+        summary.error = str(exc)
+        exit_code = 130 if exc.signum == signal.SIGINT else 143
+    except SmokeTestError as exc:
+        summary.status = "failed"
+        summary.error = str(exc)
+        exit_code = 1
+    except Exception as exc:  # pragma: no cover - defensive unexpected failure path
+        summary.status = "failed"
+        summary.error = f"Unexpected error: {exc}"
+        print("Unexpected error during E2E run", file=sys.stderr)
+        import traceback
 
-    hand_counts = _wait_for_hands(
-        auth_api_url=auth_api_url,
-        users=users,
-        expected_table_name=table_name,
-        timeout_seconds=args.timeout_seconds,
-        poll_interval_seconds=args.poll_interval_seconds,
-    )
-    print("✅ Hand history recorded for all expected participants")
-    print(f"Hand counts by user: {_fmt_json(hand_counts)}")
+        traceback.print_exc()
+        exit_code = 1
+    finally:
+        _disconnect_bots(bot_handles, stop_event)
+        if admin_user and fixture_create_dispatched and cleanup_permitted:
+            tracker.start("cleanup")
+            summary.cleanup.attempted = True
+            try:
+                cleanup_status, deleted_counts = _cleanup_fixture_stack(auth_api_url, admin_user.token, run_tag)
+                summary.cleanup.succeeded = cleanup_status == "cleaned"
+                summary.cleanup.deleted_counts = deleted_counts
+                if not summary.cleanup.succeeded:
+                    raise SmokeTestError(f"Fixture cleanup returned unexpected status {cleanup_status}")
+                print(f"fixture cleanup succeeded: {deleted_counts}", flush=True)
+            except HTTPRequestError as exc:
+                if exc.status_code == 404 and fixture is None:
+                    summary.cleanup.succeeded = True
+                    print("fixture cleanup returned 404 before ownership was established; treating as no-op", flush=True)
+                else:
+                    summary.cleanup.error = str(exc)
+                    summary.status = "failed"
+                    if not summary.error:
+                        summary.error = f"Fixture cleanup failed: {exc}"
+                    if exit_code == 0:
+                        exit_code = 1
+                    print(f"fixture cleanup failed: {exc}", file=sys.stderr)
+            except Exception as exc:
+                summary.cleanup.error = str(exc)
+                summary.status = "failed"
+                if not summary.error:
+                    summary.error = f"Fixture cleanup failed: {exc}"
+                if exit_code == 0:
+                    exit_code = 1
+                print(f"fixture cleanup failed: {exc}", file=sys.stderr)
+        if summary.status == "passed":
+            tracker.start("done")
+        tracker.finish()
+        _write_summary(artifact_dir, summary)
+        interrupt_state.restore(previous_handlers)
 
-    _disconnect_agents(agents)
-    print("✅ Bot agents disconnected")
-    print()
-    print("SMOKE TEST PASSED")
-    return 0
+    if summary.status == "failed":
+        print("AUTONOMOUS GAMEPLAY E2E FAILED", file=sys.stderr)
+        if summary.error:
+            print(summary.error, file=sys.stderr)
+    elif summary.status == "interrupted":
+        print(summary.error or "Interrupted", file=sys.stderr)
+    return exit_code
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(run())
-    except SmokeTestError as exc:
-        print()
-        print("SMOKE TEST FAILED")
-        print(str(exc))
-        raise SystemExit(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        raise SystemExit(130)
+    raise SystemExit(run())
