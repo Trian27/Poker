@@ -65,7 +65,7 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
-      - run: pytest -m gameplay tests/gameplay/test_tables_gameplay.py -q
+      - run: python -m pytest -m gameplay tests/gameplay/test_tables_gameplay.py -q
 
   poker-ui:
     runs-on: ubuntu-latest
