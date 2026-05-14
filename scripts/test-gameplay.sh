@@ -23,7 +23,13 @@ ARTIFACT_DIR=""
 COMPOSE_SERVICES=()
 COMPOSE_ACTIVE=0
 
-if [[ ! -x "$PYTHON_BIN" ]]; then
+if [[ -x "$PYTHON_BIN" ]]; then
+  :
+elif command -v "$PYTHON_BIN" > /dev/null 2>&1; then
+  PYTHON_BIN="$(command -v "$PYTHON_BIN")"
+elif [[ "$PYTHON_BIN" == "python" ]] && command -v python3 > /dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
   echo "Could not find PYTHON_BIN: $PYTHON_BIN" >&2
   echo "Expected local default: ~/.virtualenvs/poker/bin/python" >&2
   echo "Set PYTHON_BIN=python or run the documented bootstrap command." >&2
