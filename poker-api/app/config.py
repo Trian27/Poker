@@ -52,6 +52,7 @@ class Settings(BaseSettings):
 
     # Internal services
     GAME_SERVER_URL: str = "http://game-server:3000"
+    ENABLE_TEST_FIXTURE_API: bool = False
 
     @field_validator("DEBUG", mode="before")
     @classmethod

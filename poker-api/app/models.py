@@ -34,6 +34,8 @@ class User(Base):
     email_verified = Column(Boolean, default=False)
     is_admin = Column(Boolean, default=False)  # Admin can create leagues
     is_banned = Column(Boolean, default=False)
+    is_test_user = Column(Boolean, default=False, nullable=False)
+    test_run_tag = Column(String(128), nullable=True)
     gold_coins = Column(Integer, default=0, nullable=False)
     creator_cash_pending_cents = Column(Integer, default=0, nullable=False)
     creator_cash_paid_cents = Column(Integer, default=0, nullable=False)
@@ -53,6 +55,8 @@ class League(Base):
     description = Column(String(500))
     currency = Column(String(10), nullable=False, default="chips")
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    is_test_only = Column(Boolean, default=False, nullable=False)
+    test_run_tag = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
@@ -89,6 +93,8 @@ class Community(Base):
     currency = Column(String(10), nullable=False, default="chips")
     starting_balance = Column(Numeric(precision=15, scale=2), default=1000.00)
     commissioner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    is_test_only = Column(Boolean, default=False, nullable=False)
+    test_run_tag = Column(String(128), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
@@ -179,6 +185,8 @@ class Table(Base):
     max_queue_size = Column(Integer, default=10, nullable=False)  # Maximum players in queue (0 = no queue)
     action_timeout_seconds = Column(Integer, default=30, nullable=False)  # Time limit for player actions in seconds
     agents_allowed = Column(Boolean, default=True, nullable=False)  # Whether autonomous agents (bots) can join
+    is_test_only = Column(Boolean, default=False, nullable=False)
+    test_run_tag = Column(String(128), nullable=True)
     tournament_start_time = Column(DateTime(timezone=True), nullable=True)
     tournament_starting_stack = Column(Integer, default=1000, nullable=False)
     tournament_security_deposit = Column(Integer, default=0, nullable=False)
@@ -252,6 +260,8 @@ class HandHistory(Base):
     community_id = Column(Integer, ForeignKey("communities.id"), nullable=False)
     table_id = Column(Integer, ForeignKey("tables.id"), nullable=True)  # NULL if table deleted
     table_name = Column(String(100), nullable=False)  # Denormalized for history
+    is_test_only = Column(Boolean, default=False, nullable=False)
+    test_run_tag = Column(String(128), nullable=True)
     played_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # JSONB stores the entire hand data: players, actions, cards, winner, pot, etc.
@@ -273,6 +283,8 @@ class TableSession(Base):
     community_id = Column(Integer, ForeignKey("communities.id", ondelete="CASCADE"), nullable=False)
     table_name = Column(String(100), nullable=False)
     buy_in_amount = Column(Integer, nullable=False, default=0)
+    is_test_only = Column(Boolean, default=False, nullable=False)
+    test_run_tag = Column(String(128), nullable=True)
     joined_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     left_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -436,6 +448,30 @@ class EmailVerification(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     verified = Column(Boolean, default=False)
     user = relationship("User")
+
+
+class TestFixtureRun(Base):
+    """Lifecycle registry for run-scoped gameplay fixture stacks."""
+    __tablename__ = "test_fixture_runs"
+
+    run_tag = Column(String(128), primary_key=True)
+    status = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    player_count = Column(Integer, nullable=False, default=0)
+    queued_player_count = Column(Integer, nullable=False, default=0)
+    league_id = Column(Integer, ForeignKey("leagues.id", ondelete="SET NULL"), nullable=True)
+    community_id = Column(Integer, ForeignKey("communities.id", ondelete="SET NULL"), nullable=True)
+    table_id = Column(Integer, ForeignKey("tables.id", ondelete="SET NULL"), nullable=True)
+    game_id = Column(String(255), nullable=True)
+    last_create_error = Column(String, nullable=True)
+    last_cleanup_error = Column(String, nullable=True)
+
+    created_by = relationship("User")
+    league = relationship("League")
+    community = relationship("Community")
+    table = relationship("Table")
 
 
 class SkinCategory(str, enum.Enum):

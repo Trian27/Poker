@@ -4,11 +4,15 @@ Main FastAPI application with all routes
 from fastapi import FastAPI, Depends, HTTPException, status, Body, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy import or_, and_, func
+from sqlalchemy import or_, and_, func, text
 from sqlalchemy.orm import Session
 from decimal import Decimal
 import math
 from collections import Counter
+from dataclasses import dataclass
+import re
+import secrets
+import string
 
 from .config import settings
 from .database import get_db, SessionLocal
@@ -19,6 +23,7 @@ from .models import (
     CreatorPayoutRequest, CreatorPayoutStatus,
     TableSession, SessionHand, EmailVerification, TournamentRegistration, TournamentRegistrationStatus,
     Tournament, TournamentPayout, FeedbackReport, PlayerNote
+    , TestFixtureRun
 )
 from .schema_migrations import ensure_schema
 from .schemas import (
@@ -44,7 +49,8 @@ from .schemas import (
     TournamentCreate, TournamentResponse, TournamentAwardRequest,
     FeedbackCreate, FeedbackResponse, FeedbackComplaintBucket,
     ProfileUpdateRequest, ProfileUpdateInitResponse, ProfileUpdateVerifyRequest, ProfileUpdateResponse,
-    AccountRecoveryRequest, AccountRecoveryVerifyRequest, AccountRecoveryVerifyResponse
+    AccountRecoveryRequest, AccountRecoveryVerifyRequest, AccountRecoveryVerifyResponse,
+    TestFixtureGameplayStackCreate, TestFixtureGameplayStackResponse, TestFixtureCleanupResponse
 )
 from .auth import (
     get_password_hash, verify_password,
@@ -139,6 +145,8 @@ def _bootstrap_admin_user() -> None:
 def on_startup() -> None:
     ensure_schema()
     _bootstrap_admin_user()
+    if settings.ENABLE_TEST_FIXTURE_API and not settings.is_production:
+        logger.warning("Test fixture API is enabled outside production")
 
 
 # ============================================================================
@@ -167,6 +175,22 @@ def health_check():
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+TEST_RUN_TAG_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+TEST_FIXTURE_RUN_STATUS_CREATING = "creating"
+TEST_FIXTURE_RUN_STATUS_ACTIVE = "active"
+TEST_FIXTURE_RUN_STATUS_CLEANUP_STARTED = "cleanup_started"
+TEST_FIXTURE_RUN_STATUS_CLEANED = "cleaned"
+TEST_FIXTURE_RUN_STATUS_CREATE_FAILED = "create_failed"
+TEST_FIXTURE_RUN_STATUS_CLEANUP_FAILED = "cleanup_failed"
+TEST_ONLY_NOT_FOUND_DETAIL = "Resource not found"
+TABLE_NOT_FOUND_SOCKET_REASON = "table_not_found"
+
+
+@dataclass(frozen=True)
+class PartitionContext:
+    kind: str
+    run_tag: str | None = None
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
@@ -206,6 +230,29 @@ async def post_game_server_json(path: str, payload: dict, timeout: float = 10.0)
             json=payload,
             timeout=timeout,
         )
+
+
+def _issue_access_token_for_user(user: User) -> str:
+    return create_access_token(
+        data={
+            "user_id": user.id,
+            "username": user.username,
+            "is_test_user": bool(user.is_test_user),
+            "test_run_tag": user.test_run_tag,
+        }
+    )
+
+
+def _serialize_public_user(user: User) -> dict:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "is_admin": user.is_admin,
+        "is_banned": user.is_banned,
+        "is_test_user": bool(user.is_test_user),
+    }
 
 
 def _is_league_admin(db: Session, league_id: int, user_id: int) -> bool:
@@ -257,6 +304,462 @@ def _get_user_or_404(db: Session, user_id: int) -> User:
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user
+
+
+def _normal_partition() -> PartitionContext:
+    return PartitionContext(kind="normal", run_tag=None)
+
+
+def _is_test_partition(context: PartitionContext) -> bool:
+    return context.kind == "test_only"
+
+
+def _build_partition_context_for_user(user: User) -> PartitionContext:
+    if user.is_test_user:
+        return PartitionContext(kind="test_only", run_tag=user.test_run_tag)
+    return _normal_partition()
+
+
+def _get_partition_context_for_user_id(db: Session, user_id: int) -> PartitionContext:
+    return _build_partition_context_for_user(_get_user_or_404(db, user_id))
+
+
+def _require_non_test_partition(partition: PartitionContext) -> None:
+    if _is_test_partition(partition):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Test users cannot use this route"
+        )
+
+
+def _validate_run_tag(run_tag: str) -> str:
+    normalized = (run_tag or "").strip()
+    if not TEST_RUN_TAG_RE.fullmatch(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid run_tag"
+        )
+    return normalized
+
+
+def _ensure_partition_access(
+    partition: PartitionContext,
+    *,
+    is_test_only: bool,
+    test_run_tag: str | None,
+) -> None:
+    if partition.kind == "normal":
+        if is_test_only:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=TEST_ONLY_NOT_FOUND_DETAIL)
+        return
+
+    if not is_test_only or test_run_tag != partition.run_tag:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=TEST_ONLY_NOT_FOUND_DETAIL)
+
+
+def _apply_partition_filter(query, model, partition: PartitionContext):
+    if partition.kind == "normal":
+        return query.filter(model.is_test_only.is_(False))
+    return query.filter(
+        model.is_test_only.is_(True),
+        model.test_run_tag == partition.run_tag,
+    )
+
+
+def _apply_user_partition_filter(query, partition: PartitionContext):
+    if partition.kind == "normal":
+        return query.filter(User.is_test_user.is_(False))
+    return query.filter(
+        User.is_test_user.is_(True),
+        User.test_run_tag == partition.run_tag,
+    )
+
+
+def _assert_same_test_partition(
+    *,
+    child_is_test_only: bool,
+    child_run_tag: str | None,
+    parent_is_test_only: bool,
+    parent_run_tag: str | None,
+    detail: str = "Cross-partition attachment is not allowed",
+) -> None:
+    if child_is_test_only != parent_is_test_only:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+    if child_is_test_only and child_run_tag != parent_run_tag:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+def _assert_user_matches_resource_partition(user: User, resource, detail: str) -> None:
+    _assert_same_test_partition(
+        child_is_test_only=user.is_test_user,
+        child_run_tag=user.test_run_tag,
+        parent_is_test_only=resource.is_test_only,
+        parent_run_tag=resource.test_run_tag,
+        detail=detail,
+    )
+
+
+def _get_visible_league_or_404(db: Session, league_id: int, partition: PartitionContext) -> League:
+    league = db.query(League).filter(League.id == league_id).first()
+    if not league:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+    _ensure_partition_access(partition, is_test_only=league.is_test_only, test_run_tag=league.test_run_tag)
+    return league
+
+
+def _get_visible_community_or_404(db: Session, community_id: int, partition: PartitionContext) -> Community:
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+    _ensure_partition_access(partition, is_test_only=community.is_test_only, test_run_tag=community.test_run_tag)
+    return community
+
+
+def _get_visible_table_or_404(db: Session, table_id: int, partition: PartitionContext) -> Table:
+    table = db.query(Table).filter(Table.id == table_id).first()
+    if not table:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+    _ensure_partition_access(partition, is_test_only=table.is_test_only, test_run_tag=table.test_run_tag)
+    return table
+
+
+def _require_fixture_api_enabled() -> None:
+    if settings.is_production or not settings.ENABLE_TEST_FIXTURE_API:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Test fixture API is not enabled"
+        )
+
+
+def _require_fixture_admin(db: Session, current_user: dict) -> User:
+    _require_fixture_api_enabled()
+    return _require_global_admin(db, current_user)
+
+
+def _acquire_run_tag_lock(db: Session, run_tag: str) -> None:
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:run_tag))"), {"run_tag": run_tag})
+
+
+def _fixture_cleanup_counts() -> dict[str, int]:
+    return {
+        "session_hands": 0,
+        "table_sessions": 0,
+        "hand_history": 0,
+        "table_queue": 0,
+        "table_seats": 0,
+        "wallets": 0,
+        "league_members": 0,
+        "league_admins": 0,
+        "community_admins": 0,
+        "league_join_requests": 0,
+        "join_requests": 0,
+        "tournament_registrations": 0,
+        "email_verifications": 0,
+        "tables": 0,
+        "communities": 0,
+        "leagues": 0,
+        "users": 0,
+    }
+
+
+def _generate_test_password() -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "T-" + "".join(secrets.choice(alphabet) for _ in range(20))
+
+
+def _validate_fixture_stack_request(payload: TestFixtureGameplayStackCreate) -> str:
+    run_tag = _validate_run_tag(payload.run_tag)
+    if payload.player_count > payload.max_seats:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="player_count cannot exceed max_seats")
+    if payload.queued_player_count > payload.max_queue_size:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="queued_player_count cannot exceed max_queue_size")
+    if payload.queued_player_count > 0 and payload.player_count < payload.max_seats:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="queued_player_count is only supported when player_count fills the table"
+        )
+    if payload.buy_in <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cash game buy-in must be greater than zero")
+    if payload.big_blind < payload.small_blind:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Big blind must be greater than or equal to small blind"
+        )
+    if payload.starting_balance < payload.buy_in:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="starting_balance must be greater than or equal to buy_in"
+        )
+    return run_tag
+
+
+def _username_fragment_for_run(run_tag: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", run_tag).strip("_").lower()
+    return cleaned[:24] or "run"
+
+
+def _test_entity_name(prefix: str, run_tag: str, max_length: int) -> str:
+    value = f"{prefix} {run_tag}"
+    return value[:max_length]
+
+
+def _truncate_error_message(message: str | None) -> str | None:
+    if not message:
+        return None
+    return str(message)[:4000]
+
+
+def _update_fixture_run_status(
+    db: Session,
+    run_tag: str,
+    *,
+    status_value: str,
+    league_id: int | None = None,
+    community_id: int | None = None,
+    table_id: int | None = None,
+    game_id: str | None = None,
+    last_create_error: str | None = None,
+    last_cleanup_error: str | None = None,
+) -> TestFixtureRun:
+    _acquire_run_tag_lock(db, run_tag)
+    fixture_run = db.query(TestFixtureRun).filter(TestFixtureRun.run_tag == run_tag).first()
+    if not fixture_run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fixture run not found")
+    fixture_run.status = status_value
+    if league_id is not None:
+        fixture_run.league_id = league_id
+    if community_id is not None:
+        fixture_run.community_id = community_id
+    if table_id is not None:
+        fixture_run.table_id = table_id
+    if game_id is not None:
+        fixture_run.game_id = game_id
+    if last_create_error is not None:
+        fixture_run.last_create_error = _truncate_error_message(last_create_error)
+    if last_cleanup_error is not None:
+        fixture_run.last_cleanup_error = _truncate_error_message(last_cleanup_error)
+    db.commit()
+    db.refresh(fixture_run)
+    return fixture_run
+
+
+async def _seat_fixture_user(
+    *,
+    db: Session,
+    table: Table,
+    seat: TableSeat,
+    user: User,
+    wallet: Wallet,
+    buy_in_amount: int,
+) -> None:
+    wallet.balance -= buy_in_amount
+    seat.user_id = user.id
+    seat.occupied_at = func.now()
+    session = TableSession(
+        user_id=user.id,
+        table_id=table.id,
+        community_id=table.community_id,
+        table_name=table.name,
+        buy_in_amount=buy_in_amount,
+        is_test_only=table.is_test_only,
+        test_run_tag=table.test_run_tag,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(wallet)
+
+    seat_request = SeatPlayerRequest(
+        table_id=table.id,
+        user_id=user.id,
+        username=user.username,
+        stack=buy_in_amount,
+        seat_number=seat.seat_number,
+        community_id=table.community_id,
+        table_name=table.name,
+        is_test_only=table.is_test_only,
+        test_run_tag=table.test_run_tag,
+    )
+
+    try:
+        response = await post_game_server_json(
+            "/_internal/seat-player",
+            seat_request.model_dump(),
+            timeout=10.0,
+        )
+    except httpx.RequestError as exc:
+        response = None
+        error_message = f"Game server unavailable: {exc}"
+    else:
+        error_message = response.text if response.status_code != 200 else None
+
+    if error_message:
+        wallet.balance += buy_in_amount
+        seat.user_id = None
+        seat.occupied_at = None
+        db.query(TableSession).filter(
+            TableSession.user_id == user.id,
+            TableSession.table_id == table.id,
+            TableSession.left_at.is_(None),
+        ).update({"left_at": func.now()})
+        db.commit()
+        raise RuntimeError(f"Failed to seat fixture user {user.username}: {error_message}")
+
+
+async def _purge_fixture_runtime(fixture_run: TestFixtureRun) -> None:
+    if not fixture_run.game_id or not fixture_run.table_id:
+        return
+    try:
+        response = await post_game_server_json(
+            f"/_internal/game/{fixture_run.game_id}/purge",
+            {
+                "expected_table_id": fixture_run.table_id,
+                "expected_test_run_tag": fixture_run.run_tag,
+            },
+            timeout=10.0,
+        )
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Game server purge unreachable: {exc}") from exc
+
+    if response.status_code != 200:
+        raise RuntimeError(response.text or "Game server purge rejected")
+
+
+def _delete_query(query) -> int:
+    return int(query.delete(synchronize_session=False) or 0)
+
+
+def _cleanup_fixture_run_rows(db: Session, run_tag: str) -> dict[str, int]:
+    counts = _fixture_cleanup_counts()
+
+    users = db.query(User).filter(
+        User.is_test_user.is_(True),
+        User.test_run_tag == run_tag,
+    ).all()
+    user_ids = [user.id for user in users]
+    user_emails = [user.email for user in users]
+
+    leagues = db.query(League).filter(
+        League.is_test_only.is_(True),
+        League.test_run_tag == run_tag,
+    ).all()
+    league_ids = [league.id for league in leagues]
+
+    communities = db.query(Community).filter(
+        Community.is_test_only.is_(True),
+        Community.test_run_tag == run_tag,
+    ).all()
+    community_ids = [community.id for community in communities]
+
+    tables = db.query(Table).filter(
+        Table.is_test_only.is_(True),
+        Table.test_run_tag == run_tag,
+    ).all()
+    table_ids = [table.id for table in tables]
+
+    sessions = db.query(TableSession).filter(
+        TableSession.is_test_only.is_(True),
+        TableSession.test_run_tag == run_tag,
+    ).all()
+    session_ids = [session.id for session in sessions]
+
+    hands = db.query(HandHistory).filter(
+        HandHistory.is_test_only.is_(True),
+        HandHistory.test_run_tag == run_tag,
+    ).all()
+    hand_ids = [hand.id for hand in hands]
+
+    if session_ids:
+        counts["session_hands"] = _delete_query(
+            db.query(SessionHand).filter(SessionHand.session_id.in_(session_ids))
+        )
+
+    counts["table_sessions"] = _delete_query(
+        db.query(TableSession).filter(
+            TableSession.is_test_only.is_(True),
+            TableSession.test_run_tag == run_tag,
+        )
+    )
+    counts["hand_history"] = _delete_query(
+        db.query(HandHistory).filter(
+            HandHistory.is_test_only.is_(True),
+            HandHistory.test_run_tag == run_tag,
+        )
+    )
+
+    if table_ids:
+        counts["table_queue"] = _delete_query(
+            db.query(TableQueue).filter(TableQueue.table_id.in_(table_ids))
+        )
+        counts["table_seats"] = _delete_query(
+            db.query(TableSeat).filter(TableSeat.table_id.in_(table_ids))
+        )
+        counts["tournament_registrations"] = _delete_query(
+            db.query(TournamentRegistration).filter(TournamentRegistration.table_id.in_(table_ids))
+        )
+
+    if user_ids and community_ids:
+        counts["wallets"] = _delete_query(
+            db.query(Wallet).filter(
+                Wallet.user_id.in_(user_ids),
+                Wallet.community_id.in_(community_ids),
+            )
+        )
+
+    if league_ids:
+        counts["league_admins"] = _delete_query(
+            db.query(LeagueAdmin).filter(LeagueAdmin.league_id.in_(league_ids))
+        )
+        counts["league_join_requests"] = _delete_query(
+            db.query(LeagueJoinRequest).filter(LeagueJoinRequest.league_id.in_(league_ids))
+        )
+
+    if community_ids:
+        counts["community_admins"] = _delete_query(
+            db.query(CommunityAdmin).filter(CommunityAdmin.community_id.in_(community_ids))
+        )
+        counts["join_requests"] = _delete_query(
+            db.query(JoinRequest).filter(JoinRequest.community_id.in_(community_ids))
+        )
+
+    if user_ids:
+        counts["league_members"] = _delete_query(
+            db.query(LeagueMember).filter(LeagueMember.user_id.in_(user_ids))
+        )
+        counts["email_verifications"] = _delete_query(
+            db.query(EmailVerification).filter(
+                or_(
+                    EmailVerification.user_id.in_(user_ids),
+                    EmailVerification.email.in_(user_emails),
+                )
+            )
+        )
+
+    counts["tables"] = _delete_query(
+        db.query(Table).filter(
+            Table.is_test_only.is_(True),
+            Table.test_run_tag == run_tag,
+        )
+    )
+    counts["communities"] = _delete_query(
+        db.query(Community).filter(
+            Community.is_test_only.is_(True),
+            Community.test_run_tag == run_tag,
+        )
+    )
+    counts["leagues"] = _delete_query(
+        db.query(League).filter(
+            League.is_test_only.is_(True),
+            League.test_run_tag == run_tag,
+        )
+    )
+    counts["users"] = _delete_query(
+        db.query(User).filter(
+            User.is_test_user.is_(True),
+            User.test_run_tag == run_tag,
+        )
+    )
+    db.commit()
+    return counts
 
 
 def _require_global_admin(db: Session, current_user: dict) -> User:
@@ -1155,21 +1658,12 @@ def login(username: str, password: str, db: Session = Depends(get_db)):
         }
     
     # Create access token for non-admin or dev mode
-    access_token = create_access_token(
-        data={"user_id": user.id, "username": user.username}
-    )
+    access_token = _issue_access_token_for_user(user)
     
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
-            "is_admin": user.is_admin,
-            "is_banned": user.is_banned
-        }
+        "user": _serialize_public_user(user)
     }
 
 
@@ -1215,22 +1709,13 @@ def verify_admin_login(
     db.commit()
     
     # Create access token
-    access_token = create_access_token(
-        data={"user_id": user.id, "username": user.username}
-    )
+    access_token = _issue_access_token_for_user(user)
     
     return {
         "success": True,
         "access_token": access_token,
         "token_type": "bearer",
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
-            "is_admin": user.is_admin,
-            "is_banned": user.is_banned
-        }
+        "user": _serialize_public_user(user)
     }
 
 
@@ -1328,14 +1813,7 @@ def get_current_user_info(
             detail="User not found"
         )
     
-    return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "is_admin": user.is_admin,
-        "is_banned": user.is_banned
-    }
+    return _serialize_public_user(user)
 
 
 # ============================================================================
@@ -1502,6 +1980,289 @@ def set_community_currency(
     return {"message": "Community currency updated", "community_id": community.id, "currency": community.currency}
 
 
+@app.post(
+    "/api/admin/test-fixtures/gameplay-stack",
+    response_model=TestFixtureGameplayStackResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_test_fixture_gameplay_stack(
+    payload: TestFixtureGameplayStackCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    admin_user = _require_fixture_admin(db, current_user)
+    run_tag = _validate_fixture_stack_request(payload)
+
+    _acquire_run_tag_lock(db, run_tag)
+    existing_run = db.query(TestFixtureRun).filter(TestFixtureRun.run_tag == run_tag).first()
+    if existing_run:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run_tag already exists")
+
+    fixture_run = TestFixtureRun(
+        run_tag=run_tag,
+        status=TEST_FIXTURE_RUN_STATUS_CREATING,
+        created_by_user_id=admin_user.id,
+        player_count=payload.player_count,
+        queued_player_count=payload.queued_player_count,
+    )
+    db.add(fixture_run)
+    db.commit()
+
+    try:
+        run_fragment = _username_fragment_for_run(run_tag)
+        created_users: list[tuple[User, str]] = []
+        for index in range(1, payload.player_count + payload.queued_player_count + 1):
+            username = f"e2e_{run_fragment}_{index}"[:50]
+            email = f"e2e+{run_tag}+p{index}@example.test"[:100]
+            password = _generate_test_password()
+            user = User(
+                username=username,
+                email=email,
+                hashed_password=get_password_hash(password),
+                email_verified=True,
+                is_test_user=True,
+                test_run_tag=run_tag,
+            )
+            db.add(user)
+            db.flush()
+            created_users.append((user, password))
+
+        owner_user = created_users[0][0]
+        league = League(
+            name=_test_entity_name("E2E League", run_tag, 100),
+            description=f"Test-only fixture league for run {run_tag}"[:500],
+            currency="chips",
+            owner_id=owner_user.id,
+            is_test_only=True,
+            test_run_tag=run_tag,
+        )
+        db.add(league)
+        db.flush()
+
+        for user, _ in created_users:
+            db.add(LeagueMember(league_id=league.id, user_id=user.id))
+
+        community = Community(
+            name=_test_entity_name("E2E Community", run_tag, 100),
+            description=f"Test-only fixture community for run {run_tag}"[:500],
+            league_id=league.id,
+            currency="chips",
+            starting_balance=payload.starting_balance,
+            commissioner_id=owner_user.id,
+            is_test_only=True,
+            test_run_tag=run_tag,
+        )
+        db.add(community)
+        db.flush()
+
+        for user, _ in created_users:
+            db.add(
+                Wallet(
+                    user_id=user.id,
+                    community_id=community.id,
+                    balance=payload.starting_balance,
+                )
+            )
+
+        table = Table(
+            community_id=community.id,
+            name=_test_entity_name("E2E Table", run_tag, 100),
+            status=TableStatus.WAITING,
+            game_type=GameType.CASH,
+            max_seats=payload.max_seats,
+            small_blind=payload.small_blind,
+            big_blind=payload.big_blind,
+            buy_in=payload.buy_in,
+            is_permanent=False,
+            created_by_user_id=owner_user.id,
+            max_queue_size=payload.max_queue_size,
+            action_timeout_seconds=payload.action_timeout_seconds,
+            agents_allowed=True,
+            is_test_only=True,
+            test_run_tag=run_tag,
+        )
+        db.add(table)
+        db.flush()
+
+        for seat_number in range(1, payload.max_seats + 1):
+            db.add(TableSeat(table_id=table.id, seat_number=seat_number, user_id=None))
+
+        db.commit()
+        game_id = f"table_{table.id}"
+        _update_fixture_run_status(
+            db,
+            run_tag,
+            status_value=TEST_FIXTURE_RUN_STATUS_CREATING,
+            league_id=league.id,
+            community_id=community.id,
+            table_id=table.id,
+            game_id=game_id,
+        )
+
+        seat_rows = {
+            seat.seat_number: seat
+            for seat in db.query(TableSeat).filter(TableSeat.table_id == table.id).all()
+        }
+        wallet_rows = {
+            wallet.user_id: wallet
+            for wallet in db.query(Wallet).filter(Wallet.community_id == community.id).all()
+        }
+
+        response_users: list[dict[str, object]] = []
+        for index, (user, password) in enumerate(created_users, start=1):
+            if index <= payload.player_count:
+                await _seat_fixture_user(
+                    db=db,
+                    table=table,
+                    seat=seat_rows[index],
+                    user=user,
+                    wallet=wallet_rows[user.id],
+                    buy_in_amount=payload.buy_in,
+                )
+                response_users.append(
+                    {
+                        "user_id": user.id,
+                        "username": user.username,
+                        "email": user.email,
+                        "password": password,
+                        "is_test_user": True,
+                        "seat_number": index,
+                        "queue_position": None,
+                    }
+                )
+            else:
+                queue_position = index - payload.player_count
+                db.add(
+                    TableQueue(
+                        table_id=table.id,
+                        user_id=user.id,
+                        position=queue_position,
+                    )
+                )
+                db.commit()
+                response_users.append(
+                    {
+                        "user_id": user.id,
+                        "username": user.username,
+                        "email": user.email,
+                        "password": password,
+                        "is_test_user": True,
+                        "seat_number": None,
+                        "queue_position": queue_position,
+                    }
+                )
+
+        _update_fixture_run_status(
+            db,
+            run_tag,
+            status_value=TEST_FIXTURE_RUN_STATUS_ACTIVE,
+            league_id=league.id,
+            community_id=community.id,
+            table_id=table.id,
+            game_id=game_id,
+            last_create_error=None,
+            last_cleanup_error=None,
+        )
+
+        return TestFixtureGameplayStackResponse(
+            run_tag=run_tag,
+            league_id=league.id,
+            community_id=community.id,
+            table_id=table.id,
+            table_name=table.name,
+            game_id=game_id,
+            users=response_users,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        create_error = _truncate_error_message(str(exc))
+        cleanup_error: str | None = None
+        try:
+            fixture_run = db.query(TestFixtureRun).filter(TestFixtureRun.run_tag == run_tag).first()
+            if fixture_run:
+                await _purge_fixture_runtime(fixture_run)
+            _cleanup_fixture_run_rows(db, run_tag)
+        except Exception as cleanup_exc:
+            cleanup_error = _truncate_error_message(str(cleanup_exc))
+
+        final_status = (
+            TEST_FIXTURE_RUN_STATUS_CLEANUP_FAILED
+            if cleanup_error
+            else TEST_FIXTURE_RUN_STATUS_CREATE_FAILED
+        )
+        _update_fixture_run_status(
+            db,
+            run_tag,
+            status_value=final_status,
+            last_create_error=create_error,
+            last_cleanup_error=cleanup_error,
+        )
+        logger.exception("Fixture provisioning failed for run %s", run_tag)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to provision test fixture run",
+        )
+
+
+@app.delete(
+    "/api/admin/test-fixtures/runs/{run_tag}",
+    response_model=TestFixtureCleanupResponse,
+)
+async def delete_test_fixture_run(
+    run_tag: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_fixture_admin(db, current_user)
+    normalized_run_tag = _validate_run_tag(run_tag)
+
+    _acquire_run_tag_lock(db, normalized_run_tag)
+    fixture_run = db.query(TestFixtureRun).filter(TestFixtureRun.run_tag == normalized_run_tag).first()
+    if not fixture_run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fixture run not found")
+    if fixture_run.status == TEST_FIXTURE_RUN_STATUS_CLEANED:
+        return TestFixtureCleanupResponse(
+            run_tag=normalized_run_tag,
+            status=TEST_FIXTURE_RUN_STATUS_CLEANED,
+            deleted=_fixture_cleanup_counts(),
+        )
+    if fixture_run.status == TEST_FIXTURE_RUN_STATUS_CLEANUP_STARTED:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cleanup already in progress")
+
+    fixture_run.status = TEST_FIXTURE_RUN_STATUS_CLEANUP_STARTED
+    db.commit()
+    db.refresh(fixture_run)
+
+    try:
+        await _purge_fixture_runtime(fixture_run)
+        counts = _cleanup_fixture_run_rows(db, normalized_run_tag)
+    except Exception as exc:
+        _update_fixture_run_status(
+            db,
+            normalized_run_tag,
+            status_value=TEST_FIXTURE_RUN_STATUS_CLEANUP_FAILED,
+            last_cleanup_error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to clean up test fixture run",
+        ) from exc
+
+    _update_fixture_run_status(
+        db,
+        normalized_run_tag,
+        status_value=TEST_FIXTURE_RUN_STATUS_CLEANED,
+        last_cleanup_error=None,
+    )
+    return TestFixtureCleanupResponse(
+        run_tag=normalized_run_tag,
+        status=TEST_FIXTURE_RUN_STATUS_CLEANED,
+        deleted=counts,
+    )
+
+
 # ============================================================================
 # League Endpoints
 # ============================================================================
@@ -1520,6 +2281,8 @@ def create_league(
     - **description**: Optional description
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    _require_non_test_partition(partition)
     
     # Create league
     new_league = League(
@@ -1545,7 +2308,8 @@ def list_leagues(
 ):
     """List all leagues with membership status for the current user"""
     user_id = current_user.get("user_id")
-    leagues = db.query(League).all()
+    partition = _get_partition_context_for_user_id(db, user_id)
+    leagues = _apply_partition_filter(db.query(League), League, partition).all()
 
     if not leagues:
         return []
@@ -1606,13 +2370,8 @@ def delete_league(
     - League owner (can delete only their own league)
     """
     user_id = current_user.get("user_id")
-    league = db.query(League).filter(League.id == league_id).first()
-
-    if not league:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="League not found"
-        )
+    partition = _get_partition_context_for_user_id(db, user_id)
+    league = _get_visible_league_or_404(db, league_id, partition)
 
     if not (_is_global_admin(db, user_id) or league.owner_id == user_id):
         raise HTTPException(
@@ -1899,14 +2658,11 @@ def create_community(
     - **starting_balance**: Initial balance for new members (default: 1000.00)
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    _require_non_test_partition(partition)
 
     # Verify league exists
-    league = db.query(League).filter(League.id == community_data.league_id).first()
-    if not league:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="League not found"
-        )
+    league = _get_visible_league_or_404(db, community_data.league_id, partition)
 
     if not _is_league_member(db, league.id, user_id):
         raise HTTPException(
@@ -1949,14 +2705,16 @@ def join_community(
     user_id = current_user.get("user_id")
     user = _get_user_or_404(db, user_id)
     _ensure_not_banned(user)
+    partition = _build_partition_context_for_user(user)
     
     # Verify community exists
-    community = db.query(Community).filter(Community.id == community_id).first()
-    if not community:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community not found"
-        )
+    community = _get_visible_community_or_404(db, community_id, partition)
+
+    _assert_user_matches_resource_partition(
+        user,
+        community,
+        "Cross-partition community joins are not allowed",
+    )
 
     if not _is_league_member(db, community.league_id, user_id):
         raise HTTPException(
@@ -1991,15 +2749,38 @@ def join_community(
 
 
 @app.get("/api/communities", response_model=list[CommunityResponse])
-def list_communities(league_id: int | None = None, db: Session = Depends(get_db)):
+def list_communities(
+    league_id: int | None = None,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: Session = Depends(get_db),
+):
     """
     List all communities (optionally filter by league)
     
     - **league_id**: Optional league ID to filter by
     """
-    query = db.query(Community)
+    partition = _normal_partition()
+    if credentials:
+        payload = decode_token(credentials.credentials)
+        if payload and payload.get("user_id"):
+            partition = _get_partition_context_for_user_id(db, int(payload["user_id"]))
+
+    query = _apply_partition_filter(db.query(Community), Community, partition)
     
     if league_id:
+        if partition.kind == "normal":
+            league = db.query(League).filter(
+                League.id == league_id,
+                League.is_test_only.is_(False)
+            ).first()
+        else:
+            league = db.query(League).filter(
+                League.id == league_id,
+                League.is_test_only.is_(True),
+                League.test_run_tag == partition.run_tag
+            ).first()
+        if not league:
+            return []
         query = query.filter(Community.league_id == league_id)
     
     communities = query.all()
@@ -2020,13 +2801,8 @@ def delete_community(
     - Community commissioner (can delete only their own community)
     """
     user_id = current_user.get("user_id")
-    community = db.query(Community).filter(Community.id == community_id).first()
-
-    if not community:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community not found"
-        )
+    partition = _get_partition_context_for_user_id(db, user_id)
+    community = _get_visible_community_or_404(db, community_id, partition)
 
     if not (_is_global_admin(db, user_id) or community.commissioner_id == user_id):
         raise HTTPException(
@@ -2332,22 +3108,24 @@ def get_community_tables(
     Get all tables for a specific community
     Requires authentication
     """
-    # Check if community exists
-    community = db.query(Community).filter(Community.id == community_id).first()
-    if not community:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community not found"
-        )
-
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    community = _get_visible_community_or_404(db, community_id, partition)
 
     # Get all tables for this community
-    tables = db.query(Table).filter(Table.community_id == community_id).all()
+    tables = _apply_partition_filter(
+        db.query(Table).filter(Table.community_id == community_id),
+        Table,
+        partition,
+    ).all()
     for table in tables:
         _maybe_start_tournament_table(db, table)
 
-    refreshed_tables = db.query(Table).filter(Table.community_id == community_id).all()
+    refreshed_tables = _apply_partition_filter(
+        db.query(Table).filter(Table.community_id == community_id),
+        Table,
+        partition,
+    ).all()
     return [_table_to_response_with_tournament_meta(db, table, user_id) for table in refreshed_tables]
 
 
@@ -2367,14 +3145,11 @@ def create_table(
     They remain visible even when empty.
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    _require_non_test_partition(partition)
     
     # Check if community exists
-    community = db.query(Community).filter(Community.id == community_id).first()
-    if not community:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community not found"
-        )
+    community = _get_visible_community_or_404(db, community_id, partition)
     # Check if user is trying to create a permanent table
     if table.is_permanent and community.commissioner_id != user_id:
         raise HTTPException(
@@ -2546,9 +3321,8 @@ def get_table_tournament_details(
     db: Session = Depends(get_db),
 ):
     user_id = current_user.get("user_id")
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    table = _get_visible_table_or_404(db, table_id, partition)
     if table.game_type != GameType.TOURNAMENT:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Table is not a tournament")
 
@@ -2652,10 +3426,10 @@ def register_for_tournament(
     user_id = current_user.get("user_id")
     user = _get_user_or_404(db, user_id)
     _ensure_not_banned(user)
+    partition = _build_partition_context_for_user(user)
 
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+    table = _get_visible_table_or_404(db, table_id, partition)
+    _assert_user_matches_resource_partition(user, table, "Cross-run tournament registration is not allowed")
     if table.game_type != GameType.TOURNAMENT:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Table is not a tournament")
 
@@ -2756,9 +3530,8 @@ def confirm_tournament_entry(
     db: Session = Depends(get_db),
 ):
     user_id = current_user.get("user_id")
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    table = _get_visible_table_or_404(db, table_id, partition)
     if table.game_type != GameType.TOURNAMENT:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Table is not a tournament")
 
@@ -2820,9 +3593,8 @@ def unregister_from_tournament(
     db: Session = Depends(get_db),
 ):
     user_id = current_user.get("user_id")
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    table = _get_visible_table_or_404(db, table_id, partition)
     if table.game_type != GameType.TOURNAMENT:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Table is not a tournament")
 
@@ -2865,15 +3637,12 @@ def update_tournament_payout(
     db: Session = Depends(get_db),
 ):
     user_id = current_user.get("user_id")
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    table = _get_visible_table_or_404(db, table_id, partition)
     if table.game_type != GameType.TOURNAMENT:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Table is not a tournament")
 
-    community = db.query(Community).filter(Community.id == table.community_id).first()
-    if not community:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Community not found")
+    community = _get_visible_community_or_404(db, table.community_id, partition)
     if table.tournament_state in {"running", "completed"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Cannot update payout after tournament has started")
     if not _can_manage_tournament_settings(db, table, user_id):
@@ -2916,22 +3685,13 @@ def delete_table(
     Requires authentication and permission checks.
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
     
     # Get table
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Table not found"
-        )
+    table = _get_visible_table_or_404(db, table_id, partition)
     
     # Get the community to check ownership
-    community = db.query(Community).filter(Community.id == table.community_id).first()
-    if not community:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Community not found"
-        )
+    community = _get_visible_community_or_404(db, table.community_id, partition)
 
     if not (_is_global_admin(db, user_id) or community.commissioner_id == user_id):
         raise HTTPException(
@@ -2979,6 +3739,7 @@ def get_my_active_table_seat(
     while the disconnect grace period is still active.
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
 
     seat_records = (
         db.query(TableSeat, Table)
@@ -2994,6 +3755,10 @@ def get_my_active_table_seat(
     stale_seat_found = False
 
     for seat, table in seat_records:
+        try:
+            _ensure_partition_access(partition, is_test_only=table.is_test_only, test_run_tag=table.test_run_tag)
+        except HTTPException:
+            continue
         active_session = db.query(TableSession.id).filter(
             TableSession.user_id == user_id,
             TableSession.table_id == seat.table_id,
@@ -3035,14 +3800,11 @@ def join_table_queue(
     user_id = current_user.get("user_id")
     user = _get_user_or_404(db, user_id)
     _ensure_not_banned(user)
+    partition = _build_partition_context_for_user(user)
     
     # Check if table exists
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Table not found"
-        )
+    table = _get_visible_table_or_404(db, table_id, partition)
+    _assert_user_matches_resource_partition(user, table, "Cross-run queueing is not allowed")
     if table.game_type == GameType.TOURNAMENT:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3124,6 +3886,8 @@ def leave_table_queue(
     Requires authentication
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    _get_visible_table_or_404(db, table_id, partition)
     
     # Find queue entry
     queue_entry = db.query(TableQueue).filter(
@@ -3176,13 +3940,8 @@ def get_table_queue(
     Get the current queue for a table
     Requires authentication
     """
-    # Check if table exists
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Table not found"
-        )
+    partition = _get_partition_context_for_user_id(db, current_user.get("user_id"))
+    table = _get_visible_table_or_404(db, table_id, partition)
     if table.game_type == GameType.TOURNAMENT:
         return []
     
@@ -3216,13 +3975,8 @@ def get_table_seats(
     Get all seats for a table showing which are occupied
     Requires authentication
     """
-    # Check if table exists
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Table not found"
-        )
+    partition = _get_partition_context_for_user_id(db, current_user.get("user_id"))
+    _get_visible_table_or_404(db, table_id, partition)
 
     _maybe_start_tournament_table(db, table)
     
@@ -3272,6 +4026,7 @@ async def join_table(
     username = current_user.get("username")
     user = _get_user_or_404(db, user_id)
     _ensure_not_banned(user)
+    partition = _build_partition_context_for_user(user)
     new_session: TableSession | None = None
     wallet: Wallet | None = None
     tournament_registration: TournamentRegistration | None = None
@@ -3279,12 +4034,8 @@ async def join_table(
     should_debit_wallet = True
     
     # Step 2: Get table and verify it exists
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if not table:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Table not found"
-        )
+    table = _get_visible_table_or_404(db, table_id, partition)
+    _assert_user_matches_resource_partition(user, table, "Cross-run table joins are not allowed")
 
     if table.game_type == GameType.TOURNAMENT:
         _maybe_start_tournament_table(db, table)
@@ -3360,6 +4111,8 @@ async def join_table(
                 seat_number=request.seat_number,
                 community_id=table.community_id,
                 table_name=table.name,
+                is_test_only=table.is_test_only,
+                test_run_tag=table.test_run_tag,
             )
 
             response = await post_game_server_json(
@@ -3403,6 +4156,8 @@ async def join_table(
                 community_id=table.community_id,
                 table_name=table.name,
                 buy_in_amount=join_stack_amount,
+                is_test_only=table.is_test_only,
+                test_run_tag=table.test_run_tag,
             )
             db.add(active_session)
             db.commit()
@@ -3476,6 +4231,8 @@ async def join_table(
         community_id=table.community_id,
         table_name=table.name,
         buy_in_amount=join_stack_amount,
+        is_test_only=table.is_test_only,
+        test_run_tag=table.test_run_tag,
     )
     db.add(new_session)
     
@@ -3500,6 +4257,8 @@ async def join_table(
             seat_number=request.seat_number,
             community_id=table.community_id,
             table_name=table.name,
+            is_test_only=table.is_test_only,
+            test_run_tag=table.test_run_tag,
         )
         
         response = await post_game_server_json(
@@ -3593,7 +4352,13 @@ def verify_token_internal(
     if user.is_banned:
         return TokenVerifyResponse(valid=False, message="User is banned")
 
-    return TokenVerifyResponse(valid=True, user_id=user_id, username=username)
+    return TokenVerifyResponse(
+        valid=True,
+        user_id=user_id,
+        username=username,
+        is_test_user=bool(user.is_test_user),
+        test_run_tag=user.test_run_tag,
+    )
 
 
 @app.post("/api/internal/wallets/debit", response_model=WalletOperationResponse)
@@ -3712,6 +4477,8 @@ def get_table_config(table_id: int, db: Session = Depends(get_db)):
         "big_blind": table.big_blind,
         "buy_in": table.buy_in,
         "is_permanent": table.is_permanent,
+        "is_test_only": table.is_test_only,
+        "test_run_tag": table.test_run_tag,
         "action_timeout_seconds": table.action_timeout_seconds,
         "max_queue_size": table.max_queue_size
     }
@@ -3876,6 +4643,8 @@ async def unseat_player(table_id: int, user_id: int, db: Session = Depends(get_d
             community_id=table.community_id,
             table_name=table.name,
             buy_in_amount=buy_in_amount,
+            is_test_only=table.is_test_only,
+            test_run_tag=table.test_run_tag,
         )
         db.add(auto_session)
         
@@ -3907,6 +4676,8 @@ async def unseat_player(table_id: int, user_id: int, db: Session = Depends(get_d
                 seat_number=freed_seat_number,
                 community_id=table.community_id,
                 table_name=table.name,
+                is_test_only=table.is_test_only,
+                test_run_tag=table.test_run_tag,
             )
             
             response = await post_game_server_json(
@@ -3970,6 +4741,8 @@ async def leave_table(
     This is a client-facing, idempotent safety path used alongside websocket leave_game.
     """
     user_id = current_user.get("user_id")
+    partition = _get_partition_context_for_user_id(db, user_id)
+    _get_visible_table_or_404(db, table_id, partition)
 
     # Best-effort unseat (also handles queue promotion).
     result = await unseat_player(table_id, user_id, db)
@@ -4009,12 +4782,31 @@ def record_hand_history(
     It stores the full hand data in JSONB format for later retrieval.
     """
     try:
+        table = None
+        if history.table_id is not None:
+            table = db.query(Table).filter(Table.id == history.table_id).first()
+            if not table:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Table not found for hand history record"
+                )
+            if table.community_id != history.community_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Hand history community does not match table community"
+                )
+
+        is_test_only = table.is_test_only if table else bool(history.is_test_only)
+        test_run_tag = table.test_run_tag if table else history.test_run_tag
+
         # Create hand history record
         hand_record = HandHistory(
             community_id=history.community_id,
             table_id=history.table_id,
             table_name=history.table_name,
-            hand_data=history.hand_data
+            hand_data=history.hand_data,
+            is_test_only=is_test_only,
+            test_run_tag=test_run_tag,
         )
         
         db.add(hand_record)
@@ -4054,6 +4846,9 @@ def record_hand_history(
                 ).order_by(TableSession.joined_at.desc()).first()
 
             if not session:
+                continue
+
+            if session.is_test_only != is_test_only or session.test_run_tag != test_run_tag:
                 continue
 
             exists = db.query(SessionHand).filter(
@@ -4098,25 +4893,41 @@ def get_my_hand_history(
     Only returns summary information - use /api/hands/{hand_id} for full details.
     """
     user_id = current_user["user_id"]
+    partition = _get_partition_context_for_user_id(db, user_id)
     
     # Query hands where user_id appears in the hand_data.players array
     # PostgreSQL JSONB query: hand_data @> '{"players": [{"user_id": X}]}'
     # But we need to search more flexibly, so we use jsonb_array_elements
     
-    from sqlalchemy import text
-    
-    query = text("""
+    if partition.kind == "normal":
+        query = text("""
         SELECT h.id, h.table_name, h.played_at, h.hand_data
         FROM hand_history h
-        WHERE EXISTS (
+        WHERE h.is_test_only = FALSE
+        AND EXISTS (
             SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
             WHERE (player->>'user_id')::int = :user_id
         )
         ORDER BY h.played_at DESC
         LIMIT :limit OFFSET :offset
     """)
-    
-    results = db.execute(query, {"user_id": user_id, "limit": limit, "offset": offset})
+        params = {"user_id": user_id, "limit": limit, "offset": offset}
+    else:
+        query = text("""
+        SELECT h.id, h.table_name, h.played_at, h.hand_data
+        FROM hand_history h
+        WHERE h.is_test_only = TRUE
+        AND h.test_run_tag = :test_run_tag
+        AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
+            WHERE (player->>'user_id')::int = :user_id
+        )
+        ORDER BY h.played_at DESC
+        LIMIT :limit OFFSET :offset
+    """)
+        params = {"user_id": user_id, "limit": limit, "offset": offset, "test_run_tag": partition.run_tag}
+
+    results = db.execute(query, params)
     
     # Transform results into summary format
     summaries = []
@@ -4153,21 +4964,35 @@ def get_hand_details(
     This prevents users from viewing hands they weren't involved in.
     """
     user_id = current_user["user_id"]
-    
-    # Query the hand
-    from sqlalchemy import text
-    
-    query = text("""
+    partition = _get_partition_context_for_user_id(db, user_id)
+
+    if partition.kind == "normal":
+        query = text("""
         SELECT h.id, h.community_id, h.table_id, h.table_name, h.played_at, h.hand_data
         FROM hand_history h
         WHERE h.id = :hand_id
+        AND h.is_test_only = FALSE
         AND EXISTS (
             SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
             WHERE (player->>'user_id')::int = :user_id
         )
     """)
-    
-    result = db.execute(query, {"hand_id": hand_id, "user_id": user_id}).first()
+        params = {"hand_id": hand_id, "user_id": user_id}
+    else:
+        query = text("""
+        SELECT h.id, h.community_id, h.table_id, h.table_name, h.played_at, h.hand_data
+        FROM hand_history h
+        WHERE h.id = :hand_id
+        AND h.is_test_only = TRUE
+        AND h.test_run_tag = :test_run_tag
+        AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(h.hand_data->'players') AS player
+            WHERE (player->>'user_id')::int = :user_id
+        )
+    """)
+        params = {"hand_id": hand_id, "user_id": user_id, "test_run_tag": partition.run_tag}
+
+    result = db.execute(query, params).first()
     
     if not result:
         raise HTTPException(
@@ -6372,9 +7197,7 @@ def verify_email(
     db.refresh(new_user)
     
     # Create access token
-    access_token = create_access_token(
-        data={"user_id": new_user.id, "username": new_user.username}
-    )
+    access_token = _issue_access_token_for_user(new_user)
     
     return {
         "success": True,
@@ -6722,7 +7545,7 @@ def verify_profile_update(
     db.commit()
     db.refresh(user)
 
-    new_token = create_access_token(data={"user_id": user.id, "username": user.username})
+    new_token = _issue_access_token_for_user(user)
     
     return ProfileUpdateResponse(
         success=True,

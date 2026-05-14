@@ -11,13 +11,18 @@ export interface HarnessUser {
   id: number;
   username: string;
   email?: string;
+  isTestUser?: boolean;
+  testRunTag?: string | null;
 }
 
 export const createAuthToken = (user: HarnessUser): string => jwt.sign(
   {
+    user_id: user.id,
     id: user.id,
     username: user.username,
     email: user.email ?? `${user.username}@example.com`,
+    is_test_user: Boolean(user.isTestUser),
+    test_run_tag: user.testRunTag ?? null,
   },
   JWT_SECRET,
   { expiresIn: '24h' }
@@ -81,6 +86,8 @@ export class ServerHarness {
     seatNumber: number;
     communityId?: number;
     tableName?: string;
+    isTestOnly?: boolean;
+    testRunTag?: string | null;
   }): Promise<void> {
     const response = await axios.post(`${this.baseHttpUrl}/_internal/seat-player`, {
       table_id: payload.tableId,
@@ -90,6 +97,8 @@ export class ServerHarness {
       seat_number: payload.seatNumber,
       community_id: payload.communityId,
       table_name: payload.tableName,
+      is_test_only: payload.isTestOnly,
+      test_run_tag: payload.testRunTag,
     });
     expect(response.status).toBe(200);
   }

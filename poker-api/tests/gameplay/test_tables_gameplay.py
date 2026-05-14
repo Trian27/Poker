@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -26,13 +27,26 @@ class SetupBundle:
     community: Any
 
 
-def create_user(db, auth_module: Any, models_module: Any, username: str, *, email: str | None = None) -> Any:
+def create_user(
+    db,
+    auth_module: Any,
+    models_module: Any,
+    username: str,
+    *,
+    email: str | None = None,
+    is_admin: bool = False,
+    is_test_user: bool = False,
+    test_run_tag: str | None = None,
+) -> Any:
     user = models_module.User(
         username=username,
         email=email or f"{username}@example.com",
         hashed_password=auth_module.get_password_hash("password123"),
         is_active=True,
         email_verified=True,
+        is_admin=is_admin,
+        is_test_user=is_test_user,
+        test_run_tag=test_run_tag,
     )
     db.add(user)
     db.commit()
@@ -82,6 +96,56 @@ def seed_league_graph(db, app_modules: dict[str, Any]) -> SetupBundle:
 def set_current_user(auth_state: dict, user: Any) -> None:
     auth_state["user_id"] = user.id
     auth_state["username"] = user.username
+
+
+def create_partitioned_fixture_graph(
+    db,
+    app_modules: dict[str, Any],
+    *,
+    run_tag: str,
+    username_prefix: str,
+) -> tuple[Any, Any, Any, Any]:
+    auth_module = app_modules["auth"]
+    models_module = app_modules["models"]
+    user = create_user(
+        db,
+        auth_module,
+        models_module,
+        f"{username_prefix}_user",
+        email=f"{username_prefix}@example.test",
+        is_test_user=True,
+        test_run_tag=run_tag,
+    )
+    league = models_module.League(
+        name=f"{username_prefix} League",
+        description="Test league",
+        owner_id=user.id,
+        is_test_only=True,
+        test_run_tag=run_tag,
+    )
+    db.add(league)
+    db.commit()
+    db.refresh(league)
+    db.add(models_module.LeagueMember(league_id=league.id, user_id=user.id))
+    community = models_module.Community(
+        name=f"{username_prefix} Community",
+        description="Test community",
+        league_id=league.id,
+        starting_balance=Decimal("1000.00"),
+        commissioner_id=user.id,
+        is_test_only=True,
+        test_run_tag=run_tag,
+    )
+    db.add(community)
+    db.commit()
+    db.refresh(community)
+    create_wallet(db, models_module, user, community, 2000)
+    table = create_cash_table(db, models_module, community, user)
+    table.is_test_only = True
+    table.test_run_tag = run_tag
+    db.commit()
+    db.refresh(table)
+    return user, league, community, table
 
 
 def create_cash_table(db, models_module: Any, community: Any, owner: Any, *, max_seats: int = 4, buy_in: int = 200, max_queue_size: int = 5) -> Any:
@@ -377,3 +441,143 @@ def test_hand_history_summary_and_detail_are_scoped_to_participants(client, db_s
 
     outsider_detail = client.get(f"/api/hands/{hand_id}")
     assert outsider_detail.status_code == 404
+
+
+def test_normal_public_mutation_routes_reject_partition_fields(client):
+    register_response = client.post(
+        "/auth/register",
+        json={
+            "username": "normaluser",
+            "email": "normal@example.com",
+            "password": "password123",
+            "is_test_user": True,
+            "test_run_tag": "run-a",
+        },
+    )
+    assert register_response.status_code == 422
+
+
+def test_cross_run_test_users_cannot_access_other_run_tables(client, db_session, auth_state, app_modules):
+    run_a_user, _, _, _ = create_partitioned_fixture_graph(
+        db_session,
+        app_modules,
+        run_tag="run-a",
+        username_prefix="run_a",
+    )
+    _, _, run_b_community, run_b_table = create_partitioned_fixture_graph(
+        db_session,
+        app_modules,
+        run_tag="run-b",
+        username_prefix="run_b",
+    )
+
+    set_current_user(auth_state, run_a_user)
+
+    tables_response = client.get(f"/api/communities/{run_b_community.id}/tables")
+    assert tables_response.status_code == 404
+
+    queue_response = client.get(f"/api/tables/{run_b_table.id}/queue")
+    assert queue_response.status_code == 404
+
+    join_queue_response = client.post(f"/api/tables/{run_b_table.id}/queue/join")
+    assert join_queue_response.status_code == 404
+
+
+def test_fixture_api_provisions_and_cleans_up_same_run_stack(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    main_module = app_modules["main"]
+    previous_flag = main_module.settings.ENABLE_TEST_FIXTURE_API
+    main_module.settings.ENABLE_TEST_FIXTURE_API = True
+    try:
+        admin_user = create_user(
+            db_session,
+            app_modules["auth"],
+            models_module,
+            "fixture_admin",
+            is_admin=True,
+        )
+        set_current_user(auth_state, admin_user)
+
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+            calls.append((path, payload))
+            return httpx.Response(200, json={"success": True})
+
+        monkeypatch.setattr(main_module, "post_game_server_json", fake_post_game_server_json)
+
+        create_response = client.post(
+            "/api/admin/test-fixtures/gameplay-stack",
+            json={
+                "run_tag": "fixture-run-1",
+                "player_count": 2,
+                "queued_player_count": 0,
+                "starting_balance": "1000.00",
+                "buy_in": 200,
+                "small_blind": 10,
+                "big_blind": 20,
+                "max_seats": 2,
+                "max_queue_size": 0,
+                "action_timeout_seconds": 30,
+            },
+        )
+        assert create_response.status_code == 201, create_response.text
+        payload = create_response.json()
+        assert payload["run_tag"] == "fixture-run-1"
+        assert len(payload["users"]) == 2
+        assert all(user["is_test_user"] is True for user in payload["users"])
+
+        fixture_run = db_session.query(models_module.TestFixtureRun).filter_by(run_tag="fixture-run-1").one()
+        assert fixture_run.status == "active"
+
+        duplicate_response = client.post(
+            "/api/admin/test-fixtures/gameplay-stack",
+            json={
+                "run_tag": "fixture-run-1",
+                "player_count": 2,
+                "queued_player_count": 0,
+                "starting_balance": "1000.00",
+                "buy_in": 200,
+                "small_blind": 10,
+                "big_blind": 20,
+                "max_seats": 2,
+                "max_queue_size": 0,
+                "action_timeout_seconds": 30,
+            },
+        )
+        assert duplicate_response.status_code == 409
+
+        created_user_ids = [user["user_id"] for user in payload["users"]]
+        db_session.add(
+            models_module.EmailVerification(
+                email=payload["users"][0]["email"],
+                username=payload["users"][0]["username"],
+                hashed_password="hash",
+                purpose="account_recovery",
+                user_id=created_user_ids[0],
+                verification_code="123456",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+                verified=False,
+            )
+        )
+        db_session.commit()
+
+        cleanup_response = client.delete("/api/admin/test-fixtures/runs/fixture-run-1")
+        assert cleanup_response.status_code == 200, cleanup_response.text
+        cleanup_payload = cleanup_response.json()
+        assert cleanup_payload["status"] == "cleaned"
+        assert cleanup_payload["deleted"]["users"] == 2
+        assert cleanup_payload["deleted"]["tables"] == 1
+        assert cleanup_payload["deleted"]["email_verifications"] >= 1
+
+        db_session.expire_all()
+        cleaned_run = db_session.query(models_module.TestFixtureRun).filter_by(run_tag="fixture-run-1").one()
+        assert cleaned_run.status == "cleaned"
+
+        second_cleanup = client.delete("/api/admin/test-fixtures/runs/fixture-run-1")
+        assert second_cleanup.status_code == 200
+        assert second_cleanup.json()["deleted"]["users"] == 0
+
+        assert any(path == "/_internal/game/table_1/purge" or path.endswith("/purge") for path, _ in calls)
+    finally:
+        main_module.settings.ENABLE_TEST_FIXTURE_API = previous_flag
