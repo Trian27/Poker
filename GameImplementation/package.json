@@ -8,7 +8,10 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "start": "node dist/server.js",
     "client": "ts-node src/client.ts",
-    "test": "jest"
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "test:gameplay": "jest --runInBand src/engine/__tests__/Game.test.ts src/engine/__tests__/Game.trajectory.test.ts src/__tests__/game.hand-complete-actions.test.ts src/__tests__/server.agent-api.test.ts src/__tests__/server.gameplay-flow.test.ts src/__tests__/redis.test.ts",
+    "test:chaos": "jest --runInBand src/engine/__tests__/Game.invariants.test.ts"
   },
   "keywords": [
     "poker",

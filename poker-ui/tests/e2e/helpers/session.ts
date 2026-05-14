@@ -13,10 +13,11 @@ export const SMOKE_TEST_USER = {
 
 export async function seedAuthenticatedSession(page: Page): Promise<void> {
   await page.addInitScript(
-    ({ token, user }) => {
+    ({ token, user, expiry }) => {
       window.localStorage.setItem('token', token);
       window.localStorage.setItem('user', JSON.stringify(user));
+      window.localStorage.setItem('auth_session_expires_at', String(expiry));
     },
-    { token: SMOKE_TEST_TOKEN, user: SMOKE_TEST_USER }
+    { token: SMOKE_TEST_TOKEN, user: SMOKE_TEST_USER, expiry: Date.now() + 30 * 24 * 60 * 60 * 1000 }
   );
 }

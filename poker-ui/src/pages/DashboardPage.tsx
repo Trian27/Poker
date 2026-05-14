@@ -10,7 +10,11 @@ import UserMenu from '../components/UserMenu';
 import CommunitySettingsModal from '../components/CommunitySettingsModal';
 import './Dashboard.css';
 import { getApiErrorMessage } from "../utils/error";
-import { isAutoRejoinSuppressed, shouldRunReloadAutoRejoinCheck } from '../utils/activeSeatRejoin';
+import {
+  isAutoRejoinSuppressed,
+  markReloadAutoRejoinCheckComplete,
+  shouldRunReloadAutoRejoinCheck,
+} from '../utils/activeSeatRejoin';
 
 const UNREAD_COUNT_STORAGE_KEY = 'poker-inbox-unread-count';
 
@@ -145,15 +149,11 @@ export const DashboardPage: React.FC = () => {
     let cancelled = false;
 
     const tryAutoRejoinOnReload = async () => {
-      if (!shouldRunReloadAutoRejoinCheck()) {
-        return;
-      }
-
       const navigationEntries = performance.getEntriesByType('navigation');
       const navigationEntry = navigationEntries[0] as PerformanceNavigationTiming | undefined;
       const isReload = navigationEntry?.type === 'reload';
 
-      if (!isReload || isAutoRejoinSuppressed()) {
+      if (!shouldRunReloadAutoRejoinCheck(isReload) || isAutoRejoinSuppressed()) {
         return;
       }
 
@@ -162,6 +162,7 @@ export const DashboardPage: React.FC = () => {
         const activeSeat = await tablesApi.getMyActiveSeat();
         if (!cancelled && activeSeat?.active && activeSeat.table_id) {
           const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
+          markReloadAutoRejoinCheckComplete();
           navigate(`/game/${activeSeat.table_id}${communityParam}`, { replace: true });
           return;
         }
@@ -169,6 +170,7 @@ export const DashboardPage: React.FC = () => {
         console.error('Failed to check active seat for auto-rejoin:', err);
       } finally {
         if (!cancelled) {
+          markReloadAutoRejoinCheckComplete();
           setIsRejoiningTable(false);
         }
       }

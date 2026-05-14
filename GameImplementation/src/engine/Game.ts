@@ -111,12 +111,14 @@ export class Game {
   private stage: GameStage = 'waiting';
   private currentPlayerIndex: number = 0;
   private currentBet: number = 0;
+  private dealerCursorIndex: number = 0;
   private dealerIndex: number = 0;
   private smallBlindIndex: number = 0;
   private bigBlindIndex: number = 0;
-  private lastRaiserIndex: number = -1;
-  private playersActedThisRound: Set<string> = new Set(); // Track who has acted this round
-  private lastRaiseSize: number = 0; // Size of the last raise (for minimum raise enforcement)
+  private lastFullAggressorIndex: number = -1;
+  private playersActedThisRound: Set<string> = new Set(); // Players who have satisfied action requirements since the last reopening event
+  private lastFullRaiseSize: number = 0; // Size of the last full valid bet/raise for minimum raise enforcement
+  private cumulativeShortAllInDelta: number = 0; // Consecutive short all-in bet increases since the last full raise
   private config: GameConfig;
   private actionStartTime: number = 0; // Timestamp when current player's action started
   private currentActionPlayerId: string | null = null; // ID of player currently on the clock
@@ -127,6 +129,83 @@ export class Game {
 
   private isActionStage(): boolean {
     return this.stage === 'preflop' || this.stage === 'flop' || this.stage === 'turn' || this.stage === 'river';
+  }
+
+  private getActiveHandParticipantIndices(): number[] {
+    return this.players
+      .map((player, index) => ({ player, index }))
+      .filter(({ player }) => player.getIsActive())
+      .map(({ index }) => index);
+  }
+
+  private findNextEligibleIndex(fromIndex: number, eligibleIndices: number[]): number {
+    if (eligibleIndices.length === 0 || this.players.length === 0) {
+      return -1;
+    }
+
+    for (let offset = 0; offset < this.players.length; offset += 1) {
+      const candidateIndex = (fromIndex + offset + this.players.length) % this.players.length;
+      if (eligibleIndices.includes(candidateIndex)) {
+        return candidateIndex;
+      }
+    }
+
+    return -1;
+  }
+
+  private resolveLiveDealerIndex(participantIndices: number[]): number {
+    return this.findNextEligibleIndex(this.dealerCursorIndex, participantIndices);
+  }
+
+  private resolveLiveBlindIndices(participantIndices: number[]): { dealerIndex: number; smallBlindIndex: number; bigBlindIndex: number } {
+    const liveDealerIndex = this.resolveLiveDealerIndex(participantIndices);
+    if (liveDealerIndex === -1) {
+      return {
+        dealerIndex: -1,
+        smallBlindIndex: -1,
+        bigBlindIndex: -1,
+      };
+    }
+
+    if (participantIndices.length === 2) {
+      return {
+        dealerIndex: liveDealerIndex,
+        smallBlindIndex: liveDealerIndex,
+        bigBlindIndex: this.findNextEligibleIndex(liveDealerIndex + 1, participantIndices),
+      };
+    }
+
+    const liveSmallBlindIndex = this.findNextEligibleIndex(liveDealerIndex + 1, participantIndices);
+    return {
+      dealerIndex: liveDealerIndex,
+      smallBlindIndex: liveSmallBlindIndex,
+      bigBlindIndex: this.findNextEligibleIndex(liveSmallBlindIndex + 1, participantIndices),
+    };
+  }
+
+  private resolveFirstPreflopActorIndex(participantIndices: number[]): number {
+    if (participantIndices.length === 2) {
+      return this.smallBlindIndex;
+    }
+
+    return this.findNextEligibleIndex(this.bigBlindIndex + 1, participantIndices);
+  }
+
+  private resolveFirstPostflopActorIndex(): number {
+    return this.findNextActionableIndex(this.dealerIndex + 1);
+  }
+
+  private findNextActionableIndex(fromIndex: number): number {
+    const actionableIndices = this.players
+      .map((player, index) => ({ player, index }))
+      .filter(({ player }) => player.getIsActive() && !player.getHasFolded() && !player.getIsAllIn())
+      .map(({ index }) => index);
+
+    if (actionableIndices.length === 0) {
+      return -1;
+    }
+
+    return this.findNextEligibleIndex(fromIndex, actionableIndices);
   }
 
   constructor(config: GameConfig) {
@@ -203,10 +282,11 @@ export class Game {
     };
 
     this.currentPlayerIndex = remapIndex(this.currentPlayerIndex);
+    this.dealerCursorIndex = remapIndex(this.dealerCursorIndex);
     this.dealerIndex = remapIndex(this.dealerIndex);
     this.smallBlindIndex = remapIndex(this.smallBlindIndex);
     this.bigBlindIndex = remapIndex(this.bigBlindIndex);
-    this.lastRaiserIndex = this.lastRaiserIndex === -1 ? -1 : remapIndex(this.lastRaiserIndex);
+    this.lastFullAggressorIndex = this.lastFullAggressorIndex === -1 ? -1 : remapIndex(this.lastFullAggressorIndex);
 
     // Keep the action moving after a leave.
     if (this.stage !== 'waiting' && this.stage !== 'complete' && this.stage !== 'showdown') {
@@ -258,7 +338,7 @@ export class Game {
 
     // Calculate where the dealer button will be NEXT hand
     // (it moves one position after current hand completes)
-    const nextDealerIndex = (this.dealerIndex + 1) % tempPlayers.length;
+    const nextDealerIndex = (this.dealerCursorIndex + 1) % tempPlayers.length;
 
     // Calculate where big blind will be next hand with new player count
     let nextBigBlindIndex: number;
@@ -298,8 +378,9 @@ export class Game {
     this.communityCards = [];
     this.pot = 0;
     this.currentBet = 0;
-    this.lastRaiserIndex = -1;
-    this.lastRaiseSize = 0;
+    this.lastFullAggressorIndex = -1;
+    this.lastFullRaiseSize = this.config.bigBlind;
+    this.cumulativeShortAllInDelta = 0;
     this.playersActedThisRound.clear();
     this.lastHandResult = null;
     this.handActionLog = [];
@@ -312,41 +393,41 @@ export class Game {
       this.handStartingStacks[player.id] = player.getStack();
     });
 
-    // Post antes if configured
-    if (this.config.ante && this.config.ante > 0) {
-      for (const player of this.players) {
-        const anteAmount = player.bet(this.config.ante);
-        this.pot += anteAmount;
-      }
-    }
+    // Move dealer cursor across the full seated ring (always rotate, even on first hand).
+    this.dealerCursorIndex = (this.dealerCursorIndex + 1) % this.players.length;
 
-    // Move dealer button (always rotate, even on first hand)
-    this.dealerIndex = (this.dealerIndex + 1) % this.players.length;
-    
-    // Set blind positions based on player count
-    if (this.players.length === 2) {
-      // Heads-up: dealer is small blind, opponent is big blind
-      this.smallBlindIndex = this.dealerIndex;
-      this.bigBlindIndex = (this.dealerIndex + 1) % this.players.length;
-    } else {
-      // Multi-way: normal positions
-      this.smallBlindIndex = (this.dealerIndex + 1) % this.players.length;
-      this.bigBlindIndex = (this.dealerIndex + 2) % this.players.length;
-    }
+    // Resolve seat-level blind positions first so queued players only become active on their BB hand.
+    const seatLevelDealerIndex = this.dealerCursorIndex;
+    const seatLevelBigBlindIndex = this.players.length === 2
+      ? (seatLevelDealerIndex + 1) % this.players.length
+      : (seatLevelDealerIndex + 2) % this.players.length;
 
     // Players waiting to post BB only become active once their seat reaches BB.
-    const queuedBigBlind = this.players[this.bigBlindIndex];
+    const queuedBigBlind = this.players[seatLevelBigBlindIndex];
     if (queuedBigBlind && queuedBigBlind.isWaitingForBigBlind()) {
       queuedBigBlind.setWaitingForBigBlind(false);
       queuedBigBlind.setActive();
     }
 
-    const activePlayers = this.players.filter((player) => player.getIsActive() && player.getStack() > 0);
-    if (activePlayers.length < 2) {
+    const handParticipantIndices = this.getActiveHandParticipantIndices();
+    if (handParticipantIndices.length < 2) {
       this.stage = 'waiting';
       this.clearActionTimerState();
       return;
     }
+
+    // Post antes only from players actually participating in this hand.
+    if (this.config.ante && this.config.ante > 0) {
+      for (const index of handParticipantIndices) {
+        const anteAmount = this.players[index].bet(this.config.ante);
+        this.pot += anteAmount;
+      }
+    }
+
+    const liveBlindIndices = this.resolveLiveBlindIndices(handParticipantIndices);
+    this.dealerIndex = liveBlindIndices.dealerIndex;
+    this.smallBlindIndex = liveBlindIndices.smallBlindIndex;
+    this.bigBlindIndex = liveBlindIndices.bigBlindIndex;
 
     // Post blinds
     const sbPlayer = this.players[this.smallBlindIndex];
@@ -370,7 +451,7 @@ export class Game {
       committedChips: sbAmount,
       toCallBefore: 0,
       minimumRaiseBefore: this.config.bigBlind,
-      playersInHandBefore: this.players.length,
+      playersInHandBefore: handParticipantIndices.length,
       potBefore: sbPotBefore,
       potAfter: sbPotAfter,
       currentBetBefore: 0,
@@ -392,7 +473,7 @@ export class Game {
       committedChips: bbAmount,
       toCallBefore: Math.max(0, sbPlayer.getCurrentBet() - bbPlayer.getCurrentBet()),
       minimumRaiseBefore: this.config.bigBlind,
-      playersInHandBefore: this.players.length,
+      playersInHandBefore: handParticipantIndices.length,
       potBefore: bbPotBefore,
       potAfter: this.pot,
       currentBetBefore: sbPlayer.getCurrentBet(),
@@ -403,37 +484,20 @@ export class Game {
       playerStackAfter: bbPlayer.getStack(),
     });
     
-    // Mark blind posters as having acted
-    this.playersActedThisRound.add(this.players[this.smallBlindIndex].id);
-    this.playersActedThisRound.add(this.players[this.bigBlindIndex].id);
-
     // Deal hole cards
-    for (const player of this.players) {
-      if (player.getIsActive()) {
-        player.dealHoleCards(this.deck.dealMultiple(2));
-      }
+    for (const index of handParticipantIndices) {
+      this.players[index].dealHoleCards(this.deck.dealMultiple(2));
     }
 
     this.stage = 'preflop';
-    
-    // Set first player to act based on player count
-    if (this.players.length === 2) {
-      // Heads-up: small blind (dealer) acts first pre-flop
-      this.currentPlayerIndex = this.smallBlindIndex;
-    } else {
-      // Multi-way: player after big blind (UTG) acts first
-      this.currentPlayerIndex = (this.bigBlindIndex + 1) % this.players.length;
-    }
 
-    // Ensure first turn is assigned to an actionable player.
-    let attempts = 0;
-    while (attempts < this.players.length) {
-      const current = this.players[this.currentPlayerIndex];
-      if (current.getIsActive() && !current.getHasFolded() && !current.getIsAllIn()) {
-        break;
-      }
-      this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
-      attempts += 1;
+    this.currentPlayerIndex = this.findNextActionableIndex(
+      this.resolveFirstPreflopActorIndex(handParticipantIndices)
+    );
+
+    if (this.currentPlayerIndex === -1) {
+      this.advanceStage();
+      return;
     }
 
     // Start action timer for first player
@@ -456,6 +520,35 @@ export class Game {
   private clearActionTimerState(): void {
     this.currentActionPlayerId = null;
     this.actionStartTime = 0;
+  }
+
+  private hasBettingBeenReopenedForPlayer(playerId: string, currentBetBefore: number, playerBetBefore: number): boolean {
+    return !this.playersActedThisRound.has(playerId) || currentBetBefore <= playerBetBefore;
+  }
+
+  private applyAggressiveActionState(betIncrease: number, minimumFullRaise: number, isAllIn: boolean): void {
+    if (betIncrease <= 0) {
+      return;
+    }
+
+    if (betIncrease >= minimumFullRaise) {
+      this.lastFullRaiseSize = betIncrease;
+      this.lastFullAggressorIndex = this.currentPlayerIndex;
+      this.cumulativeShortAllInDelta = 0;
+      this.playersActedThisRound.clear();
+      return;
+    }
+
+    if (!isAllIn) {
+      return;
+    }
+
+    this.cumulativeShortAllInDelta += betIncrease;
+    if (this.cumulativeShortAllInDelta >= this.lastFullRaiseSize) {
+      this.lastFullAggressorIndex = this.currentPlayerIndex;
+      this.cumulativeShortAllInDelta = 0;
+      this.playersActedThisRound.clear();
+    }
   }
 
   private getPerTurnActionSeconds(): number {
@@ -533,11 +626,13 @@ export class Game {
     this.pot = 0;
     this.currentBet = 0;
     this.currentPlayerIndex = 0;
+    this.dealerCursorIndex = 0;
     this.dealerIndex = 0;
     this.smallBlindIndex = 0;
     this.bigBlindIndex = 0;
-    this.lastRaiserIndex = -1;
-    this.lastRaiseSize = 0;
+    this.lastFullAggressorIndex = -1;
+    this.lastFullRaiseSize = this.config.bigBlind;
+    this.cumulativeShortAllInDelta = 0;
     this.playersActedThisRound.clear();
     this.clearActionTimerState();
     this.lastHandResult = null;
@@ -708,6 +803,19 @@ export class Game {
           const toCall = this.currentBet - player.getCurrentBet();
           const totalBet = toCall + amount;
           const isAllIn = totalBet >= player.getStack();
+          const actualCommitted = isAllIn ? player.getStack() : totalBet;
+          const newBet = player.getCurrentBet() + actualCommitted;
+          const betIncrease = Math.max(0, newBet - currentBetBefore);
+
+          if (
+            betIncrease > 0
+            && !this.hasBettingBeenReopenedForPlayer(playerId, currentBetBefore, playerBetBefore)
+          ) {
+            return {
+              valid: false,
+              error: 'Betting has not been reopened by a full raise'
+            };
+          }
           
           // For minimum validation:
           // - For 'bet': amount is the bet size
@@ -730,36 +838,39 @@ export class Game {
             const betAmount = player.bet(player.getStack());
             this.pot += betAmount;
             committedChips += betAmount;
-            const newBet = player.getCurrentBet(); // Use current round bet, not cumulative
-            if (newBet > this.currentBet) {
-              // Track raise size for next raise minimum (only if this actually raises)
-              this.lastRaiseSize = newBet - this.currentBet;
-              this.currentBet = newBet;
-              this.lastRaiserIndex = this.currentPlayerIndex;
-            }
+            this.currentBet = Math.max(currentBetBefore, player.getCurrentBet());
+            this.applyAggressiveActionState(betIncrease, minimumRaise, true);
           } else {
             const betAmount = player.bet(totalBet);
             this.pot += betAmount;
             committedChips += betAmount;
-            const newBet = player.getCurrentBet(); // Use current round bet, not cumulative
-            // Track raise size for next raise minimum
-            this.lastRaiseSize = newBet - this.currentBet;
-            this.currentBet = newBet;
-            this.lastRaiserIndex = this.currentPlayerIndex;
+            this.currentBet = player.getCurrentBet();
+            this.applyAggressiveActionState(betIncrease, minimumRaise, false);
           }
           break;
         }
 
         case 'all-in': {
+          const allInAmount = player.getStack();
+          const newBet = player.getCurrentBet() + allInAmount;
+          const betIncrease = Math.max(0, newBet - currentBetBefore);
+
+          if (
+            betIncrease > 0
+            && !this.hasBettingBeenReopenedForPlayer(playerId, currentBetBefore, playerBetBefore)
+          ) {
+            return {
+              valid: false,
+              error: 'Betting has not been reopened by a full raise'
+            };
+          }
+
+          const minimumRaise = this.getMinimumRaise();
           const betAmount = player.bet(player.getStack());
           this.pot += betAmount;
           committedChips += betAmount;
-          const newBet = player.getCurrentBet(); // Use current round bet
-          if (newBet > this.currentBet) {
-            this.lastRaiseSize = newBet - this.currentBet;
-            this.currentBet = newBet;
-            this.lastRaiserIndex = this.currentPlayerIndex;
-          }
+          this.currentBet = Math.max(currentBetBefore, player.getCurrentBet());
+          this.applyAggressiveActionState(betIncrease, minimumRaise, true);
           break;
         }
 
@@ -813,66 +924,43 @@ export class Game {
       return;
     }
 
-    // Find next active player
-    let nextIndex = (this.currentPlayerIndex + 1) % this.players.length;
-    let attempts = 0;
-    while (attempts < this.players.length) {
-      const nextPlayer = this.players[nextIndex];
-      if (nextPlayer.getIsActive() && !nextPlayer.getHasFolded() && !nextPlayer.getIsAllIn()) {
-        // Check if betting round is complete
-        if (this.isBettingRoundComplete(nextIndex)) {
-          this.advanceStage();
-          return;
-        }
-        this.currentPlayerIndex = nextIndex;
-        this.startActionTimer(); // Start timer for next player
-        return;
-      }
-      nextIndex = (nextIndex + 1) % this.players.length;
-      attempts++;
+    if (this.isBettingRoundComplete()) {
+      this.advanceStage();
+      return;
     }
 
-    // All remaining players are all-in, advance to showdown
-    this.advanceStage();
+    const nextIndex = this.findNextActionableIndex(this.currentPlayerIndex + 1);
+    if (nextIndex === -1) {
+      this.advanceStage();
+      return;
+    }
+
+    this.currentPlayerIndex = nextIndex;
+    this.startActionTimer();
   }
 
   /**
    * Gets the minimum raise amount for the current betting round
    */
   private getMinimumRaise(): number {
-    // If no one has bet yet, minimum bet is the big blind
-    if (this.currentBet === 0) {
-      return this.config.bigBlind;
-    }
-    
-    // If there's been a bet but no raise, minimum raise is the bet size
-    if (this.lastRaiseSize === 0) {
-      return this.currentBet;
-    }
-    
-    // If there's been a raise, minimum re-raise is the last raise size
-    return this.lastRaiseSize;
+    return this.lastFullRaiseSize > 0 ? this.lastFullRaiseSize : this.config.bigBlind;
   }
 
   /**
    * Checks if the current betting round is complete
    */
-  private isBettingRoundComplete(nextIndex: number): boolean {
-    // Get all players who can still act
+  private isBettingRoundComplete(): boolean {
     const activePlayers = this.players.filter(p => p.getIsActive() && !p.getHasFolded() && !p.getIsAllIn());
     
     if (activePlayers.length === 0) {
       return true; // All folded or all-in
     }
 
-    // If we have a raiser this round, we need to come back to them
-    if (this.lastRaiserIndex !== -1) {
-      return nextIndex === this.lastRaiserIndex;
-    }
-
-    // No raises this round - check if all active players have acted
     for (const player of activePlayers) {
       if (!this.playersActedThisRound.has(player.id)) {
+        return false;
+      }
+      if (player.getCurrentBet() !== this.currentBet) {
         return false;
       }
     }
@@ -887,8 +975,9 @@ export class Game {
     // Reset player bets for new round
     this.players.forEach(p => p.resetForNewRound());
     this.currentBet = 0;
-    this.lastRaiserIndex = -1;
-    this.lastRaiseSize = 0; // Reset raise size for new round
+    this.lastFullAggressorIndex = -1;
+    this.lastFullRaiseSize = this.config.bigBlind; // Reset full-raise threshold for new round
+    this.cumulativeShortAllInDelta = 0;
     this.playersActedThisRound.clear(); // Reset tracking for new round
 
     // Check if we should continue or go to showdown
@@ -913,21 +1002,6 @@ export class Game {
       return;
     }
 
-    // Find first active player starting from small blind (correct post-flop position)
-    let firstPlayerIndex = this.smallBlindIndex;
-    while (this.players[firstPlayerIndex].getHasFolded() || 
-           this.players[firstPlayerIndex].getIsAllIn() || 
-           !this.players[firstPlayerIndex].getIsActive()) {
-      firstPlayerIndex = (firstPlayerIndex + 1) % this.players.length;
-      // Safety check to prevent infinite loop
-      if (firstPlayerIndex === this.smallBlindIndex) {
-        // All players are folded/all-in/inactive - go to showdown
-        this.showdown();
-        return;
-      }
-    }
-    this.currentPlayerIndex = firstPlayerIndex;
-
     switch (this.stage) {
       case 'preflop':
         this.dealFlop();
@@ -943,12 +1017,19 @@ export class Game {
         break;
     }
 
-    // Start timer only while betting is still active.
-    if (this.isActionStage()) {
-      this.startActionTimer();
-    } else {
+    if (!this.isActionStage()) {
       this.clearActionTimerState();
+      return;
     }
+
+    // Post-flop, action starts with the first live player to the left of the button.
+    const firstPlayerIndex = this.resolveFirstPostflopActorIndex();
+    if (firstPlayerIndex === -1) {
+      this.showdown();
+      return;
+    }
+    this.currentPlayerIndex = firstPlayerIndex;
+    this.startActionTimer();
   }
 
   private dealFlop(): void {
@@ -1399,11 +1480,15 @@ export class Game {
       stage: this.stage,
       currentPlayerIndex: this.currentPlayerIndex,
       currentBet: this.currentBet,
+      dealerCursorIndex: this.dealerCursorIndex,
       dealerIndex: this.dealerIndex,
       smallBlindIndex: this.smallBlindIndex,
       bigBlindIndex: this.bigBlindIndex,
-      lastRaiserIndex: this.lastRaiserIndex,
-      lastRaiseSize: this.lastRaiseSize,
+      lastFullAggressorIndex: this.lastFullAggressorIndex,
+      lastFullRaiseSize: this.lastFullRaiseSize,
+      cumulativeShortAllInDelta: this.cumulativeShortAllInDelta,
+      lastRaiserIndex: this.lastFullAggressorIndex,
+      lastRaiseSize: this.lastFullRaiseSize,
       playersActedThisRound: Array.from(this.playersActedThisRound),
       deckCards: (this.deck as any).cards.map((c: Card) => ({ rank: c.rank, suit: c.suit })),
       actionStartTime: this.actionStartTime,
@@ -1456,11 +1541,13 @@ export class Game {
     game.stage = data.stage;
     game.currentPlayerIndex = data.currentPlayerIndex;
     game.currentBet = data.currentBet;
+    game.dealerCursorIndex = data.dealerCursorIndex ?? data.dealerIndex ?? 0;
     game.dealerIndex = data.dealerIndex;
     game.smallBlindIndex = data.smallBlindIndex;
     game.bigBlindIndex = data.bigBlindIndex;
-    game.lastRaiserIndex = data.lastRaiserIndex;
-    game.lastRaiseSize = data.lastRaiseSize;
+    game.lastFullAggressorIndex = data.lastFullAggressorIndex ?? data.lastRaiserIndex ?? -1;
+    game.lastFullRaiseSize = data.lastFullRaiseSize ?? data.lastRaiseSize ?? game.config.bigBlind;
+    game.cumulativeShortAllInDelta = data.cumulativeShortAllInDelta ?? 0;
     game.playersActedThisRound = new Set(data.playersActedThisRound || []);
     game.actionStartTime = data.actionStartTime || 0;
     game.currentActionPlayerId = data.currentActionPlayerId || null;

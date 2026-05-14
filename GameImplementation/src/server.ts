@@ -9,6 +9,7 @@ import bodyParser from 'body-parser';
 
 const PORT = parseInt(process.env.PORT || '3000');
 const FASTAPI_URL = process.env.AUTH_API_URL || 'http://localhost:8000';
+const TABLE_NOT_FOUND_SOCKET_REASON = 'table_not_found';
 
 interface ConnectedPlayer {
   socketId: string;
@@ -23,6 +24,8 @@ interface AuthenticatedUser {
   id: number;
   username: string;
   email?: string;  // Optional since WebSocket auth doesn't need it
+  isTestUser?: boolean;
+  testRunTag?: string | null;
 }
 
 interface ChatMessage {
@@ -59,8 +62,11 @@ interface AuthenticatedSocket extends Socket {
 
 interface TableReadiness {
   gameId: string;
+  tableId?: number;
   communityId?: number;
   tableName?: string;
+  isTestOnly?: boolean;
+  testRunTag?: string | null;
   seatedPlayers: Set<string>; // userIds of players seated via FastAPI
   connectedPlayers: Set<string>; // userIds of players connected via WebSocket
   playerIds: Map<string, string>; // userId -> playerId mapping
@@ -90,6 +96,9 @@ export class PokerServer {
   private readonly RECONNECT_TIMEOUT = 30000; // 30 seconds to reconnect
   private readonly HAND_RESULT_DELAY = 7000; // 7 seconds to show showdown results
   private staleTableSweepTimer?: NodeJS.Timeout;
+  private shuttingDown = false;
+  private closePromise?: Promise<void>;
+  private pendingDisconnects: Set<Promise<void>> = new Set();
   private server: any; // HTTP server instance
   private app: express.Application; // Express app
 
@@ -154,6 +163,76 @@ export class PokerServer {
     this.staleTableSweepTimer.unref?.();
   }
 
+  private trackPendingDisconnect(work: Promise<void>): void {
+    this.pendingDisconnects.add(work);
+    work.finally(() => {
+      this.pendingDisconnects.delete(work);
+    });
+  }
+
+  private async waitForPendingDisconnects(): Promise<void> {
+    if (this.pendingDisconnects.size === 0) {
+      return;
+    }
+    await Promise.allSettled(Array.from(this.pendingDisconnects));
+  }
+
+  private clearSpectatorSocketState(socketId: string, userId?: number): void {
+    this.removeSpectatorSocket(socketId);
+    this.connectedPlayers.delete(socketId);
+    this.disconnectedPlayers.delete(socketId);
+    this.clearDisconnectCleanupTimer(socketId);
+    if (userId !== undefined && this.userIdToSocketId.get(userId) === socketId) {
+      this.userIdToSocketId.delete(userId);
+    }
+  }
+
+  private cleanupSocketStateForShutdown(socketId: string, userId: number): void {
+    this.clearSpectatorSocketState(socketId, userId);
+    this.lobby = this.lobby.filter((queuedSocketId) => queuedSocketId !== socketId);
+    for (const [, tableState] of this.tableReadiness.entries()) {
+      tableState.connectedPlayers.delete(userId.toString());
+    }
+  }
+
+  public async close(): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+
+    this.closePromise = (async () => {
+      this.shuttingDown = true;
+      this.clearAllActionTimers();
+      this.clearAllDisconnectCleanupTimers();
+      if (this.staleTableSweepTimer) {
+        clearInterval(this.staleTableSweepTimer);
+        this.staleTableSweepTimer = undefined;
+      }
+
+      this.io.local.disconnectSockets(true);
+
+      await new Promise<void>((resolve) => {
+        this.io.close(() => resolve());
+      });
+
+      await this.waitForPendingDisconnects();
+
+      if (this.server?.listening) {
+        await new Promise<void>((resolve, reject) => {
+          this.server.close((error?: Error) => {
+            if (error && error.message !== 'Server is not running.') {
+              reject(error);
+              return;
+            }
+            resolve();
+          });
+        });
+      }
+    })();
+
+    return this.closePromise;
+  }
+
   /**
    * Verify JWT token with FastAPI before allowing socket connection
    */
@@ -175,8 +254,10 @@ export class PokerServer {
             ) as JwtPayload;
 
             socket.data.user = {
-              id: Number(decoded.id),
-              username: decoded.username || 'test-user'
+              id: Number(decoded.user_id ?? decoded.id),
+              username: decoded.username || 'test-user',
+              isTestUser: Boolean(decoded.is_test_user),
+              testRunTag: typeof decoded.test_run_tag === 'string' ? decoded.test_run_tag : null,
             };
             return next();
           } catch (err) {
@@ -193,7 +274,9 @@ export class PokerServer {
           // Attach user data to socket
           socket.data.user = {
             id: response.data.user_id,
-            username: response.data.username
+            username: response.data.username,
+            isTestUser: Boolean(response.data.is_test_user),
+            testRunTag: typeof response.data.test_run_tag === 'string' ? response.data.test_run_tag : null,
           };
           console.log(`🔐 Authenticated: ${response.data.username} (ID: ${response.data.user_id})`);
           next();
@@ -289,6 +372,76 @@ export class PokerServer {
     }
 
     return undefined;
+  }
+
+  private extractTableIdFromGameId(gameId: string): number | undefined {
+    const match = gameId.match(/^table_(\d+)$/);
+    if (!match) {
+      return undefined;
+    }
+    const tableId = Number(match[1]);
+    return Number.isFinite(tableId) && tableId > 0 ? tableId : undefined;
+  }
+
+  private canUserAccessTable(user: AuthenticatedUser, tableState: TableReadiness): boolean {
+    const isTestOnly = Boolean(tableState.isTestOnly);
+    if (!isTestOnly) {
+      return !user.isTestUser;
+    }
+    return Boolean(user.isTestUser) && Boolean(user.testRunTag) && user.testRunTag === tableState.testRunTag;
+  }
+
+  private emitTableNotFound(socketId: string): void {
+    this.io.to(socketId).emit('error', {
+      message: TABLE_NOT_FOUND_SOCKET_REASON,
+      code: TABLE_NOT_FOUND_SOCKET_REASON,
+    });
+  }
+
+  private async ensureTablePartitionMetadata(gameId: string, tableState?: TableReadiness): Promise<TableReadiness | undefined> {
+    const existing = tableState || this.tableReadiness.get(gameId);
+    const tableId = existing?.tableId || this.extractTableIdFromGameId(gameId);
+    if (!tableId) {
+      return existing;
+    }
+
+    if (existing?.tableId && existing.isTestOnly !== undefined) {
+      return existing;
+    }
+
+    if (process.env.NODE_ENV === 'test') {
+      if (existing && !existing.tableId) {
+        existing.tableId = tableId;
+      }
+      return existing;
+    }
+
+    try {
+      const response = await axios.get(`${FASTAPI_URL}/api/internal/tables/${tableId}`);
+      const metadata = response.data || {};
+      const readiness = existing || {
+        gameId,
+        tableId,
+        communityId: undefined,
+        tableName: undefined,
+        isTestOnly: false,
+        testRunTag: null,
+        seatedPlayers: new Set<string>(),
+        connectedPlayers: new Set<string>(),
+        playerIds: new Map<string, string>(),
+        gameStarted: false,
+      };
+      readiness.tableId = tableId;
+      readiness.communityId = Number(metadata.community_id) || readiness.communityId;
+      readiness.tableName = typeof metadata.name === 'string' ? metadata.name : readiness.tableName;
+      readiness.isTestOnly = Boolean(metadata.is_test_only);
+      readiness.testRunTag = typeof metadata.test_run_tag === 'string' ? metadata.test_run_tag : null;
+      this.tableReadiness.set(gameId, readiness);
+      return readiness;
+    } catch (error: any) {
+      console.warn(`⚠️  Failed to fetch table partition metadata for ${gameId}:`, error.response?.data || error.message);
+      return existing;
+    }
   }
 
   /**
@@ -556,6 +709,81 @@ export class PokerServer {
     return undefined;
   }
 
+  private async tryRecoverRequestedTableFromRedis(
+    user: AuthenticatedUser,
+    socketId: string,
+    gameId: string,
+  ): Promise<boolean> {
+    const gameData = await GameStateStorage.loadGameState(gameId);
+    if (!gameData) {
+      return false;
+    }
+
+    const game = Game.fromJSON(gameData);
+    const players = game.getPlayers();
+    const requestedPlayer = players.find((player) => this.extractUserIdFromPlayerId(player.id) === user.id);
+    if (!requestedPlayer) {
+      return false;
+    }
+
+    let tableState = this.tableReadiness.get(gameId);
+    if (!tableState) {
+      tableState = {
+        gameId,
+        tableId: this.extractTableIdFromGameId(gameId),
+        seatedPlayers: new Set(),
+        connectedPlayers: new Set(),
+        playerIds: new Map(),
+        gameStarted: false,
+      };
+      this.tableReadiness.set(gameId, tableState);
+    }
+    tableState = await this.ensureTablePartitionMetadata(gameId, tableState);
+    if (!tableState) {
+      return false;
+    }
+    if (tableState && !this.canUserAccessTable(user, tableState)) {
+      this.emitTableNotFound(socketId);
+      return false;
+    }
+
+    if (!tableState.playerIds) {
+      tableState.playerIds = new Map();
+    }
+
+    for (const player of players) {
+      const mappedUserId = this.extractUserIdFromPlayerId(player.id);
+      if (mappedUserId !== null) {
+        tableState.seatedPlayers.add(mappedUserId.toString());
+        tableState.playerIds.set(mappedUserId.toString(), player.id);
+        this.playerGameMap.set(player.id, gameId);
+      }
+    }
+
+    tableState.connectedPlayers.add(user.id.toString());
+
+    const socket = this.io.sockets.sockets.get(socketId);
+    if (socket) {
+      socket.join(gameId);
+      console.log(`♻️  Recovered requested table ${gameId} for ${user.username}`);
+    }
+
+    const existing = this.connectedPlayers.get(socketId);
+    this.connectedPlayers.set(socketId, {
+      ...existing,
+      socketId,
+      playerId: requestedPlayer.id,
+      playerName: user.username,
+      userId: user.id,
+      communityId: tableState.communityId,
+      gameId,
+    });
+
+    this.emitPlayerState(socketId, gameId, requestedPlayer.id, game);
+    await this.checkAndStartGame(gameId);
+    return true;
+  }
+
   private async handlePlayerWebSocketConnectionForGame(
     user: AuthenticatedUser,
     socketId: string,
@@ -570,6 +798,10 @@ export class PokerServer {
         continue;
       }
       if (tableState.seatedPlayers.has(userIdStr)) {
+        const hydratedTableState = await this.ensureTablePartitionMetadata(gameId, tableState);
+        if (hydratedTableState && !this.canUserAccessTable(user, hydratedTableState)) {
+          continue;
+        }
         matchedRequestedGame = true;
         if (!tableState.playerIds) {
           tableState.playerIds = new Map();
@@ -649,11 +881,13 @@ export class PokerServer {
     }
 
     if (requestedGameId && !matchedRequestedGame) {
+      const recovered = await this.tryRecoverRequestedTableFromRedis(user, socketId, requestedGameId);
+      if (recovered) {
+        return;
+      }
       const socket = this.io.sockets.sockets.get(socketId);
       if (socket) {
-        this.io.to(socket.id).emit('error', {
-          message: 'No active seat found for requested table. Join a seat first.',
-        });
+        this.emitTableNotFound(socket.id);
       }
     }
   }
@@ -818,9 +1052,10 @@ export class PokerServer {
     console.log(`✅ ${user.username} reconnected to game ${gameId}`);
 
     this.recentlyReconnected.add(updatedPlayerInfo.playerId);
-    setTimeout(() => {
+    const recentlyReconnectedTimer = setTimeout(() => {
       this.recentlyReconnected.delete(updatedPlayerInfo.playerId);
     }, 5000);
+    recentlyReconnectedTimer.unref?.();
   }
 
   /**
@@ -1000,7 +1235,10 @@ export class PokerServer {
 
       socket.on('disconnect', (reason) => {
         console.log(`❌ Player disconnected: ${user.username} (${socket.id}) reason=${reason}`);
-        this.handleDisconnect(socket, reason);
+        const disconnectWork = this.handleDisconnect(socket, reason).catch((error) => {
+          console.error(`❌ Failed to handle disconnect for ${user.username}:`, error);
+        });
+        this.trackPendingDisconnect(disconnectWork);
       });
     });
   }
@@ -1284,7 +1522,9 @@ export class PokerServer {
         community_id: communityId,
         table_id: tableId,
         table_name: tableName,
-        hand_data: handData
+        hand_data: handData,
+        is_test_only: Boolean(tableState.isTestOnly),
+        test_run_tag: tableState.testRunTag ?? null,
       }, {
         timeout: 5000 // 5 second timeout
       });
@@ -1375,6 +1615,11 @@ export class PokerServer {
     const gameId = `table_${Math.floor(numericTableId)}`;
     const userId = socket.data.user.id;
     const userIdStr = userId.toString();
+    const partitionState = await this.ensureTablePartitionMetadata(gameId);
+    if (partitionState && !this.canUserAccessTable(socket.data.user, partitionState)) {
+      this.emitTableNotFound(socket.id);
+      return;
+    }
 
     this.removeSpectatorSocket(socket.id);
     this.spectatorReadOnlySockets.add(socket.id);
@@ -1721,7 +1966,7 @@ export class PokerServer {
     await this.processGamePayouts(gameId, game);
     this.clearActionTimer(gameId);
 
-    setTimeout(async () => {
+    const handCompleteTimer = setTimeout(async () => {
       const latestData = await GameStateStorage.loadGameState(gameId);
       if (!latestData) {
         return;
@@ -1765,6 +2010,7 @@ export class PokerServer {
 
       await this.broadcastGameState(gameId);
     }, this.HAND_RESULT_DELAY);
+    handCompleteTimer.unref?.();
   }
 
   private async broadcastGameState(gameId: string): Promise<void> {
@@ -1828,6 +2074,7 @@ export class PokerServer {
     const timerId = setTimeout(async () => {
       await this.handleActionTimeout(gameId);
     }, safeTimeoutMs);
+    timerId.unref?.();
 
     this.actionTimers.set(gameId, timerId);
   }
@@ -2047,13 +2294,12 @@ export class PokerServer {
     const user = socket.data.user;
 
     if (this.spectatorReadOnlySockets.has(socketId)) {
-      this.removeSpectatorSocket(socketId);
-      this.connectedPlayers.delete(socketId);
-      this.disconnectedPlayers.delete(socketId);
-      this.clearDisconnectCleanupTimer(socketId);
-      if (this.userIdToSocketId.get(user.id) === socketId) {
-        this.userIdToSocketId.delete(user.id);
-      }
+      this.clearSpectatorSocketState(socketId, user.id);
+      return;
+    }
+
+    if (this.shuttingDown) {
+      this.cleanupSocketStateForShutdown(socketId, user.id);
       return;
     }
 
@@ -2289,11 +2535,55 @@ export class PokerServer {
       }
     });
 
+    this.app.post('/_internal/game/:gameId/purge', async (req: Request, res: Response) => {
+      try {
+        const { gameId } = req.params;
+        const expectedTableId = Number(req.body?.expected_table_id);
+        const expectedTestRunTag = typeof req.body?.expected_test_run_tag === 'string'
+          ? req.body.expected_test_run_tag
+          : undefined;
+
+        if (!Number.isFinite(expectedTableId) || expectedTableId <= 0 || !expectedTestRunTag) {
+          return res.status(400).json({ error: 'expected_table_id and expected_test_run_tag are required' });
+        }
+
+        const normalizedExpectedGameId = `table_${Math.floor(expectedTableId)}`;
+        if (gameId !== normalizedExpectedGameId) {
+          return res.status(409).json({ error: 'game_id/table_id mismatch' });
+        }
+
+        const tableState = await this.ensureTablePartitionMetadata(gameId);
+        if (!tableState) {
+          return res.status(404).json({ error: 'table_not_found' });
+        }
+        if (!tableState.isTestOnly) {
+          return res.status(409).json({ error: 'refusing to purge normal table' });
+        }
+        if (tableState.testRunTag !== expectedTestRunTag) {
+          return res.status(409).json({ error: 'test_run_tag mismatch' });
+        }
+
+        await this.purgeLocalTableRuntime(gameId);
+        return res.json({
+          success: true,
+          gameId,
+          tableId: expectedTableId,
+          purged: true,
+        });
+      } catch (error: any) {
+        console.error('❌ Error purging game runtime:', error);
+        return res.status(500).json({
+          error: 'Internal server error',
+          message: error.message,
+        });
+      }
+    });
+
     // Seat player endpoint (for buy-in orchestration)
     // Called by poker-api when a user joins a table
     this.app.post('/_internal/seat-player', async (req: Request, res: Response) => {
       try {
-  const { table_id, user_id, username, stack, seat_number, community_id, table_name } = req.body;
+  const { table_id, user_id, username, stack, seat_number, community_id, table_name, is_test_only, test_run_tag } = req.body;
 
         // Validate request
         if (!table_id || !user_id || !username || !stack || !seat_number) {
@@ -2310,10 +2600,18 @@ export class PokerServer {
         // Fetch table configuration including action_timeout_seconds and max_seats
         let actionTimeoutSeconds: number | undefined;
         let maxSeats = 8;
+        let resolvedCommunityId = community_id;
+        let resolvedTableName = table_name;
+        let resolvedIsTestOnly = Boolean(is_test_only);
+        let resolvedTestRunTag = typeof test_run_tag === 'string' ? test_run_tag : null;
         try {
           const tableResponse = await axios.get(`${FASTAPI_URL}/api/internal/tables/${table_id}`);
           actionTimeoutSeconds = tableResponse.data.action_timeout_seconds;
           maxSeats = Number(tableResponse.data.max_seats) || 8;
+          resolvedCommunityId = Number(tableResponse.data.community_id) || resolvedCommunityId;
+          resolvedTableName = tableResponse.data.name || resolvedTableName;
+          resolvedIsTestOnly = Boolean(tableResponse.data.is_test_only);
+          resolvedTestRunTag = typeof tableResponse.data.test_run_tag === 'string' ? tableResponse.data.test_run_tag : null;
           console.log(`⏱️  Table ${table_id} action timeout: ${actionTimeoutSeconds} seconds`);
         } catch (error: any) {
           console.warn(`⚠️  Failed to fetch table config for ${table_id}:`, error.response?.data || error.message);
@@ -2344,8 +2642,11 @@ export class PokerServer {
         if (!this.tableReadiness.has(gameId)) {
           this.tableReadiness.set(gameId, {
             gameId,
-            communityId: community_id,
-            tableName: table_name,
+            tableId: Number(table_id),
+            communityId: resolvedCommunityId,
+            tableName: resolvedTableName,
+            isTestOnly: resolvedIsTestOnly,
+            testRunTag: resolvedTestRunTag,
             seatedPlayers: new Set(),
             connectedPlayers: new Set(),
             playerIds: new Map(),
@@ -2353,15 +2654,18 @@ export class PokerServer {
           });
         }
         const tableState = this.tableReadiness.get(gameId)!;
+        tableState.tableId = Number(table_id);
         if (!tableState.playerIds) {
           tableState.playerIds = new Map();
         }
-        if (community_id && tableState.communityId !== community_id) {
-          tableState.communityId = community_id;
+        if (resolvedCommunityId && tableState.communityId !== resolvedCommunityId) {
+          tableState.communityId = resolvedCommunityId;
         }
-        if (table_name && tableState.tableName !== table_name) {
-          tableState.tableName = table_name;
+        if (resolvedTableName && tableState.tableName !== resolvedTableName) {
+          tableState.tableName = resolvedTableName;
         }
+        tableState.isTestOnly = resolvedIsTestOnly;
+        tableState.testRunTag = resolvedTestRunTag;
 
         // Check if player already seated
         const existingPlayer = game.getPlayers().find((p) => {

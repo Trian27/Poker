@@ -3,7 +3,7 @@
  * Tests game state storage and retrieval
  */
 
-import { GameStateStorage, redis } from '../redis';
+import { GameStateStorage, closeRedis, redis } from '../redis';
 import { Game, GameConfig } from '../engine/Game';
 import { Player } from '../engine/Player';
 
@@ -17,7 +17,7 @@ describe('Redis Integration', () => {
 
   afterAll(async () => {
     // Close Redis connection
-    await redis.quit();
+    await closeRedis();
   });
 
   describe('GameStateStorage', () => {
@@ -174,6 +174,48 @@ describe('Redis Integration', () => {
       expect(loadedPlayers).toHaveLength(originalPlayers.length);
       expect(loadedPlayers[0].getStack()).toBe(originalPlayers[0].getStack());
       expect(loadedPlayers[1].getStack()).toBe(originalPlayers[1].getStack());
+      expect(loadedGame.getGameState().dealerIndex).toBe(game.getGameState().dealerIndex);
+      expect(loadedGame.getGameState().smallBlindIndex).toBe(game.getGameState().smallBlindIndex);
+      expect(loadedGame.getGameState().bigBlindIndex).toBe(game.getGameState().bigBlindIndex);
+      expect(loadedGame.getGameState().currentPlayerIndex).toBe(game.getGameState().currentPlayerIndex);
+      expect(loadedData.dealerCursorIndex).toBeDefined();
+    });
+
+    it('should preserve dealer cursor behavior through serialization with waiting seats', async () => {
+      const config: GameConfig = {
+        smallBlind: 10,
+        bigBlind: 20,
+        initialStack: 1000
+      };
+
+      const game = new Game(config);
+      const player1 = new Player('p1', 'Alice', 1000, 1);
+      const player2 = new Player('p2', 'Bob', 1000, 3);
+      const waitingPlayer = new Player('p3', 'Charlie', 1000, 5);
+
+      game.addPlayer(player1);
+      game.addPlayer(player2);
+      game.startHand();
+      game.addPlayer(waitingPlayer);
+
+      const handOneState = game.getGameState();
+      game.handleAction(handOneState.players[handOneState.currentPlayerIndex].id, 'fold');
+
+      await GameStateStorage.saveGameState(testGameId, game.toJSON());
+
+      const loadedData = await GameStateStorage.loadGameState(testGameId);
+      const loadedGame = Game.fromJSON(loadedData);
+
+      game.startHand();
+      loadedGame.startHand();
+
+      const originalState = game.getGameState();
+      const restoredState = loadedGame.getGameState();
+      expect(restoredState.dealerIndex).toBe(originalState.dealerIndex);
+      expect(restoredState.smallBlindIndex).toBe(originalState.smallBlindIndex);
+      expect(restoredState.bigBlindIndex).toBe(originalState.bigBlindIndex);
+      expect(restoredState.currentPlayerIndex).toBe(originalState.currentPlayerIndex);
+      expect(restoredState.players.find((player) => player.id === 'p3')?.waitingForBigBlind).toBe(true);
     });
   });
 });

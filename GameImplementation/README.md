@@ -12,6 +12,7 @@ A real-time poker platform with microservice architecture, featuring tournament 
 - All actions supported (fold, check, call, bet, raise, all-in)
 - Automatic game progression and winner determination
 - Wikipedia-compliant rules (heads-up, antes, burn cards)
+- Correct heads-up action order: small blind/button first preflop, big blind first postflop
 
 ### Tournament System
 - Automatic blind structure generation using exponential growth formula

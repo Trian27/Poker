@@ -1,0 +1,115 @@
+name: Gameplay Tests
+
+on:
+  pull_request:
+    paths:
+      - 'GameImplementation/**'
+      - 'poker-api/**'
+      - 'poker-ui/**'
+      - 'scripts/test-gameplay.sh'
+      - '.github/workflows/gameplay-tests.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'
+
+jobs:
+  gameimplementation:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    defaults:
+      run:
+        working-directory: GameImplementation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: GameImplementation/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm test -- --runInBand
+      - run: npm run test:gameplay
+
+  poker-api-gameplay:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: poker-api
+    env:
+      TEST_DATABASE_BASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      ENV_MODE: dev
+      GAME_SERVER_URL: http://game-server:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -m gameplay tests/gameplay/test_tables_gameplay.py -q
+
+  poker-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: poker-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: poker-ui/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:e2e:gameplay
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poker-ui-playwright-results
+          path: |
+            poker-ui/test-results
+            poker-ui/playwright-report
+          if-no-files-found: ignore
+
+  gameimplementation-chaos:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    defaults:
+      run:
+        working-directory: GameImplementation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: GameImplementation/package-lock.json
+      - run: npm ci
+      - run: npm run test:chaos

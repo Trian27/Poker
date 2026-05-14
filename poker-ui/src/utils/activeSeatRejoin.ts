@@ -34,16 +34,21 @@ export const clearAutoRejoinSuppression = (): void => {
   window.sessionStorage.removeItem(AUTO_REJOIN_SUPPRESS_UNTIL_KEY);
 };
 
-export const shouldRunReloadAutoRejoinCheck = (): boolean => {
+export const shouldRunReloadAutoRejoinCheck = (isReload: boolean): boolean => {
   if (typeof window === 'undefined') {
     return false;
   }
-  const alreadyChecked = window.sessionStorage.getItem(RELOAD_REJOIN_CHECKED_KEY) === '1';
-  if (alreadyChecked) {
+  if (!isReload) {
     return false;
   }
+  return window.sessionStorage.getItem(RELOAD_REJOIN_CHECKED_KEY) !== '1';
+};
+
+export const markReloadAutoRejoinCheckComplete = (): void => {
+  if (typeof window === 'undefined') {
+    return;
+  }
   window.sessionStorage.setItem(RELOAD_REJOIN_CHECKED_KEY, '1');
-  return true;
 };
 
 export const resetReloadAutoRejoinCheck = (): void => {

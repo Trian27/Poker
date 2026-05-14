@@ -48,6 +48,7 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """Schema for creating a new user"""
     password: str = Field(..., min_length=8, max_length=100)
+    model_config = ConfigDict(extra="forbid")
 
 
 class UserResponse(UserBase):
@@ -56,6 +57,7 @@ class UserResponse(UserBase):
     created_at: datetime
     is_active: bool
     is_banned: bool = False
+    is_test_user: bool = False
     gold_coins: int = 0
     
     model_config = ConfigDict(from_attributes=True)
@@ -111,7 +113,7 @@ class LeagueBase(BaseModel):
 
 class LeagueCreate(LeagueBase):
     """Schema for creating a new league"""
-    pass
+    model_config = ConfigDict(extra="forbid")
 
 
 class LeagueResponse(LeagueBase):
@@ -140,6 +142,7 @@ class CommunityBase(BaseModel):
 class CommunityCreate(CommunityBase):
     """Schema for creating a new community"""
     league_id: int
+    model_config = ConfigDict(extra="forbid")
 
 
 class CommunityResponse(CommunityBase):
@@ -242,6 +245,7 @@ class TableCreate(TableBase):
     max_queue_size: int = Field(default=10, ge=0, le=50, description="Maximum queue size (0 = no queue)")
     action_timeout_seconds: int = Field(default=30, ge=10, le=120, description="Timeout for player actions in seconds")
     agents_allowed: bool = Field(default=True, description="Whether autonomous agents (bots) can join this table")
+    model_config = ConfigDict(extra="forbid")
 
 
 class TableResponse(TableBase):
@@ -282,6 +286,8 @@ class SeatPlayerRequest(BaseModel):
     seat_number: int
     community_id: Optional[int] = None
     table_name: Optional[str] = None
+    is_test_only: bool = False
+    test_run_tag: Optional[str] = None
 
 
 # ============================================================================
@@ -312,6 +318,8 @@ class TokenVerifyResponse(BaseModel):
     valid: bool
     user_id: Optional[int] = None
     username: Optional[str] = None
+    is_test_user: Optional[bool] = None
+    test_run_tag: Optional[str] = None
     message: Optional[str] = None
 
 
@@ -325,6 +333,8 @@ class HandHistoryCreate(BaseModel):
     table_id: Optional[int] = None
     table_name: str
     hand_data: dict  # JSONB data containing full hand details
+    is_test_only: bool = False
+    test_run_tag: Optional[str] = None
 
 
 class HandHistoryResponse(BaseModel):
@@ -567,6 +577,47 @@ class ProfileUpdateRequest(BaseModel):
     new_username: Optional[str] = Field(None, min_length=3, max_length=50)
     new_email: Optional[EmailStr] = None
     new_password: Optional[str] = Field(None, min_length=8, max_length=100)
+    model_config = ConfigDict(extra="forbid")
+
+
+class TestFixtureGameplayStackCreate(BaseModel):
+    run_tag: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]{1,128}$")
+    player_count: int = Field(..., ge=2)
+    queued_player_count: int = Field(default=0, ge=0)
+    starting_balance: Decimal = Field(..., ge=0)
+    buy_in: int = Field(..., ge=0)
+    small_blind: int = Field(..., gt=0)
+    big_blind: int = Field(..., gt=0)
+    max_seats: int = Field(..., ge=2, le=8)
+    max_queue_size: int = Field(default=10, ge=0, le=50)
+    action_timeout_seconds: int = Field(default=30, ge=10, le=120)
+    model_config = ConfigDict(extra="forbid")
+
+
+class TestFixtureUserCredential(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    password: str
+    is_test_user: bool = True
+    seat_number: Optional[int] = None
+    queue_position: Optional[int] = None
+
+
+class TestFixtureGameplayStackResponse(BaseModel):
+    run_tag: str
+    league_id: int
+    community_id: int
+    table_id: int
+    table_name: str
+    game_id: str
+    users: list[TestFixtureUserCredential]
+
+
+class TestFixtureCleanupResponse(BaseModel):
+    run_tag: str
+    status: str
+    deleted: dict[str, int]
 
 
 class ProfileUpdateInitResponse(BaseModel):
