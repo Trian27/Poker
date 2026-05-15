@@ -11,11 +11,14 @@ import {
   findCommonPersistedHand,
   FixtureConflictError,
   generateRunTag,
+  getTableSeats,
   getEnabledActions,
   locatorByDataValue,
   loginApi,
   loginViaUi,
+  readVisibleBannerText,
   seedReturningVisitor,
+  summarizeSeatAssignments,
   validateRunTag,
   waitForActionStateChange,
   waitForSeatAssignment,
@@ -62,12 +65,45 @@ async function clickHighestPriorityAction(page: Page): Promise<'check' | 'call' 
 async function describeActionablePage(page: Page, name: string) {
   const actions = await getEnabledActions(page);
   const street = await page.getByTestId('street-label').textContent().catch(() => null);
+  const errorBanner = await readVisibleBannerText(page, '.error-banner').catch(() => null);
+  const bustedBanner = await readVisibleBannerText(page, '.busted-banner').catch(() => null);
   return {
     name,
     url: page.url(),
     street,
     actions,
+    errorBanner,
+    bustedBanner,
   };
+}
+
+async function assertGameplayStillHealthy(
+  fixture: GameplayFixture,
+  pageA: Page,
+  pageB: Page,
+  userAApi: AuthenticatedApiUser,
+  userBApi: AuthenticatedApiUser,
+) {
+  const expectedGameUrl = `/game/${fixture.table_id}?communityId=${fixture.community_id}`;
+  const pageDiagnostics = await Promise.all([
+    describeActionablePage(pageA, fixture.users[0].username),
+    describeActionablePage(pageB, fixture.users[1].username),
+  ]);
+
+  for (const diagnostic of pageDiagnostics) {
+    if (!diagnostic.url.includes(expectedGameUrl)) {
+      throw new Error(`Gameplay state lost: ${diagnostic.name} left the game route: ${JSON.stringify(pageDiagnostics)}`);
+    }
+    if (diagnostic.bustedBanner || (diagnostic.errorBanner && /timed out|removed from the table/i.test(diagnostic.errorBanner))) {
+      throw new Error(`Gameplay state unhealthy: ${JSON.stringify(pageDiagnostics)}`);
+    }
+  }
+
+  const seats = await getTableSeats(userAApi.request, fixture.table_id);
+  const seatSummary = summarizeSeatAssignments(seats);
+  if (seatSummary[1] !== userAApi.userId || seatSummary[2] !== userBApi.userId) {
+    throw new Error(`Seat assignments changed during gameplay: ${JSON.stringify({ seatSummary, pageDiagnostics })}`);
+  }
 }
 
 async function joinSeat(
@@ -233,7 +269,9 @@ test.describe('Gameplay full-stack flow', () => {
       await expect(locatorByDataValue(pageB, 'seat-player-name', 'data-seat-number', 1)).toHaveText(fixture.users[0].username);
       await expect(locatorByDataValue(pageB, 'seat-player-name', 'data-seat-number', 2)).toHaveText(fixture.users[1].username);
 
-      const gameplayDeadline = Date.now() + 90_000;
+      const gameplayDeadline = Date.now() + 150_000;
+      let lastProgressAt = Date.now();
+      let lastHealthCheckAt = 0;
       let persistedHand = await findCommonPersistedHand(userAApi, userBApi, fixture);
 
       while (!persistedHand && Date.now() < gameplayDeadline) {
@@ -258,11 +296,24 @@ test.describe('Gameplay full-stack flow', () => {
           const activePage = actionablePages[0];
           await clickHighestPriorityAction(activePage.page);
           await waitForActionStateChange(activePage.page, activePage.actions);
+          lastProgressAt = Date.now();
         } else {
           await pageA.waitForTimeout(300);
         }
 
+        if (Date.now() - lastProgressAt > 20_000) {
+          throw new Error('Gameplay coordinator made no progress for 20 seconds');
+        }
+
+        if (Date.now() - lastHealthCheckAt > 5_000) {
+          await assertGameplayStillHealthy(fixture, pageA, pageB, userAApi, userBApi);
+          lastHealthCheckAt = Date.now();
+        }
+
         persistedHand = await findCommonPersistedHand(userAApi, userBApi, fixture);
+        if (persistedHand) {
+          lastProgressAt = Date.now();
+        }
       }
 
       expect(persistedHand, 'Expected a persisted common hand before timeout').not.toBeNull();

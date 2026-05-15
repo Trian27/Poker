@@ -284,7 +284,7 @@ export const createFixture = async (
       big_blind: 20,
       max_seats: 2,
       max_queue_size: 0,
-      action_timeout_seconds: 30,
+      action_timeout_seconds: 60,
     },
   });
 
@@ -428,28 +428,40 @@ export const locatorByDataValue = (page: Page, testId: string, attributeName: st
 };
 
 export const getEnabledActions = async (page: Page): Promise<Array<'check' | 'call' | 'fold'>> => {
-  const actionPanel = page.getByTestId('action-panel');
-  if (await actionPanel.count() === 0 || !(await actionPanel.first().isVisible())) {
-    return [];
-  }
+  return page.evaluate(() => {
+    const isVisible = (element: Element | null): element is HTMLElement => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+      const style = window.getComputedStyle(element);
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && element.getClientRects().length > 0;
+    };
 
-  const states: Array<{ name: 'check' | 'call' | 'fold'; testId: string }> = [
-    { name: 'check', testId: 'action-check-button' },
-    { name: 'call', testId: 'action-call-button' },
-    { name: 'fold', testId: 'action-fold-button' },
-  ];
-
-  const enabled: Array<'check' | 'call' | 'fold'> = [];
-  for (const state of states) {
-    const locator = page.getByTestId(state.testId);
-    if (await locator.count() === 0) {
-      continue;
+    const actionPanel = document.querySelector('[data-testid="action-panel"]');
+    if (!isVisible(actionPanel)) {
+      return [] as Array<'check' | 'call' | 'fold'>;
     }
-    if ((await locator.isVisible()) && (await locator.isEnabled())) {
+
+    const states: Array<{ name: 'check' | 'call' | 'fold'; testId: string }> = [
+      { name: 'check', testId: 'action-check-button' },
+      { name: 'call', testId: 'action-call-button' },
+      { name: 'fold', testId: 'action-fold-button' },
+    ];
+
+    const enabled: Array<'check' | 'call' | 'fold'> = [];
+    for (const state of states) {
+      const button = document.querySelector(`[data-testid="${state.testId}"]`);
+      if (!(button instanceof HTMLButtonElement) || !isVisible(button) || button.disabled) {
+        continue;
+      }
       enabled.push(state.name);
     }
-  }
-  return enabled;
+
+    return enabled;
+  });
 };
 
 export const clickHighestPriorityAction = async (page: Page): Promise<'check' | 'call' | 'fold'> => {
@@ -480,6 +492,30 @@ export const waitForActionStateChange = async (page: Page, previousActions: Arra
     }
     await page.waitForTimeout(150);
   }
+};
+
+export const summarizeSeatAssignments = (seats: Array<Record<string, unknown>>): Record<number, number | null> => {
+  return Object.fromEntries(
+    seats.map((seat) => [
+      Number(seat.seat_number),
+      seat.user_id === null || seat.user_id === undefined ? null : Number(seat.user_id),
+    ]),
+  );
+};
+
+export const readVisibleBannerText = async (page: Page, selector: string): Promise<string | null> => {
+  return page.evaluate((targetSelector) => {
+    const element = document.querySelector(targetSelector);
+    if (!(element instanceof HTMLElement)) {
+      return null;
+    }
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || element.getClientRects().length === 0) {
+      return null;
+    }
+    const text = element.textContent?.trim() ?? '';
+    return text || null;
+  }, selector);
 };
 
 export const disposeApiUsers = async (...users: Array<AuthenticatedApiUser | null | undefined>): Promise<void> => {
