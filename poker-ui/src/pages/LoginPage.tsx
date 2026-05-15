@@ -409,6 +409,7 @@ export const LoginPage: React.FC = () => {
             <input
               id="username"
               type="text"
+              data-testid="login-username-input"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               required
@@ -422,6 +423,7 @@ export const LoginPage: React.FC = () => {
             <input
               id="password"
               type="password"
+              data-testid="login-password-input"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
@@ -444,7 +446,7 @@ export const LoginPage: React.FC = () => {
 
           {error && <div className="error-message">{error}</div>}
 
-          <button type="submit" disabled={loading} className="btn-primary">
+          <button type="submit" disabled={loading} className="btn-primary" data-testid="login-submit-button">
             {loading ? 'Logging in...' : 'Login'}
           </button>
         </form>

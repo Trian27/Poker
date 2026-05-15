@@ -584,6 +584,7 @@ class TestFixtureGameplayStackCreate(BaseModel):
     run_tag: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._:-]{1,128}$")
     player_count: int = Field(..., ge=2)
     queued_player_count: int = Field(default=0, ge=0)
+    auto_seat_players: bool = True
     starting_balance: Decimal = Field(..., ge=0)
     buy_in: int = Field(..., ge=0)
     small_blind: int = Field(..., gt=0)
@@ -606,8 +607,11 @@ class TestFixtureUserCredential(BaseModel):
 
 class TestFixtureGameplayStackResponse(BaseModel):
     run_tag: str
+    auto_seat_players: bool
     league_id: int
+    league_name: str
     community_id: int
+    community_name: str
     table_id: int
     table_name: str
     game_id: str

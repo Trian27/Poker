@@ -524,6 +524,9 @@ def test_fixture_api_provisions_and_cleans_up_same_run_stack(client, db_session,
         assert create_response.status_code == 201, create_response.text
         payload = create_response.json()
         assert payload["run_tag"] == "fixture-run-1"
+        assert payload["auto_seat_players"] is True
+        assert payload["league_name"] == "E2E League fixture-run-1"
+        assert payload["community_name"] == "E2E Community fixture-run-1"
         assert len(payload["users"]) == 2
         assert all(user["is_test_user"] is True for user in payload["users"])
 
@@ -579,5 +582,72 @@ def test_fixture_api_provisions_and_cleans_up_same_run_stack(client, db_session,
         assert second_cleanup.json()["deleted"]["users"] == 0
 
         assert any(path == "/_internal/game/table_1/purge" or path.endswith("/purge") for path, _ in calls)
+    finally:
+        main_module.settings.ENABLE_TEST_FIXTURE_API = previous_flag
+
+
+def test_fixture_api_can_create_unseated_browser_stack(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    main_module = app_modules["main"]
+    previous_flag = main_module.settings.ENABLE_TEST_FIXTURE_API
+    main_module.settings.ENABLE_TEST_FIXTURE_API = True
+    try:
+        admin_user = create_user(
+            db_session,
+            app_modules["auth"],
+            models_module,
+            "browser_fixture_admin",
+            is_admin=True,
+        )
+        set_current_user(auth_state, admin_user)
+
+        async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+            return httpx.Response(200, json={"success": True})
+
+        monkeypatch.setattr(main_module, "post_game_server_json", fake_post_game_server_json)
+
+        create_response = client.post(
+            "/api/admin/test-fixtures/gameplay-stack",
+            json={
+                "run_tag": "browser-fixture-run-1",
+                "player_count": 2,
+                "queued_player_count": 0,
+                "auto_seat_players": False,
+                "starting_balance": "1000.00",
+                "buy_in": 200,
+                "small_blind": 10,
+                "big_blind": 20,
+                "max_seats": 2,
+                "max_queue_size": 0,
+                "action_timeout_seconds": 30,
+            },
+        )
+        assert create_response.status_code == 201, create_response.text
+        payload = create_response.json()
+        assert payload["auto_seat_players"] is False
+        assert payload["league_name"] == "E2E League browser-fixture-run-1"
+        assert payload["community_name"] == "E2E Community browser-fixture-run-1"
+        assert all(user["seat_number"] is None for user in payload["users"])
+        assert all(user["queue_position"] is None for user in payload["users"])
+
+        seats = (
+            db_session.query(models_module.TableSeat)
+            .filter(models_module.TableSeat.table_id == payload["table_id"])
+            .order_by(models_module.TableSeat.seat_number)
+            .all()
+        )
+        assert len(seats) == 2
+        assert all(seat.user_id is None for seat in seats)
+
+        queue_rows = (
+            db_session.query(models_module.TableQueue)
+            .filter(models_module.TableQueue.table_id == payload["table_id"])
+            .all()
+        )
+        assert queue_rows == []
+
+        cleanup_response = client.delete("/api/admin/test-fixtures/runs/browser-fixture-run-1")
+        assert cleanup_response.status_code == 200, cleanup_response.text
+        assert cleanup_response.json()["status"] == "cleaned"
     finally:
         main_module.settings.ENABLE_TEST_FIXTURE_API = previous_flag

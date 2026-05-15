@@ -70,13 +70,16 @@ export const api = axios.create({
 api.interceptors.request.use(
   (config) => {
     const token = getApiAuthToken();
+    const headers = axios.AxiosHeaders.from(config.headers);
     if (token) {
       config.params = {
         ...config.params,
         token, // FastAPI expects token as query param
       };
+      headers.set('Authorization', `Bearer ${token}`);
+    } else {
+      headers.delete('Authorization');
     }
-    const headers = axios.AxiosHeaders.from(config.headers);
     headers.set('X-Dormstacks-UI', 'web');
     config.headers = headers;
     return config;

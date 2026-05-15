@@ -638,7 +638,12 @@ export const DashboardPage: React.FC = () => {
                 const canViewLeagueSettings = isMember;
                 
                 return (
-                  <div key={league.id} className="league-card">
+                  <div
+                    key={league.id}
+                    className="league-card"
+                    data-testid="league-card"
+                    data-league-id={league.id}
+                  >
                     <div 
                       className="league-header"
                       onClick={() => toggleLeague(league.id)}
@@ -711,7 +716,12 @@ export const DashboardPage: React.FC = () => {
                             ) : (
                               <div className="communities-grid">
                                 {leagueCommunities.map((community) => (
-                                  <div key={community.id} className="community-card">
+                                  <div
+                                    key={community.id}
+                                    className="community-card"
+                                    data-testid="community-card"
+                                    data-community-id={community.id}
+                                  >
                                     <h4>{community.name}</h4>
                                     <p className="description">{community.description}</p>
                                     
@@ -729,6 +739,8 @@ export const DashboardPage: React.FC = () => {
                                         <button
                                           onClick={() => handleJoinGame(community.id)}
                                           className="btn-primary"
+                                          data-testid="view-lobby-button"
+                                          data-community-id={community.id}
                                         >
                                           View Lobby
                                         </button>

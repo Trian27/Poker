@@ -23,18 +23,24 @@ ARTIFACT_DIR=""
 COMPOSE_SERVICES=()
 COMPOSE_ACTIVE=0
 
-if [[ -x "$PYTHON_BIN" ]]; then
-  :
-elif command -v "$PYTHON_BIN" > /dev/null 2>&1; then
-  PYTHON_BIN="$(command -v "$PYTHON_BIN")"
-elif [[ "$PYTHON_BIN" == "python" ]] && command -v python3 > /dev/null 2>&1; then
-  PYTHON_BIN="$(command -v python3)"
-else
+resolve_python_bin() {
+  if [[ -x "$PYTHON_BIN" ]]; then
+    return 0
+  fi
+  if command -v "$PYTHON_BIN" > /dev/null 2>&1; then
+    PYTHON_BIN="$(command -v "$PYTHON_BIN")"
+    return 0
+  fi
+  if [[ "$PYTHON_BIN" == "python" ]] && command -v python3 > /dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+    return 0
+  fi
+
   echo "Could not find PYTHON_BIN: $PYTHON_BIN" >&2
   echo "Expected local default: ~/.virtualenvs/poker/bin/python" >&2
   echo "Set PYTHON_BIN=python or run the documented bootstrap command." >&2
   exit 1
-fi
+}
 
 run_gameimplementation() {
   echo "==> GameImplementation build"
@@ -53,6 +59,7 @@ run_gameimplementation() {
 }
 
 run_poker_api() {
+  resolve_python_bin
   echo "==> poker-api gameplay pytest suite"
   (
     cd "$ROOT_DIR/poker-api"
@@ -98,6 +105,7 @@ cleanup_compose() {
 
   if [[ "$COMPOSE_ACTIVE" == "1" ]]; then
     mkdir -p "$ARTIFACT_DIR"
+    compose_cmd config > "$ARTIFACT_DIR/compose-config.yaml" 2>&1 || true
     compose_cmd ps > "$ARTIFACT_DIR/compose-ps.txt" 2>&1 || true
     compose_cmd logs --no-color "${COMPOSE_SERVICES[@]}" > "$ARTIFACT_DIR/compose.log" 2>&1 || true
     compose_cmd down -v --remove-orphans > "$ARTIFACT_DIR/compose-down.log" 2>&1 || true
@@ -150,6 +158,7 @@ run_compose_mode() {
     wait_for_url "react-ui" "http://localhost:${REACT_UI_HOST_PORT}"
   fi
 
+  resolve_python_bin
   echo "==> Running autonomous gameplay driver"
   local driver_log="$ARTIFACT_DIR/driver.log"
   "$PYTHON_BIN" "$ROOT_DIR/scripts/test_autonomous_bot_gameplay.py" \
@@ -161,6 +170,63 @@ run_compose_mode() {
     --admin-password "$ADMIN_PASSWORD" \
     --artifact-dir "$ARTIFACT_DIR" \
     "${EXTRA_ARGS[@]}" 2>&1 | tee "$driver_log"
+}
+
+run_compose_browser_e2e() {
+  COMPOSE_SERVICES=(postgres-db redis-cache auth-api game-server react-ui)
+  COMPOSE_ACTIVE=1
+
+  local timestamp
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  ARTIFACT_DIR="$ROOT_DIR/logs/compose-browser-e2e/$timestamp"
+  mkdir -p "$ARTIFACT_DIR"
+
+  trap cleanup_compose EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  export COMPOSE_PROJECT_NAME
+  export POSTGRES_HOST_PORT
+  export REDIS_HOST_PORT
+  export AUTH_API_HOST_PORT
+  export GAME_SERVER_HOST_PORT
+  export REACT_UI_HOST_PORT
+  export AGENT_API_HOST_PORT
+  export ENABLE_TEST_FIXTURE_API
+  export ENV_MODE
+  export ADMIN_USERNAME
+  export ADMIN_EMAIL
+  export ADMIN_PASSWORD
+  export ADMIN_RESET_PASSWORD
+
+  echo "==> Compose project: $COMPOSE_PROJECT_NAME"
+  echo "==> Artifact dir: $ARTIFACT_DIR"
+  echo "==> Resetting isolated compose project"
+  compose_cmd down -v --remove-orphans > "$ARTIFACT_DIR/compose-preclean.log" 2>&1 || true
+
+  echo "==> Starting services: ${COMPOSE_SERVICES[*]}"
+  compose_cmd up -d --build "${COMPOSE_SERVICES[@]}"
+
+  wait_for_url "auth-api" "http://localhost:${AUTH_API_HOST_PORT}/health"
+  wait_for_url "game-server" "http://localhost:${GAME_SERVER_HOST_PORT}/health"
+  wait_for_url "react-ui" "http://localhost:${REACT_UI_HOST_PORT}"
+
+  echo "==> Running browser full-stack gameplay E2E"
+  local browser_log="$ARTIFACT_DIR/browser-e2e.log"
+  (
+    cd "$ROOT_DIR/poker-ui"
+    PLAYWRIGHT_FULL_STACK=1 \
+    PLAYWRIGHT_SKIP_WEB_SERVER=1 \
+    PLAYWRIGHT_BASE_URL="http://localhost:${REACT_UI_HOST_PORT}" \
+    PLAYWRIGHT_AUTH_API_URL="http://localhost:${AUTH_API_HOST_PORT}" \
+    PLAYWRIGHT_GAME_SERVER_URL="http://localhost:${GAME_SERVER_HOST_PORT}" \
+    PLAYWRIGHT_ARTIFACT_DIR="$ARTIFACT_DIR" \
+    PLAYWRIGHT_REPORT_DIR="$ARTIFACT_DIR/playwright-report" \
+    PLAYWRIGHT_OUTPUT_DIR="$ARTIFACT_DIR/test-results" \
+    ADMIN_USERNAME="$ADMIN_USERNAME" \
+    ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+    npm run test:e2e:gameplay:full-stack
+  ) 2>&1 | tee "$browser_log"
 }
 
 case "$MODE" in
@@ -175,8 +241,11 @@ case "$MODE" in
   compose-human-vs-bot)
     run_compose_mode "human-vs-bot" "compose-human-vs-bot" postgres-db redis-cache auth-api game-server react-ui
     ;;
+  compose-browser-e2e)
+    run_compose_browser_e2e
+    ;;
   *)
-    echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot] [driver args...]" >&2
+    echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot|compose-browser-e2e] [driver args...]" >&2
     exit 1
     ;;
 esac
