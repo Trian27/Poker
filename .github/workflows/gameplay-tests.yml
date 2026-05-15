@@ -137,6 +137,34 @@ jobs:
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: compose-autonomous-e2e-artifacts
+          name: compose-autonomous-e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
           path: logs/compose-autonomous
+          if-no-files-found: ignore
+
+  compose-browser-e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: gameplay-compose-e2e
+      cancel-in-progress: false
+    env:
+      COMPOSE_PROJECT_NAME: gameplay-browser-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: poker-ui/package-lock.json
+      - run: npm ci
+        working-directory: poker-ui
+      - run: npx playwright install --with-deps chromium
+        working-directory: poker-ui
+      - run: ./scripts/test-gameplay.sh compose-browser-e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-browser-e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/compose-browser-e2e
           if-no-files-found: ignore

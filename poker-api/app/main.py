@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 UI_CLIENT_HEADER_NAME = "X-Dormstacks-UI"
 UI_CLIENT_HEADER_VALUE = "web"
 UI_ALLOWED_ORIGINS = {origin.rstrip("/").lower() for origin in settings.CORS_ORIGINS}
+LOCAL_UI_ORIGIN_PATTERN = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 
 # Security scheme for JWT Bearer tokens (optional so query params can be used)
 security = HTTPBearer(auto_error=False)
@@ -83,6 +84,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=None if settings.is_production else LOCAL_UI_ORIGIN_PATTERN.pattern,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -473,7 +475,12 @@ def _validate_fixture_stack_request(payload: TestFixtureGameplayStackCreate) -> 
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="player_count cannot exceed max_seats")
     if payload.queued_player_count > payload.max_queue_size:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="queued_player_count cannot exceed max_queue_size")
-    if payload.queued_player_count > 0 and payload.player_count < payload.max_seats:
+    if not payload.auto_seat_players and payload.queued_player_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="queued_player_count requires auto_seat_players=true"
+        )
+    if payload.auto_seat_players and payload.queued_player_count > 0 and payload.player_count < payload.max_seats:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="queued_player_count is only supported when player_count fills the table"
@@ -787,6 +794,17 @@ def _extract_origin_from_referer(referer: str | None) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}".lower()
 
 
+def _is_allowed_ui_origin(origin: str | None) -> bool:
+    if not origin:
+        return False
+    normalized_origin = origin.rstrip("/").lower()
+    if normalized_origin in UI_ALLOWED_ORIGINS:
+        return True
+    if settings.is_production:
+        return False
+    return LOCAL_UI_ORIGIN_PATTERN.fullmatch(normalized_origin) is not None
+
+
 def _require_ui_create_request(
     request: Request,
     ui_client: str | None = Header(default=None, alias=UI_CLIENT_HEADER_NAME),
@@ -805,7 +823,7 @@ def _require_ui_create_request(
     if not normalized_origin:
         normalized_origin = _extract_origin_from_referer(request.headers.get("referer"))
 
-    if not normalized_origin or normalized_origin not in UI_ALLOWED_ORIGINS:
+    if not _is_allowed_ui_origin(normalized_origin):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Creation requests must come from an approved UI origin."
@@ -2110,7 +2128,7 @@ async def create_test_fixture_gameplay_stack(
 
         response_users: list[dict[str, object]] = []
         for index, (user, password) in enumerate(created_users, start=1):
-            if index <= payload.player_count:
+            if payload.auto_seat_players and index <= payload.player_count:
                 await _seat_fixture_user(
                     db=db,
                     table=table,
@@ -2130,7 +2148,7 @@ async def create_test_fixture_gameplay_stack(
                         "queue_position": None,
                     }
                 )
-            else:
+            elif payload.auto_seat_players:
                 queue_position = index - payload.player_count
                 db.add(
                     TableQueue(
@@ -2151,6 +2169,18 @@ async def create_test_fixture_gameplay_stack(
                         "queue_position": queue_position,
                     }
                 )
+            else:
+                response_users.append(
+                    {
+                        "user_id": user.id,
+                        "username": user.username,
+                        "email": user.email,
+                        "password": password,
+                        "is_test_user": True,
+                        "seat_number": None,
+                        "queue_position": None,
+                    }
+                )
 
         _update_fixture_run_status(
             db,
@@ -2166,8 +2196,11 @@ async def create_test_fixture_gameplay_stack(
 
         return TestFixtureGameplayStackResponse(
             run_tag=run_tag,
+            auto_seat_players=payload.auto_seat_players,
             league_id=league.id,
+            league_name=league.name,
             community_id=community.id,
+            community_name=community.name,
             table_id=table.id,
             table_name=table.name,
             game_id=game_id,

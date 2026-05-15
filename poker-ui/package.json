@@ -13,6 +13,7 @@
     "test:ui:smoke": "playwright test",
     "test:e2e:smoke": "playwright test tests/e2e/gameplay.smoke.spec.ts --project=laptop --workers=1",
     "test:e2e:gameplay": "playwright test tests/e2e/gameplay.smoke.spec.ts --project=laptop --workers=1",
+    "test:e2e:gameplay:full-stack": "playwright test tests/e2e/gameplay.full-stack.spec.ts --project=laptop --workers=1",
     "test:ui:smoke:headed": "playwright test --headed --project=phone-portrait --project=laptop",
     "test:ui:smoke:report": "playwright show-report"
   },

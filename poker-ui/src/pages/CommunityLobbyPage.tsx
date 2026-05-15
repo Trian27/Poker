@@ -893,7 +893,12 @@ export default function CommunityLobbyPage() {
         ) : (
           <div className="tables-grid">
             {tables.map((table) => (
-              <div key={table.id} className={`table-card ${table.status}`}>
+              <div
+                key={table.id}
+                className={`table-card ${table.status}`}
+                data-testid="lobby-table-row"
+                data-table-id={table.id}
+              >
                 <div className="table-header">
                   <h3>{table.name}</h3>
                   <span className={`table-type ${table.game_type}`}>
@@ -1016,6 +1021,8 @@ export default function CommunityLobbyPage() {
                       <button
                         className="join-button secondary"
                         onClick={() => handleSpectateTable(table)}
+                        data-testid="spectate-table-button"
+                        data-table-id={table.id}
                       >
                         Spectate
                       </button>
@@ -1044,6 +1051,8 @@ export default function CommunityLobbyPage() {
                       className="join-button"
                       onClick={() => openJoinModal(table)}
                       disabled={((!wallet && !(activeSeat?.active && activeSeat.table_id === table.id)) || table.status === 'finished')}
+                      data-testid="join-table-button"
+                      data-table-id={table.id}
                     >
                       {table.status === 'finished'
                         ? 'Finished'
@@ -1397,6 +1406,8 @@ export default function CommunityLobbyPage() {
                             className={`seat-button ${isOccupied ? 'occupied' : 'available'} ${isTakenByMe ? 'yours' : ''} ${isSelected ? 'selected' : ''}`}
                             onClick={() => !isOccupied && setSelectedSeat(seat.seat_number)}
                             disabled={isOccupied}
+                            data-testid="seat-button"
+                            data-seat-number={seat.seat_number}
                             title={
                               isOccupied
                                 ? `Occupied by ${seat.username}`
@@ -1468,6 +1479,7 @@ export default function CommunityLobbyPage() {
                   className="primary"
                   onClick={handleJoinTable}
                   disabled={selectedSeat === null || loadingSeats}
+                  data-testid="confirm-join-button"
                 >
                   {selectedSeat === null
                     ? 'Select a seat'

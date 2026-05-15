@@ -1259,7 +1259,7 @@ export const GameTablePage: React.FC = () => {
       <div className="game-header">
         <h2>Poker Table</h2>
         <div className="game-info">
-          <span>Street: {gameState.phase}</span>
+          <span data-testid="street-label">Street: {gameState.phase}</span>
           <span>Pot: {gameState.pot}</span>
           <span>Blinds: {gameState.smallBlind}/{gameState.bigBlind}</span>
         </div>
@@ -1288,7 +1288,7 @@ export const GameTablePage: React.FC = () => {
 
       <div className="game-layout">
         <section className="table-stage" ref={tableStageRef}>
-          <div className="game-table" ref={gameTableRef}>
+          <div className="game-table" ref={gameTableRef} data-testid="game-table">
             <div className="table-center">
               <div className="pot-display">
                 <div className="pot-line">Total Pot: ${gameState.pot}</div>
@@ -1415,6 +1415,7 @@ export const GameTablePage: React.FC = () => {
                         }
                       }}
                       aria-label={`Open note panel for ${player.username}`}
+                      data-seat-number={player.seatNumber}
                     >
                       <div className="player-avatar-shell">
                         {player.profileImageUrl ? (
@@ -1423,7 +1424,13 @@ export const GameTablePage: React.FC = () => {
                           <span className="player-avatar-placeholder" aria-hidden="true" />
                         )}
                       </div>
-                      <div className="player-name">{player.username}</div>
+                      <div
+                        className="player-name"
+                        data-testid="seat-player-name"
+                        data-seat-number={player.seatNumber}
+                      >
+                        {player.username}
+                      </div>
                       <div className="player-stack">${player.stack}</div>
                       <div className="player-badges">
                         {roleBadges.map((badge) => (
@@ -1468,7 +1475,7 @@ export const GameTablePage: React.FC = () => {
 
           <div className="action-area">
             {canAct && (
-              <div className="action-panel">
+              <div className="action-panel" data-testid="action-panel">
                 <h3>Your Turn</h3>
                 <div className="quick-bets">
                   {quickBetPresets.map((preset) => (
@@ -1488,16 +1495,17 @@ export const GameTablePage: React.FC = () => {
                     onClick={handleFold}
                     className={`btn-action btn-fold ${canCheckNow ? 'btn-disabled' : ''}`}
                     disabled={canCheckNow}
+                    data-testid="action-fold-button"
                   >
                     Fold
                   </button>
 
                   {canCheckNow ? (
-                    <button onClick={handleCheck} className="btn-action btn-check">
+                    <button onClick={handleCheck} className="btn-action btn-check" data-testid="action-check-button">
                       Check
                     </button>
                   ) : (
-                    <button onClick={handleCall} className="btn-action btn-call">
+                    <button onClick={handleCall} className="btn-action btn-call" data-testid="action-call-button">
                       Call {callAmount}
                     </button>
                   )}

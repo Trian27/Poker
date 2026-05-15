@@ -1,25 +1,29 @@
 import { defineConfig } from '@playwright/test';
 
 const PORT = Number.parseInt(process.env.PLAYWRIGHT_UI_PORT || '4173', 10);
-const BASE_URL = `http://127.0.0.1:${PORT}`;
+const FULL_STACK = process.env.PLAYWRIGHT_FULL_STACK === '1';
+const BASE_URL = process.env.PLAYWRIGHT_BASE_URL || `http://127.0.0.1:${PORT}`;
+const REPORT_DIR = process.env.PLAYWRIGHT_REPORT_DIR || 'playwright-report';
+const OUTPUT_DIR = process.env.PLAYWRIGHT_OUTPUT_DIR || 'test-results';
 
 export default defineConfig({
   testDir: './tests/e2e',
+  outputDir: OUTPUT_DIR,
   timeout: 60_000,
   expect: {
     timeout: 10_000,
   },
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 1 : 0,
+  retries: FULL_STACK ? 0 : (process.env.CI ? 1 : 0),
   reporter: process.env.CI
-    ? [['github'], ['html', { open: 'never' }]]
-    : [['list'], ['html', { open: 'never' }]],
+    ? [['github'], ['html', { open: 'never', outputFolder: REPORT_DIR }]]
+    : [['list'], ['html', { open: 'never', outputFolder: REPORT_DIR }]],
   use: {
     baseURL: BASE_URL,
-    trace: 'on-first-retry',
+    trace: FULL_STACK ? 'off' : 'on-first-retry',
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    video: FULL_STACK ? 'off' : 'retain-on-failure',
   },
   projects: [
     {
@@ -72,14 +76,16 @@ export default defineConfig({
       },
     },
   ],
-  webServer: {
-    command: `npm run dev -- --host 127.0.0.1 --port ${PORT}`,
-    url: BASE_URL,
-    timeout: 120_000,
-    reuseExistingServer: !process.env.CI,
-    env: {
-      VITE_API_URL: 'http://127.0.0.1:18000',
-      VITE_GAME_SERVER_URL: 'http://127.0.0.1:13000',
-    },
-  },
+  webServer: process.env.PLAYWRIGHT_SKIP_WEB_SERVER === '1'
+    ? undefined
+    : {
+        command: `npm run dev -- --host 127.0.0.1 --port ${PORT}`,
+        url: BASE_URL,
+        timeout: 120_000,
+        reuseExistingServer: !process.env.CI,
+        env: {
+          VITE_API_URL: 'http://127.0.0.1:18000',
+          VITE_GAME_SERVER_URL: 'http://127.0.0.1:13000',
+        },
+      },
 });
