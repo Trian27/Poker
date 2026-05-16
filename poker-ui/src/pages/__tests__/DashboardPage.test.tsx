@@ -4,6 +4,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthContext, type AuthContextType } from '../../auth-context';
 import { DashboardPage } from '../DashboardPage';
+import { suppressAutoRejoinForUserTable } from '../../utils/activeSeatRejoin';
 
 const {
   getCommunitiesMock,
@@ -86,10 +87,10 @@ const authValue: AuthContextType = {
   refreshUser: vi.fn(async () => undefined),
 };
 
-const renderDashboard = () => render(
+const renderDashboard = (initialEntries: Array<string | { pathname: string; search?: string; state?: unknown }> = ['/dashboard']) => render(
   <StrictMode>
     <AuthContext.Provider value={authValue}>
-      <MemoryRouter initialEntries={['/dashboard']}>
+      <MemoryRouter initialEntries={initialEntries}>
         <Routes>
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/game/:tableId" element={<div>Game route reached</div>} />
@@ -120,5 +121,25 @@ describe('DashboardPage gameplay behavior', () => {
 
     expect(getMyActiveSeatMock).toHaveBeenCalled();
     expect(window.sessionStorage.getItem('poker:reloadRejoinChecked')).toBe('1');
+  });
+
+  it('does not auto-rejoin when the current user and table are suppressed', async () => {
+    suppressAutoRejoinForUserTable(authValue.user!.id, 11, 60_000);
+
+    renderDashboard();
+
+    await waitFor(() => {
+      expect(screen.getByText('Alpha League')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText('Game route reached')).not.toBeInTheDocument();
+  });
+
+  it('shows the seat-lost banner when redirected back to the dashboard', async () => {
+    renderDashboard([{ pathname: '/dashboard', state: { seat_lost: true } }]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('seat-lost-banner')).toHaveTextContent('You are no longer seated at that table.');
+    });
   });
 });

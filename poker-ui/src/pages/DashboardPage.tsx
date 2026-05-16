@@ -11,12 +11,14 @@ import CommunitySettingsModal from '../components/CommunitySettingsModal';
 import './Dashboard.css';
 import { getApiErrorMessage } from "../utils/error";
 import {
-  isAutoRejoinSuppressed,
+  clearAutoRejoinSuppressionForUserTable,
+  isAutoRejoinSuppressedForUserTable,
   markReloadAutoRejoinCheckComplete,
   shouldRunReloadAutoRejoinCheck,
 } from '../utils/activeSeatRejoin';
 
 const UNREAD_COUNT_STORAGE_KEY = 'poker-inbox-unread-count';
+const SEAT_LOST_BANNER_COPY = 'You are no longer seated at that table.';
 
 export const DashboardPage: React.FC = () => {
   const REFRESH_INTERVAL_MS = 5000;
@@ -25,6 +27,7 @@ export const DashboardPage: React.FC = () => {
   const [leagues, setLeagues] = useState<League[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [seatLostBanner, setSeatLostBanner] = useState<string | null>(null);
   const [isRejoiningTable, setIsRejoiningTable] = useState(false);
   const [activeSeat, setActiveSeat] = useState<ActiveSeatStatus | null>(null);
   
@@ -71,6 +74,22 @@ export const DashboardPage: React.FC = () => {
   const { user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+
+  useEffect(() => {
+    const seatLost = Boolean(
+      location.state
+      && typeof location.state === 'object'
+      && 'seat_lost' in location.state
+      && (location.state as { seat_lost?: unknown }).seat_lost,
+    );
+
+    if (!seatLost) {
+      return;
+    }
+
+    setSeatLostBanner(SEAT_LOST_BANNER_COPY);
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [location.pathname, location.search, location.state, navigate]);
 
   const loadData = useCallback(async (showLoader: boolean = false) => {
     try {
@@ -153,7 +172,7 @@ export const DashboardPage: React.FC = () => {
       const navigationEntry = navigationEntries[0] as PerformanceNavigationTiming | undefined;
       const isReload = navigationEntry?.type === 'reload';
 
-      if (!shouldRunReloadAutoRejoinCheck(isReload) || isAutoRejoinSuppressed()) {
+      if (!shouldRunReloadAutoRejoinCheck(isReload)) {
         return;
       }
 
@@ -161,6 +180,9 @@ export const DashboardPage: React.FC = () => {
       try {
         const activeSeat = await tablesApi.getMyActiveSeat();
         if (!cancelled && activeSeat?.active && activeSeat.table_id) {
+          if (isAutoRejoinSuppressedForUserTable(user?.id ?? null, activeSeat.table_id)) {
+            return;
+          }
           const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
           markReloadAutoRejoinCheckComplete();
           navigate(`/game/${activeSeat.table_id}${communityParam}`, { replace: true });
@@ -181,7 +203,7 @@ export const DashboardPage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [navigate]);
+  }, [navigate, user?.id]);
 
   useEffect(() => {
     void loadActiveSeat();
@@ -263,6 +285,7 @@ export const DashboardPage: React.FC = () => {
     if (!activeSeat?.active || !activeSeat.table_id) {
       return;
     }
+    clearAutoRejoinSuppressionForUserTable(user?.id ?? null, activeSeat.table_id);
     const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
     navigate(`/game/${activeSeat.table_id}${communityParam}`);
   };
@@ -599,6 +622,12 @@ export const DashboardPage: React.FC = () => {
       {isRejoiningTable && (
         <div className="rejoin-banner">
           Rejoining your active table...
+        </div>
+      )}
+
+      {!isRejoiningTable && seatLostBanner && (
+        <div className="rejoin-banner" data-testid="seat-lost-banner">
+          {seatLostBanner}
         </div>
       )}
 

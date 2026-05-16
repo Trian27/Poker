@@ -9,6 +9,7 @@ const {
   fakeSocket,
   createGameSocketMock,
   getSeatsMock,
+  getMyActiveSeatMock,
   leaveMock,
   getMySkinsMock,
   getNoteMock,
@@ -80,6 +81,12 @@ const {
       { id: 1, seat_number: 1, user_id: 7, username: 'smoke-user', occupied_at: '2026-01-01T00:00:00Z' },
       { id: 2, seat_number: 2, user_id: 8, username: 'villain', occupied_at: '2026-01-01T00:00:00Z' },
     ]),
+    getMyActiveSeatMock: vi.fn(async () => ({
+      active: true,
+      table_id: 11,
+      community_id: 1,
+      seat_number: 1,
+    })),
     leaveMock: vi.fn(async () => ({ success: true })),
     getMySkinsMock: vi.fn(async () => []),
     getNoteMock: vi.fn(async () => ({ notes: '' })),
@@ -94,6 +101,7 @@ vi.mock('../../gameSocket', () => ({
 vi.mock('../../api', () => ({
   tablesApi: {
     getSeats: getSeatsMock,
+    getMyActiveSeat: getMyActiveSeatMock,
     leave: leaveMock,
   },
   skinsApi: {
@@ -128,6 +136,7 @@ const renderGameTable = () => render(
       <Routes>
         <Route path="/game/:tableId" element={<GameTablePage />} />
         <Route path="/community/:communityId" element={<div>Community page</div>} />
+        <Route path="/dashboard" element={<div>Dashboard page</div>} />
       </Routes>
     </MemoryRouter>
   </AuthContext.Provider>
@@ -240,5 +249,31 @@ describe('GameTablePage gameplay behavior', () => {
       fakeSocket.trigger('disconnect');
     });
     await waitFor(() => expect(screen.getByText('Reconnecting to game...')).toBeInTheDocument());
+  });
+
+  it('navigates away from a stale player route when the socket reports table_not_found', async () => {
+    renderGameTable();
+
+    act(() => {
+      fakeSocket.trigger('connect');
+      fakeSocket.trigger('error', { message: 'table_not_found', code: 'table_not_found' });
+    });
+
+    await waitFor(() => expect(screen.getByText('Community page')).toBeInTheDocument());
+  });
+
+  it('navigates away from a stale player route when active-seat fallback no longer matches the table', async () => {
+    getMyActiveSeatMock.mockResolvedValueOnce({
+      active: false,
+      community_id: 1,
+    } as any);
+
+    renderGameTable();
+
+    act(() => {
+      fakeSocket.trigger('connect');
+    });
+
+    await waitFor(() => expect(screen.getByText('Community page')).toBeInTheDocument());
   });
 });

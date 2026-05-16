@@ -7,9 +7,12 @@ import { useAuth } from '../auth-context';
 import { ActionTimer } from '../components/ActionTimer';
 import RulesScrollHelp from '../components/RulesScrollHelp';
 import { tablesApi, skinsApi, playerNotesApi } from '../api';
-import type { GameState, GameAction, Card, ChatMessage, HandResult, TableSeat } from '../types';
+import type { GameState, GameAction, Card, ChatMessage, HandResult, TableSeat, ActiveSeatStatus } from '../types';
 import { getApiErrorMessage } from '../utils/error';
-import { suppressAutoRejoinForMs } from '../utils/activeSeatRejoin';
+import {
+  clearAutoRejoinSuppressionForUserTable,
+  suppressAutoRejoinForUserTable,
+} from '../utils/activeSeatRejoin';
 import { createGameSocket, type GameSocket } from '../gameSocket';
 import './GameTable.css';
 
@@ -89,13 +92,20 @@ const normalizePhase = (rawPhase: unknown): GameState['phase'] => {
 export const GameTablePage: React.FC = () => {
   const params = useParams<{ tableId?: string; communityId?: string }>();
   const tableIdParam = params.tableId ?? params.communityId;
+  const { user, token } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
+  const initialCommunityId = Number(queryParams.get('communityId'));
   const [socket, setSocket] = useState<GameSocket | null>(null);
   const [gameState, setGameState] = useState<GameState | null>(null);
   const [connected, setConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [error, setError] = useState('');
   const [bustMessage, setBustMessage] = useState('');
-  const [resolvedCommunityId, setResolvedCommunityId] = useState<number | null>(null);
+  const [resolvedCommunityId, setResolvedCommunityId] = useState<number | null>(
+    Number.isFinite(initialCommunityId) && initialCommunityId > 0 ? initialCommunityId : null,
+  );
   const [handResult, setHandResult] = useState<HandResult | null>(null);
   const [revealedShowdownHandsByUserId, setRevealedShowdownHandsByUserId] = useState<Record<number, boolean>>({});
   const [nextHandCountdown, setNextHandCountdown] = useState<number | null>(null);
@@ -136,14 +146,13 @@ export const GameTablePage: React.FC = () => {
   const gameContainerRef = useRef<HTMLDivElement | null>(null);
   const tableStageRef = useRef<HTMLElement | null>(null);
   const gameTableRef = useRef<HTMLDivElement | null>(null);
+  const latestSocketErrorCodeRef = useRef<string | null>(null);
+  const staleRouteRecoveryStartedRef = useRef(false);
+  const activeSeatFallbackCheckInFlightRef = useRef(false);
 
-  const { user, token } = useAuth();
-  const navigate = useNavigate();
-  const location = useLocation();
   const tableId = Number(tableIdParam);
   const currentUserId = user?.id ?? null;
   const expectedGameId = Number.isFinite(tableId) ? `table_${tableId}` : undefined;
-  const queryParams = useMemo(() => new URLSearchParams(location.search), [location.search]);
   const spectateRequested = queryParams.get('spectate') === '1';
   const [spectatorMode, setSpectatorMode] = useState<boolean>(spectateRequested);
   const [spectatorHasSeat, setSpectatorHasSeat] = useState(false);
@@ -360,12 +369,66 @@ export const GameTablePage: React.FC = () => {
     }
   }, [resolvedCommunityId, navigate]);
 
+  const navigateToSeatLostDestination = useCallback(() => {
+    if (staleRouteRecoveryStartedRef.current) {
+      return;
+    }
+
+    staleRouteRecoveryStartedRef.current = true;
+    if (!spectatorMode && currentUserId !== null && Number.isFinite(tableId) && tableId > 0) {
+      suppressAutoRejoinForUserTable(currentUserId, tableId);
+    }
+
+    const nextPath = resolvedCommunityId
+      ? `/community/${resolvedCommunityId}`
+      : '/dashboard';
+    navigate(nextPath, { replace: true, state: { seat_lost: true } });
+  }, [currentUserId, navigate, resolvedCommunityId, spectatorMode, tableId]);
+
+  const routeMatchesActiveSeat = useCallback((activeSeat: ActiveSeatStatus | null | undefined): boolean => {
+    if (!activeSeat?.active || !activeSeat.table_id) {
+      return false;
+    }
+    return Number(activeSeat.table_id) === tableId;
+  }, [tableId]);
+
+  const validateCurrentRouteActiveSeat = useCallback(async (): Promise<boolean> => {
+    if (
+      spectatorMode
+      || currentUserId === null
+      || !Number.isFinite(tableId)
+      || tableId <= 0
+      || activeSeatFallbackCheckInFlightRef.current
+      || staleRouteRecoveryStartedRef.current
+    ) {
+      return false;
+    }
+
+    activeSeatFallbackCheckInFlightRef.current = true;
+    try {
+      const activeSeat = await tablesApi.getMyActiveSeat();
+      if (routeMatchesActiveSeat(activeSeat)) {
+        clearAutoRejoinSuppressionForUserTable(currentUserId, tableId);
+        return false;
+      }
+      navigateToSeatLostDestination();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      activeSeatFallbackCheckInFlightRef.current = false;
+    }
+  }, [currentUserId, navigateToSeatLostDestination, routeMatchesActiveSeat, spectatorMode, tableId]);
+
   useEffect(() => {
     setSpectatorMode(spectateRequested);
     if (!spectateRequested) {
       setSpectatorHasSeat(false);
     }
-  }, [spectateRequested]);
+    staleRouteRecoveryStartedRef.current = false;
+    activeSeatFallbackCheckInFlightRef.current = false;
+    latestSocketErrorCodeRef.current = null;
+  }, [spectateRequested, tableIdParam]);
 
   useEffect(() => {
     if (!tableIdParam) {
@@ -496,8 +559,11 @@ export const GameTablePage: React.FC = () => {
       setConnected(true);
       setReconnecting(false);
       setError('');
+      latestSocketErrorCodeRef.current = null;
       if (spectateRequested && Number.isFinite(tableId)) {
         newSocket.emit('spectate_table', { tableId });
+      } else {
+        void validateCurrentRouteActiveSeat();
       }
     });
 
@@ -517,6 +583,10 @@ export const GameTablePage: React.FC = () => {
       setGameState(normalizeGameState(restoredState, normalizedBotUsers));
       setReconnecting(false);
       setError('');
+      latestSocketErrorCodeRef.current = null;
+      if (!spectateRequested && currentUserId !== null && Number.isFinite(tableId)) {
+        clearAutoRejoinSuppressionForUserTable(currentUserId, tableId);
+      }
     });
 
     newSocket.on('spectator_mode', ({ enabled, hasSeat }: { enabled?: boolean; hasSeat?: boolean }) => {
@@ -606,6 +676,9 @@ export const GameTablePage: React.FC = () => {
       }
       const normalizedState = normalizeGameState(newGameState, botUserIdsRef.current);
       setGameState(normalizedState);
+      if (!spectatorMode && currentUserId !== null && Number.isFinite(tableId)) {
+        clearAutoRejoinSuppressionForUserTable(currentUserId, tableId);
+      }
       if (normalizedState.phase !== 'finished' && normalizedState.lastHandResult == null) {
         if (handResultTimeoutRef.current !== null) {
           window.clearTimeout(handResultTimeoutRef.current);
@@ -642,8 +715,12 @@ export const GameTablePage: React.FC = () => {
       }, 2400);
     });
 
-    newSocket.on('error', ({ message }: { message: string }) => {
+    newSocket.on('error', ({ message, code }: { message: string; code?: string }) => {
+      latestSocketErrorCodeRef.current = code ?? null;
       setError(message);
+      if (code === 'table_not_found' && !spectateRequested) {
+        navigateToSeatLostDestination();
+      }
     });
 
     newSocket.on('action_error', ({ error: actionError }: { error: string }) => {
@@ -663,7 +740,36 @@ export const GameTablePage: React.FC = () => {
       }
       newSocket.close();
     };
-  }, [token, tableIdParam, tableId, spectateRequested, expectedGameId, currentUserId, normalizeGameState, normalizeHandResult, backToCommunity]);
+  }, [token, tableIdParam, tableId, spectateRequested, expectedGameId, currentUserId, normalizeGameState, normalizeHandResult, backToCommunity, navigateToSeatLostDestination, spectatorMode, validateCurrentRouteActiveSeat]);
+
+  useEffect(() => {
+    const handleOffline = () => {
+      if (!gameState) {
+        return;
+      }
+      setConnected(false);
+      setReconnecting(true);
+      setError('');
+    };
+
+    const handleOnline = () => {
+      if (socket?.connected) {
+        setConnected(true);
+        setReconnecting(false);
+        return;
+      }
+      if (gameState) {
+        setReconnecting(true);
+      }
+    };
+
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [gameState, socket]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -845,7 +951,9 @@ export const GameTablePage: React.FC = () => {
   };
 
   const handleLeaveGame = async () => {
-    suppressAutoRejoinForMs();
+    if (!spectatorMode && currentUserId !== null && Number.isFinite(tableId) && tableId > 0) {
+      suppressAutoRejoinForUserTable(currentUserId, tableId);
+    }
     if (!spectatorMode && Number.isFinite(tableId)) {
       try {
         await tablesApi.leave(tableId);
@@ -1228,7 +1336,10 @@ export const GameTablePage: React.FC = () => {
   if (!connected) {
     return (
       <div className="game-container" style={tableThemeStyles} ref={gameContainerRef}>
-        <div className="connecting-overlay">
+        <div
+          className="connecting-overlay"
+          data-testid={reconnecting ? 'reconnecting-overlay' : undefined}
+        >
           <div className="spinner"></div>
           <p>{reconnecting ? 'Reconnecting to game...' : 'Connecting to game server...'}</p>
           {error && <p className="error">{error}</p>}
@@ -1677,7 +1788,7 @@ export const GameTablePage: React.FC = () => {
       </div>
 
       {reconnecting && (
-        <div className="reconnecting-overlay">
+        <div className="reconnecting-overlay" data-testid="reconnecting-overlay">
           <div className="spinner"></div>
           <p>Reconnecting to game...</p>
         </div>

@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, type CSSProperties } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { communitiesApi, tablesApi, walletsApi, inboxApi } from '../api';
 import { useAuth } from '../auth-context';
 import type { Community, Table, Wallet, TableSeat, TableTournamentDetails, InboxMessage, ActiveSeatStatus } from '../types';
@@ -7,16 +7,19 @@ import UserMenu from '../components/UserMenu';
 import CommunitySettingsModal from '../components/CommunitySettingsModal';
 import './CommunityLobby.css';
 import { getApiErrorMessage, getApiErrorStatus } from '../utils/error';
+import { clearAutoRejoinSuppressionForUserTable } from '../utils/activeSeatRejoin';
 
 const MAX_TABLE_SEATS = 8;
 const LOBBY_REFRESH_INTERVAL_MS = 3000;
 const INBOX_REFRESH_INTERVAL_MS = 5000;
 const TOURNAMENT_PLAYER_LIMIT_OPTIONS = [2, 4, 8];
 const UNREAD_COUNT_STORAGE_KEY = 'poker-inbox-unread-count';
+const SEAT_LOST_BANNER_COPY = 'You are no longer seated at that table.';
 
 export default function CommunityLobbyPage() {
   const { communityId } = useParams<{ communityId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const { user } = useAuth();
   
   const [community, setCommunity] = useState<Community | null>(null);
@@ -26,6 +29,7 @@ export default function CommunityLobbyPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeSeat, setActiveSeat] = useState<ActiveSeatStatus | null>(null);
+  const [seatLostBanner, setSeatLostBanner] = useState<string | null>(null);
   
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
@@ -79,6 +83,22 @@ export default function CommunityLobbyPage() {
   const canCreatePermanentTables = !!(user && community && idsEqual(community.commissioner_id, user.id));
   const authApiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   const gameServerBaseUrl = import.meta.env.VITE_GAME_SERVER_URL || 'http://localhost:3000';
+
+  useEffect(() => {
+    const seatLost = Boolean(
+      location.state
+      && typeof location.state === 'object'
+      && 'seat_lost' in location.state
+      && (location.state as { seat_lost?: unknown }).seat_lost,
+    );
+
+    if (!seatLost) {
+      return;
+    }
+
+    setSeatLostBanner(SEAT_LOST_BANNER_COPY);
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [location.pathname, location.search, location.state, navigate]);
 
   const loadUnreadCount = useCallback(async () => {
     try {
@@ -561,6 +581,7 @@ export default function CommunityLobbyPage() {
       
       alert(response.message);
       setShowJoinModal(false);
+      clearAutoRejoinSuppressionForUserTable(user?.id ?? null, selectedTable.id);
       
       // Navigate to game table
       const communityQuery = Number.isFinite(parsedCommunityId) && parsedCommunityId > 0
@@ -585,6 +606,7 @@ export default function CommunityLobbyPage() {
 
   const openJoinModal = async (table: Table) => {
     if (activeSeat?.active && activeSeat.table_id === table.id) {
+      clearAutoRejoinSuppressionForUserTable(user?.id ?? null, table.id);
       const communityQuery = Number.isFinite(parsedCommunityId) && parsedCommunityId > 0
         ? `?communityId=${parsedCommunityId}`
         : '';
@@ -840,6 +862,12 @@ export default function CommunityLobbyPage() {
         </div>
         <h1>{community.name}</h1>
         <p>{community.description}</p>
+
+        {seatLostBanner && (
+          <div className="rejoin-banner" data-testid="seat-lost-banner">
+            {seatLostBanner}
+          </div>
+        )}
         
         {wallet && (
           <div className="wallet-balance">

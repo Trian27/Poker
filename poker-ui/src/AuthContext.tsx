@@ -6,6 +6,7 @@ import type { ReactNode } from 'react';
 import type { User } from './types';
 import { authApi, clearApiAuthStorage, getApiAuthToken, setApiAuthToken } from './api';
 import { AuthContext } from './auth-context';
+import { clearAutoRejoinSuppressionForUser } from './utils/activeSeatRejoin';
 
 interface AuthProviderProps {
   children: ReactNode;
@@ -143,6 +144,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   };
 
   const logout = () => {
+    if (user?.id !== undefined && user?.id !== null) {
+      clearAutoRejoinSuppressionForUser(user.id);
+    }
     clearApiAuthStorage();
     setTokenState(null);
     setUser(null);
