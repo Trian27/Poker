@@ -87,7 +87,7 @@ export class FullStackRuntime {
     this.scenario = scenario;
     this.artifactDir = createScenarioArtifactDir(ARTIFACT_ROOT_DIR, scenario);
     this.summary = new SummaryTracker(this.artifactDir, scenario);
-    this.runTag = validateRunTag(generateRunTag());
+    this.runTag = validateRunTag(generateRunTag(scenario));
 
     const missingEnv = Object.entries(requiredEnv)
       .filter(([, value]) => !value)

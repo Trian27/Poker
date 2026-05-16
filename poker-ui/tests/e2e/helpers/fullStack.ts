@@ -267,14 +267,22 @@ const authHeaders = (token: string): Record<string, string> => ({
   Authorization: `Bearer ${token}`,
 });
 
-export const generateRunTag = (): string => {
+export const generateRunTag = (scenario?: string): string => {
   const githubRunId = process.env.GITHUB_RUN_ID;
   const githubRunAttempt = process.env.GITHUB_RUN_ATTEMPT;
+  const scenarioFragment = scenario ? slugifyScenario(scenario).slice(0, 40) : '';
   if (githubRunId && githubRunAttempt) {
-    return `e2e-browser-gh-${githubRunId}-${githubRunAttempt}`;
+    const base = `e2e-browser-gh-${githubRunId}-${githubRunAttempt}`;
+    if (!scenarioFragment) {
+      return base;
+    }
+    return `${base}-${scenarioFragment}`.slice(0, 128);
   }
   const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
-  return `e2e-browser-${timestamp}-${randomBytes(3).toString('hex')}`;
+  if (!scenarioFragment) {
+    return `e2e-browser-${timestamp}-${randomBytes(3).toString('hex')}`;
+  }
+  return `e2e-browser-${timestamp}-${scenarioFragment}-${randomBytes(2).toString('hex')}`.slice(0, 128);
 };
 
 export const validateRunTag = (runTag: string): string => {
