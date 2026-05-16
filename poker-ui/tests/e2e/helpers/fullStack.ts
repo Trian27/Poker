@@ -1,4 +1,4 @@
-import type { APIRequestContext, BrowserContext, Page } from '@playwright/test';
+import type { APIRequestContext, Browser, BrowserContext, Page } from '@playwright/test';
 import { expect, request as playwrightRequest } from '@playwright/test';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -38,12 +38,45 @@ export interface GameplayFixture {
   users: FixtureUserCredential[];
 }
 
+export interface FixtureCreateOptions {
+  autoSeatPlayers?: boolean;
+  actionTimeoutSeconds?: number;
+  playerCount?: number;
+  queuedPlayerCount?: number;
+  startingBalance?: string;
+  buyIn?: number;
+  smallBlind?: number;
+  bigBlind?: number;
+  maxSeats?: number;
+  maxQueueSize?: number;
+}
+
 export interface AuthenticatedApiUser {
   username: string;
   password: string;
   userId: number;
   token: string;
   request: APIRequestContext;
+}
+
+export interface SeatSnapshot {
+  tableId: string;
+  userA: {
+    userId: string;
+    seatNumber: number | null;
+    activeSeatTableId: string | null;
+    activeSeatNumber: number | null;
+  };
+  userB: {
+    userId: string;
+    seatNumber: number | null;
+    activeSeatTableId: string | null;
+    activeSeatNumber: number | null;
+  };
+  seats: Array<{
+    userId: string;
+    seatNumber: number;
+  }>;
 }
 
 interface CleanupSummary {
@@ -54,8 +87,18 @@ interface CleanupSummary {
   error?: string | null;
 }
 
+interface DisruptionSummary {
+  type?: string | null;
+  target_user?: string | null;
+  offline_started_at?: string | null;
+  reconnecting_observed_at?: string | null;
+  active_seat_inactive_at?: string | null;
+  online_restored_at?: string | null;
+}
+
 interface FullStackSummary {
   mode: 'compose-browser-e2e';
+  scenario: string;
   phase: string;
   status: 'running' | 'passed' | 'failed';
   error: string | null;
@@ -71,6 +114,22 @@ interface FullStackSummary {
   table_name: string | null;
   game_id: string | null;
   common_hand_id: string | null;
+  action_timeout_seconds: number | null;
+  reconnect_grace_ms_expected: number | null;
+  active_seat_inactive_deadline_ms: number | null;
+  disruption: DisruptionSummary | null;
+  seat_state_before: SeatSnapshot | null;
+  seat_state_after: SeatSnapshot | null;
+  page_a_url: string | null;
+  page_b_url: string | null;
+  page_a_actionable: boolean | null;
+  page_b_actionable: boolean | null;
+  page_a_connection_state: string | null;
+  page_b_connection_state: string | null;
+  reconnecting_overlay_observed_page_a: boolean;
+  reconnecting_overlay_observed_page_b: boolean;
+  last_observed_banner: string | null;
+  last_socket_error_code: string | null;
   cleanup: CleanupSummary;
   phase_timings: Record<string, number>;
 }
@@ -83,10 +142,11 @@ export class SummaryTracker {
   private currentPhase: string | null = null;
   private phaseStartedAt: number | null = null;
 
-  constructor(artifactDir: string) {
+  constructor(artifactDir: string, scenario: string) {
     this.artifactDir = artifactDir;
     this.summary = {
       mode: 'compose-browser-e2e',
+      scenario,
       phase: 'starting',
       status: 'running',
       error: null,
@@ -102,6 +162,22 @@ export class SummaryTracker {
       table_name: null,
       game_id: null,
       common_hand_id: null,
+      action_timeout_seconds: null,
+      reconnect_grace_ms_expected: null,
+      active_seat_inactive_deadline_ms: null,
+      disruption: null,
+      seat_state_before: null,
+      seat_state_after: null,
+      page_a_url: null,
+      page_b_url: null,
+      page_a_actionable: null,
+      page_b_actionable: null,
+      page_a_connection_state: null,
+      page_b_connection_state: null,
+      reconnecting_overlay_observed_page_a: false,
+      reconnecting_overlay_observed_page_b: false,
+      last_observed_banner: null,
+      last_socket_error_code: null,
       cleanup: {
         attempted: false,
         succeeded: false,
@@ -191,14 +267,22 @@ const authHeaders = (token: string): Record<string, string> => ({
   Authorization: `Bearer ${token}`,
 });
 
-export const generateRunTag = (): string => {
+export const generateRunTag = (scenario?: string): string => {
   const githubRunId = process.env.GITHUB_RUN_ID;
   const githubRunAttempt = process.env.GITHUB_RUN_ATTEMPT;
+  const scenarioFragment = scenario ? slugifyScenario(scenario).slice(0, 40) : '';
   if (githubRunId && githubRunAttempt) {
-    return `e2e-browser-gh-${githubRunId}-${githubRunAttempt}`;
+    const base = `e2e-browser-gh-${githubRunId}-${githubRunAttempt}`;
+    if (!scenarioFragment) {
+      return base;
+    }
+    return `${base}-${scenarioFragment}`.slice(0, 128);
   }
   const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
-  return `e2e-browser-${timestamp}-${randomBytes(3).toString('hex')}`;
+  if (!scenarioFragment) {
+    return `e2e-browser-${timestamp}-${randomBytes(3).toString('hex')}`;
+  }
+  return `e2e-browser-${timestamp}-${scenarioFragment}-${randomBytes(2).toString('hex')}`.slice(0, 128);
 };
 
 export const validateRunTag = (runTag: string): string => {
@@ -207,6 +291,18 @@ export const validateRunTag = (runTag: string): string => {
     throw new Error(`Invalid run tag: ${runTag}`);
   }
   return normalized;
+};
+
+export const slugifyScenario = (value: string): string => {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+};
+
+export const createScenarioArtifactDir = (rootDir: string, scenario: string): string => {
+  return join(rootDir, slugifyScenario(scenario));
 };
 
 export const createApiContext = async (baseURL: string, token?: string): Promise<APIRequestContext> => {
@@ -271,20 +367,34 @@ export const assertHealth = async (baseURL: string, label: string): Promise<void
 export const createFixture = async (
   adminRequest: APIRequestContext,
   runTag: string,
+  options: FixtureCreateOptions = {},
 ): Promise<GameplayFixture> => {
+  const {
+    autoSeatPlayers = false,
+    actionTimeoutSeconds = 60,
+    playerCount = 2,
+    queuedPlayerCount = 0,
+    startingBalance = '1000.00',
+    buyIn = 200,
+    smallBlind = 10,
+    bigBlind = 20,
+    maxSeats = 2,
+    maxQueueSize = 0,
+  } = options;
+
   const response = await adminRequest.post('/api/admin/test-fixtures/gameplay-stack', {
     data: {
       run_tag: runTag,
-      player_count: 2,
-      queued_player_count: 0,
-      auto_seat_players: false,
-      starting_balance: '1000.00',
-      buy_in: 200,
-      small_blind: 10,
-      big_blind: 20,
-      max_seats: 2,
-      max_queue_size: 0,
-      action_timeout_seconds: 60,
+      player_count: playerCount,
+      queued_player_count: queuedPlayerCount,
+      auto_seat_players: autoSeatPlayers,
+      starting_balance: startingBalance,
+      buy_in: buyIn,
+      small_blind: smallBlind,
+      big_blind: bigBlind,
+      max_seats: maxSeats,
+      max_queue_size: maxQueueSize,
+      action_timeout_seconds: actionTimeoutSeconds,
     },
   });
 
@@ -332,6 +442,12 @@ export const getTableSeats = async (userRequest: APIRequestContext, tableId: num
   return (await response.json()) as Array<Record<string, unknown>>;
 };
 
+export const getActiveSeatStatus = async (userRequest: APIRequestContext): Promise<Record<string, unknown>> => {
+  const response = await userRequest.get('/api/tables/me/active-seat');
+  await assertOk(response, 'Load active seat');
+  return (await response.json()) as Record<string, unknown>;
+};
+
 export const waitForSeatAssignment = async (
   userRequest: APIRequestContext,
   tableId: number,
@@ -347,6 +463,33 @@ export const waitForSeatAssignment = async (
     timeout: 15_000,
     intervals: [250, 500, 1000],
   }).toBe(true);
+};
+
+export const createBrowserContext = async (
+  browser: Browser,
+  baseUrl: string,
+  viewport = { width: 1366, height: 768 },
+): Promise<{ context: BrowserContext; page: Page }> => {
+  const context = await browser.newContext({
+    baseURL: baseUrl,
+    viewport,
+  });
+  await seedReturningVisitor(context, baseUrl);
+  const page = await context.newPage();
+  return { context, page };
+};
+
+export const joinSeat = async (
+  page: Page,
+  fixture: { community_id: number; table_id: number; table_name: string },
+  seatNumber: number,
+): Promise<void> => {
+  await expect(locatorByDataValue(page, 'lobby-table-row', 'data-table-id', fixture.table_id)).toContainText(fixture.table_name);
+  await locatorByDataValue(page, 'join-table-button', 'data-table-id', fixture.table_id).click();
+  await expect(page.getByText(`Join ${fixture.table_name}`)).toBeVisible();
+  await locatorByDataValue(page, 'seat-button', 'data-seat-number', seatNumber).click();
+  await page.getByTestId('confirm-join-button').click();
+  await expect(page).toHaveURL(new RegExp(`/game/${fixture.table_id}\\?communityId=${fixture.community_id}$`));
 };
 
 export const isAcceptablePersistedHand = (
@@ -421,6 +564,107 @@ export const waitForCommonPersistedHand = async (
   }
 
   throw new Error('Timed out waiting for a common persisted hand');
+};
+
+export const assertOnGameRoute = async (page: Page, fixture: Pick<GameplayFixture, 'table_id' | 'community_id'>): Promise<void> => {
+  await expect(page).toHaveURL(new RegExp(`/game/${fixture.table_id}\\?communityId=${fixture.community_id}$`));
+};
+
+export const waitForGameTable = async (page: Page, timeout = 20_000): Promise<void> => {
+  await expect(page.getByTestId('game-table')).toBeVisible({ timeout });
+};
+
+export const assertUiSeatAssignments = async (
+  pageA: Page,
+  pageB: Page,
+  assignments: Record<number, string>,
+): Promise<void> => {
+  for (const [seatNumber, username] of Object.entries(assignments)) {
+    await expect(locatorByDataValue(pageA, 'seat-player-name', 'data-seat-number', seatNumber)).toHaveText(username);
+    await expect(locatorByDataValue(pageB, 'seat-player-name', 'data-seat-number', seatNumber)).toHaveText(username);
+  }
+};
+
+export const awaitActionable = async (page: Page, timeout = 45_000): Promise<Array<'check' | 'call' | 'fold'>> => {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    await waitForGameTable(page, 5_000);
+    const actions = await getEnabledActions(page);
+    if (actions.length > 0) {
+      return actions;
+    }
+    await page.waitForTimeout(200);
+  }
+
+  throw new Error(`Timed out waiting for actionable state on ${page.url()}`);
+};
+
+export const awaitHealthyNonActionable = async (
+  page: Page,
+  fixture: Pick<GameplayFixture, 'table_id' | 'community_id'>,
+  timeout = 45_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const onExpectedRoute = page.url().includes(`/game/${fixture.table_id}?communityId=${fixture.community_id}`);
+    if (!onExpectedRoute) {
+      await page.waitForTimeout(200);
+      continue;
+    }
+
+    const [gameTableVisible, reconnectingVisible, actions] = await Promise.all([
+      page.getByTestId('game-table').isVisible().catch(() => false),
+      page.getByTestId('reconnecting-overlay').isVisible().catch(() => false),
+      getEnabledActions(page),
+    ]);
+
+    if (gameTableVisible && !reconnectingVisible && actions.length === 0) {
+      return;
+    }
+
+    await page.waitForTimeout(200);
+  }
+
+  throw new Error(`Timed out waiting for healthy non-actionable state on ${page.url()}`);
+};
+
+export const awaitActionabilityPair = async (
+  actionablePage: Page,
+  passivePage: Page,
+  fixture: Pick<GameplayFixture, 'table_id' | 'community_id'>,
+  timeout = 45_000,
+): Promise<Array<'check' | 'call' | 'fold'>> => {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const [actionableActions, passiveActions, passiveGameVisible, passiveReconnect] = await Promise.all([
+      getEnabledActions(actionablePage),
+      getEnabledActions(passivePage),
+      passivePage.getByTestId('game-table').isVisible().catch(() => false),
+      passivePage.getByTestId('reconnecting-overlay').isVisible().catch(() => false),
+    ]);
+
+    const passiveOnExpectedRoute = passivePage.url().includes(`/game/${fixture.table_id}?communityId=${fixture.community_id}`);
+    if (
+      actionableActions.length > 0
+      && passiveActions.length === 0
+      && passiveOnExpectedRoute
+      && passiveGameVisible
+      && !passiveReconnect
+    ) {
+      return actionableActions;
+    }
+
+    await actionablePage.waitForTimeout(200);
+  }
+
+  throw new Error(`Timed out waiting for actionability pair: actionable=${actionablePage.url()} passive=${passivePage.url()}`);
+};
+
+export const awaitReconnectingOverlay = async (page: Page, timeout = 10_000): Promise<void> => {
+  await expect(page.getByTestId('reconnecting-overlay')).toBeVisible({ timeout });
 };
 
 export const locatorByDataValue = (page: Page, testId: string, attributeName: string, attributeValue: string | number) => {
@@ -503,6 +747,111 @@ export const summarizeSeatAssignments = (seats: Array<Record<string, unknown>>):
   );
 };
 
+const normalizeSnapshotId = (value: unknown): string | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const normalized = String(value).trim();
+  return normalized.length > 0 ? normalized : null;
+};
+
+export const captureSeatSnapshot = async (
+  userA: AuthenticatedApiUser,
+  userB: AuthenticatedApiUser,
+  tableId: number,
+): Promise<SeatSnapshot> => {
+  const [seats, activeSeatA, activeSeatB] = await Promise.all([
+    getTableSeats(userA.request, tableId),
+    getActiveSeatStatus(userA.request),
+    getActiveSeatStatus(userB.request),
+  ]);
+
+  const findSeatForUser = (userId: number): number | null => {
+    const seat = seats.find((entry) => Number(entry.user_id) === userId);
+    return seat ? Number(seat.seat_number) : null;
+  };
+
+  return {
+    tableId: String(tableId),
+    userA: {
+      userId: String(userA.userId),
+      seatNumber: findSeatForUser(userA.userId),
+      activeSeatTableId: normalizeSnapshotId(activeSeatA.table_id),
+      activeSeatNumber: activeSeatA.seat_number === undefined || activeSeatA.seat_number === null ? null : Number(activeSeatA.seat_number),
+    },
+    userB: {
+      userId: String(userB.userId),
+      seatNumber: findSeatForUser(userB.userId),
+      activeSeatTableId: normalizeSnapshotId(activeSeatB.table_id),
+      activeSeatNumber: activeSeatB.seat_number === undefined || activeSeatB.seat_number === null ? null : Number(activeSeatB.seat_number),
+    },
+    seats: seats
+      .filter((entry) => entry.user_id !== null && entry.user_id !== undefined)
+      .map((entry) => ({
+        userId: String(entry.user_id),
+        seatNumber: Number(entry.seat_number),
+      }))
+      .sort((left, right) => left.seatNumber - right.seatNumber),
+  };
+};
+
+export const assertSeatSnapshot = (
+  snapshot: SeatSnapshot,
+  expected: {
+    tableId: number | string;
+    userAId: number | string;
+    userBId: number | string;
+    userASeatNumber: number | null;
+    userBSeatNumber: number | null;
+  },
+): void => {
+  expect(snapshot.tableId).toBe(String(expected.tableId));
+  expect(snapshot.userA.userId).toBe(String(expected.userAId));
+  expect(snapshot.userB.userId).toBe(String(expected.userBId));
+  expect(snapshot.userA.seatNumber).toBe(expected.userASeatNumber);
+  expect(snapshot.userB.seatNumber).toBe(expected.userBSeatNumber);
+};
+
+export const assertNoSeatDrift = (before: SeatSnapshot, after: SeatSnapshot): void => {
+  expect(after.tableId).toBe(before.tableId);
+  expect(after.userA.userId).toBe(before.userA.userId);
+  expect(after.userB.userId).toBe(before.userB.userId);
+  expect(after.userA.seatNumber).toBe(before.userA.seatNumber);
+  expect(after.userB.seatNumber).toBe(before.userB.seatNumber);
+  expect(after.userA.activeSeatTableId).toBe(before.userA.activeSeatTableId);
+  expect(after.userB.activeSeatTableId).toBe(before.userB.activeSeatTableId);
+  expect(after.userA.activeSeatNumber).toBe(before.userA.activeSeatNumber);
+  expect(after.userB.activeSeatNumber).toBe(before.userB.activeSeatNumber);
+
+  const seatKeys = after.seats.map((entry) => `${entry.userId}:${entry.seatNumber}`);
+  expect(new Set(seatKeys).size).toBe(seatKeys.length);
+  expect(after.seats).toEqual(before.seats);
+};
+
+export const assertUserNotOccupyingSeat = async (
+  page: Page,
+  username: string,
+  seatNumber: number,
+): Promise<void> => {
+  const locator = locatorByDataValue(page, 'seat-player-name', 'data-seat-number', seatNumber);
+  const count = await locator.count();
+  if (count === 0) {
+    return;
+  }
+  const text = (await locator.first().textContent())?.trim() ?? '';
+  expect(text).not.toBe(username);
+};
+
+export const getConnectionState = async (page: Page): Promise<string> => {
+  if (await page.getByTestId('reconnecting-overlay').isVisible().catch(() => false)) {
+    return 'reconnecting';
+  }
+  if (await page.getByTestId('game-table').isVisible().catch(() => false)) {
+    return 'connected';
+  }
+  return 'unknown';
+};
+
 export const readVisibleBannerText = async (page: Page, selector: string): Promise<string | null> => {
   return page.evaluate((targetSelector) => {
     const element = document.querySelector(targetSelector);
@@ -517,6 +866,171 @@ export const readVisibleBannerText = async (page: Page, selector: string): Promi
     return text || null;
   }, selector);
 };
+
+export const describePageState = async (page: Page, name: string) => {
+  const [actions, seatLostBanner, errorBanner, bustedBanner, reconnectingVisible, connectionState] = await Promise.all([
+    getEnabledActions(page),
+    readVisibleBannerText(page, '[data-testid="seat-lost-banner"]').catch(() => null),
+    readVisibleBannerText(page, '.error-banner').catch(() => null),
+    readVisibleBannerText(page, '.busted-banner').catch(() => null),
+    page.getByTestId('reconnecting-overlay').isVisible().catch(() => false),
+    getConnectionState(page),
+  ]);
+
+  return {
+    name,
+    url: page.url(),
+    actions,
+    seatLostBanner,
+    errorBanner,
+    bustedBanner,
+    reconnectingVisible,
+    connectionState,
+  };
+};
+
+export const assertGameplayStillHealthy = async (
+  fixture: GameplayFixture,
+  pageA: Page,
+  pageB: Page,
+  userAApi: AuthenticatedApiUser,
+  userBApi: AuthenticatedApiUser,
+): Promise<void> => {
+  const expectedGameUrl = `/game/${fixture.table_id}?communityId=${fixture.community_id}`;
+  const pageDiagnostics = await Promise.all([
+    describePageState(pageA, fixture.users[0].username),
+    describePageState(pageB, fixture.users[1].username),
+  ]);
+
+  for (const diagnostic of pageDiagnostics) {
+    if (!diagnostic.url.includes(expectedGameUrl)) {
+      throw new Error(`Gameplay state lost: ${JSON.stringify(pageDiagnostics)}`);
+    }
+    if (diagnostic.bustedBanner || (diagnostic.errorBanner && /timed out|removed from the table/i.test(diagnostic.errorBanner))) {
+      throw new Error(`Gameplay state unhealthy: ${JSON.stringify(pageDiagnostics)}`);
+    }
+  }
+
+  const seats = await getTableSeats(userAApi.request, fixture.table_id);
+  const seatSummary = summarizeSeatAssignments(seats);
+  if (seatSummary[1] !== userAApi.userId || seatSummary[2] !== userBApi.userId) {
+    throw new Error(`Seat assignments changed during gameplay: ${JSON.stringify({ seatSummary, pageDiagnostics })}`);
+  }
+};
+
+export class GameplayCoordinator {
+  private paused = false;
+  private inFlight = false;
+
+  constructor(
+    private readonly pageA: Page,
+    private readonly pageB: Page,
+    private readonly userAApi: AuthenticatedApiUser,
+    private readonly userBApi: AuthenticatedApiUser,
+    private readonly fixture: GameplayFixture,
+    private readonly summary?: SummaryTracker,
+  ) {}
+
+  async pauseAndDrain(): Promise<void> {
+    this.paused = true;
+    while (this.inFlight) {
+      await this.pageA.waitForTimeout(50);
+    }
+  }
+
+  resume(): void {
+    this.paused = false;
+  }
+
+  async captureDiagnostics(): Promise<void> {
+    const [pageAState, pageBState] = await Promise.all([
+      describePageState(this.pageA, this.fixture.users[0].username),
+      describePageState(this.pageB, this.fixture.users[1].username),
+    ]);
+    await this.summary?.update({
+      page_a_url: pageAState.url,
+      page_b_url: pageBState.url,
+      page_a_actionable: pageAState.actions.length > 0,
+      page_b_actionable: pageBState.actions.length > 0,
+      page_a_connection_state: pageAState.connectionState,
+      page_b_connection_state: pageBState.connectionState,
+      reconnecting_overlay_observed_page_a: pageAState.reconnectingVisible,
+      reconnecting_overlay_observed_page_b: pageBState.reconnectingVisible,
+      last_observed_banner: pageAState.seatLostBanner ?? pageBState.seatLostBanner ?? null,
+    });
+  }
+
+  async playUntilPersistedHand(options: {
+    deadlineMs: number;
+    idleFailureMs?: number;
+    healthCheckIntervalMs?: number;
+  }): Promise<{ handId: string; detail: Record<string, unknown> }> {
+    const deadlineAt = Date.now() + options.deadlineMs;
+    const idleFailureMs = options.idleFailureMs ?? 20_000;
+    const healthCheckIntervalMs = options.healthCheckIntervalMs ?? 5_000;
+    let lastProgressAt = Date.now();
+    let lastHealthCheckAt = 0;
+
+    while (Date.now() < deadlineAt) {
+      if (this.paused) {
+        await this.pageA.waitForTimeout(100);
+        continue;
+      }
+
+      const persistedHand = await findCommonPersistedHand(this.userAApi, this.userBApi, this.fixture);
+      if (persistedHand) {
+        await this.summary?.update({ common_hand_id: persistedHand.handId });
+        return persistedHand;
+      }
+
+      const [actionsA, actionsB] = await Promise.all([
+        getEnabledActions(this.pageA),
+        getEnabledActions(this.pageB),
+      ]);
+
+      const actionablePages = [
+        { page: this.pageA, actions: actionsA },
+        { page: this.pageB, actions: actionsB },
+      ].filter((entry) => entry.actions.length > 0);
+
+      if (actionablePages.length > 1) {
+        const diagnostics = await Promise.all([
+          describePageState(this.pageA, this.fixture.users[0].username),
+          describePageState(this.pageB, this.fixture.users[1].username),
+        ]);
+        throw new Error(`Both pages appeared actionable at once: ${JSON.stringify(diagnostics)}`);
+      }
+
+      if (actionablePages.length === 1) {
+        this.inFlight = true;
+        try {
+          const activePage = actionablePages[0];
+          await clickHighestPriorityAction(activePage.page);
+          await waitForActionStateChange(activePage.page, activePage.actions);
+          lastProgressAt = Date.now();
+          await this.captureDiagnostics();
+        } finally {
+          this.inFlight = false;
+        }
+      } else {
+        await this.pageA.waitForTimeout(250);
+      }
+
+      if (Date.now() - lastProgressAt > idleFailureMs) {
+        await this.captureDiagnostics();
+        throw new Error(`Gameplay coordinator made no progress for ${idleFailureMs}ms`);
+      }
+
+      if (Date.now() - lastHealthCheckAt > healthCheckIntervalMs) {
+        await assertGameplayStillHealthy(this.fixture, this.pageA, this.pageB, this.userAApi, this.userBApi);
+        lastHealthCheckAt = Date.now();
+      }
+    }
+
+    await this.captureDiagnostics();
+    throw new Error('Timed out waiting for a persisted common hand');
+  }
+}
 
 export const disposeApiUsers = async (...users: Array<AuthenticatedApiUser | null | undefined>): Promise<void> => {
   for (const user of users) {

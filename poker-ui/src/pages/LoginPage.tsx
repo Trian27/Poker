@@ -7,7 +7,7 @@ import { useAuth } from '../auth-context';
 import { authApi, tablesApi } from '../api';
 import './AuthPages.css';
 import { getApiErrorMessage, getApiErrorStatus } from '../utils/error';
-import { clearAutoRejoinSuppression, isAutoRejoinSuppressed } from '../utils/activeSeatRejoin';
+import { isAutoRejoinSuppressedForUserTable } from '../utils/activeSeatRejoin';
 import { hasSeenDormstacks, markDormstacksSeen } from '../utils/visitorState';
 
 export const LoginPage: React.FC = () => {
@@ -34,7 +34,7 @@ export const LoginPage: React.FC = () => {
   const [recoveredUsername, setRecoveredUsername] = useState('');
   
   const navigate = useNavigate();
-  const { login, isAuthenticated, isReady } = useAuth();
+  const { login, isAuthenticated, isReady, user } = useAuth();
   const hasAutoRedirectedRef = useRef(false);
   const brandHeading = (
     <h1 className="brand-title">
@@ -51,17 +51,16 @@ export const LoginPage: React.FC = () => {
     }
   }, [navigate]);
 
-  const navigateAfterLogin = useCallback(async () => {
-    if (isAutoRejoinSuppressed()) {
-      clearAutoRejoinSuppression();
-      navigate('/dashboard', { replace: true });
-      return;
-    }
-
+  const navigateAfterLogin = useCallback(async (nextUserId?: number | null) => {
+    const effectiveUserId = nextUserId ?? user?.id ?? null;
     setIsRejoiningTable(true);
     try {
       const activeSeat = await tablesApi.getMyActiveSeat();
       if (activeSeat?.active && activeSeat.table_id) {
+        if (isAutoRejoinSuppressedForUserTable(effectiveUserId, activeSeat.table_id)) {
+          navigate('/dashboard', { replace: true });
+          return;
+        }
         const communityParam = activeSeat.community_id ? `?communityId=${activeSeat.community_id}` : '';
         navigate(`/game/${activeSeat.table_id}${communityParam}`, { replace: true });
         return;
@@ -73,7 +72,7 @@ export const LoginPage: React.FC = () => {
     }
 
     navigate('/dashboard', { replace: true });
-  }, [navigate]);
+  }, [navigate, user?.id]);
 
   useEffect(() => {
     if (!isReady || !isAuthenticated || showVerification || showRecovery || hasAutoRedirectedRef.current) {
@@ -111,7 +110,7 @@ export const LoginPage: React.FC = () => {
       
       login(response.access_token, user, { persist: staySignedIn });
       markDormstacksSeen();
-      await navigateAfterLogin();
+      await navigateAfterLogin(user.id);
     } catch (err: unknown) {
       if (getApiErrorStatus(err) === 401) {
         const generic = 'Incorrect username or password.';
@@ -144,7 +143,7 @@ export const LoginPage: React.FC = () => {
       
       login(response.access_token, user, { persist: staySignedIn });
       markDormstacksSeen();
-      await navigateAfterLogin();
+      await navigateAfterLogin(user.id);
     } catch (err: unknown) {
       setError(getApiErrorMessage(err, 'Verification failed. Please try again.'));
     } finally {
