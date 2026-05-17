@@ -117,9 +117,21 @@ Run the repo test driver from the project root:
 
 ```bash
 ./scripts/test-gameplay.sh full
+./scripts/test-gameplay.sh compose-browser-pr-smoke
 ./scripts/test-gameplay.sh compose-autonomous
 ./scripts/test-gameplay.sh compose-browser-e2e
 ```
+
+### Browser Test Layers
+- Mocked UI smoke:
+  - `npm run test:e2e:gameplay`
+  - fast PR UI and routing sanity
+- Compose Browser PR Smoke:
+  - `./scripts/test-gameplay.sh compose-browser-pr-smoke`
+  - required real-stack happy path only
+- Compose Browser E2E:
+  - `./scripts/test-gameplay.sh compose-browser-e2e`
+  - scheduled/manual heavy suite for happy path + queue + reconnect
 
 ## Additional Guides
 

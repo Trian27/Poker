@@ -102,6 +102,7 @@ wait_for_url() {
 
 cleanup_compose() {
   local exit_code="$?"
+  local teardown_exit_code=0
   trap - EXIT INT TERM
 
   if [[ "$COMPOSE_ACTIVE" == "1" ]]; then
@@ -109,7 +110,16 @@ cleanup_compose() {
     compose_cmd config > "$ARTIFACT_DIR/compose-config.yaml" 2>&1 || true
     compose_cmd ps > "$ARTIFACT_DIR/compose-ps.txt" 2>&1 || true
     compose_cmd logs --no-color "${COMPOSE_SERVICES[@]}" > "$ARTIFACT_DIR/compose.log" 2>&1 || true
-    compose_cmd down -v --remove-orphans > "$ARTIFACT_DIR/compose-down.log" 2>&1 || true
+    if compose_cmd down -v --remove-orphans > "$ARTIFACT_DIR/compose-down.log" 2>&1; then
+      printf 'compose_teardown_succeeded=true\n' > "$ARTIFACT_DIR/compose-teardown-status.txt"
+    else
+      teardown_exit_code="$?"
+      printf 'compose_teardown_succeeded=false\n' > "$ARTIFACT_DIR/compose-teardown-status.txt"
+    fi
+  fi
+
+  if [[ "$teardown_exit_code" -ne 0 && "$exit_code" -eq 0 ]]; then
+    exit_code="$teardown_exit_code"
   fi
 
   exit "$exit_code"
@@ -184,13 +194,16 @@ run_compose_mode() {
   fi
 }
 
-run_compose_browser_e2e() {
+run_compose_browser_suite() {
+  local service_log_dir="$1"
+  local npm_script="$2"
+  local full_stack_mode="$3"
   COMPOSE_SERVICES=(postgres-db redis-cache auth-api game-server react-ui)
   COMPOSE_ACTIVE=1
 
   local timestamp
   timestamp="$(date +%Y%m%d-%H%M%S)"
-  ARTIFACT_DIR="$ROOT_DIR/logs/compose-browser-e2e/$timestamp"
+  ARTIFACT_DIR="$ROOT_DIR/logs/$service_log_dir/$timestamp"
   mkdir -p "$ARTIFACT_DIR"
 
   trap cleanup_compose EXIT
@@ -227,7 +240,9 @@ run_compose_browser_e2e() {
   local browser_log="$ARTIFACT_DIR/browser-e2e.log"
   (
     cd "$ROOT_DIR/poker-ui"
+    # Smoke mode intentionally targets only happy-path.spec.ts via the npm script.
     PLAYWRIGHT_FULL_STACK=1 \
+    PLAYWRIGHT_FULL_STACK_MODE="$full_stack_mode" \
     PLAYWRIGHT_SKIP_WEB_SERVER=1 \
     PLAYWRIGHT_BASE_URL="http://localhost:${REACT_UI_HOST_PORT}" \
     PLAYWRIGHT_AUTH_API_URL="http://localhost:${AUTH_API_HOST_PORT}" \
@@ -237,7 +252,7 @@ run_compose_browser_e2e() {
     PLAYWRIGHT_OUTPUT_DIR="$ARTIFACT_DIR/test-results" \
     ADMIN_USERNAME="$ADMIN_USERNAME" \
     ADMIN_PASSWORD="$ADMIN_PASSWORD" \
-    npm run test:e2e:gameplay:full-stack
+    npm run "$npm_script"
   ) 2>&1 | tee "$browser_log"
 }
 
@@ -253,11 +268,14 @@ case "$MODE" in
   compose-human-vs-bot)
     run_compose_mode "human-vs-bot" "compose-human-vs-bot" postgres-db redis-cache auth-api game-server react-ui
     ;;
+  compose-browser-pr-smoke)
+    run_compose_browser_suite "compose-browser-pr-smoke" "test:e2e:gameplay:full-stack:smoke" "compose-browser-pr-smoke"
+    ;;
   compose-browser-e2e)
-    run_compose_browser_e2e
+    run_compose_browser_suite "compose-browser-e2e" "test:e2e:gameplay:full-stack" "compose-browser-e2e"
     ;;
   *)
-    echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot|compose-browser-e2e] [driver args...]" >&2
+    echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot|compose-browser-pr-smoke|compose-browser-e2e] [driver args...]" >&2
     exit 1
     ;;
 esac

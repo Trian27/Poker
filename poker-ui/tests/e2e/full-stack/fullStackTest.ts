@@ -33,6 +33,9 @@ export const GAME_SERVER_URL = process.env.PLAYWRIGHT_GAME_SERVER_URL;
 export const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 export const ARTIFACT_ROOT_DIR = process.env.PLAYWRIGHT_ARTIFACT_DIR || 'test-results/browser-full-stack';
+export const FULL_STACK_MODE =
+  (process.env.PLAYWRIGHT_FULL_STACK_MODE as 'compose-browser-pr-smoke' | 'compose-browser-e2e' | undefined)
+  || 'compose-browser-e2e';
 export const BROWSER_VIEWPORT = { width: 1366, height: 768 };
 const CLEANUP_TIMEOUT_MS = 60_000;
 
@@ -92,7 +95,7 @@ export class FullStackRuntime {
   constructor(private readonly browser: Browser, scenario: string) {
     this.scenario = scenario;
     this.artifactDir = createScenarioArtifactDir(ARTIFACT_ROOT_DIR, scenario);
-    this.summary = new SummaryTracker(this.artifactDir, scenario);
+    this.summary = new SummaryTracker(this.artifactDir, scenario, FULL_STACK_MODE);
     this.runTag = validateRunTag(generateRunTag(scenario));
 
     const missingEnv = Object.entries(requiredEnv)

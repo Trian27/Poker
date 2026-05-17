@@ -43,6 +43,16 @@ PYTHON_BIN=/Users/your-user/.virtualenvs/poker/bin/python
 All repo shell runners use `PYTHON_BIN` directly. They do not require manual virtualenv activation.
 
 ## Main Entry Points
+### Browser compose layers
+Use these two browser compose modes deliberately:
+
+- `./scripts/test-gameplay.sh compose-browser-pr-smoke`
+  - exact happy-path full-stack browser smoke
+  - intended for PR gating
+- `./scripts/test-gameplay.sh compose-browser-e2e`
+  - heavy scheduled/manual browser suite
+  - covers happy path + queue promotion + reconnect
+
 ### Automated compose-backed backend/runtime E2E
 Run from repo root:
 
