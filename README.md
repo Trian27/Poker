@@ -118,6 +118,7 @@ Run the repo test driver from the project root:
 ```bash
 ./scripts/test-gameplay.sh full
 ./scripts/test-gameplay.sh compose-browser-pr-smoke
+./scripts/test-gameplay.sh compose-browser-queue-pr
 ./scripts/test-gameplay.sh compose-autonomous
 ./scripts/test-gameplay.sh compose-browser-e2e
 ```
@@ -129,9 +130,15 @@ Run the repo test driver from the project root:
 - Compose Browser PR Smoke:
   - `./scripts/test-gameplay.sh compose-browser-pr-smoke`
   - required real-stack happy path only
+- Compose Browser Queue PR Shadow:
+  - `./scripts/test-gameplay.sh compose-browser-queue-pr`
+  - informational PR/merge-group queue promotion shadow
+  - runs only `tests/e2e/full-stack/queue.spec.ts`
 - Compose Browser E2E:
   - `./scripts/test-gameplay.sh compose-browser-e2e`
   - scheduled/manual heavy suite for happy path + queue + reconnect
+
+These compose browser modes assume GitHub-hosted isolated runners in CI. If they are ever moved to shared or self-hosted runners, fixed host ports will need unique per-run values or a global compose lock.
 
 ## Additional Guides
 

@@ -103,7 +103,7 @@ interface DisruptionSummary {
 }
 
 interface FullStackSummary {
-  mode: 'compose-browser-pr-smoke' | 'compose-browser-e2e';
+  mode: 'compose-browser-pr-smoke' | 'compose-browser-queue-pr' | 'compose-browser-e2e';
   scenario: string;
   required_check: boolean;
   phase: string;

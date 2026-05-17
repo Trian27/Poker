@@ -44,14 +44,20 @@ All repo shell runners use `PYTHON_BIN` directly. They do not require manual vir
 
 ## Main Entry Points
 ### Browser compose layers
-Use these two browser compose modes deliberately:
+Use these three browser compose modes deliberately:
 
 - `./scripts/test-gameplay.sh compose-browser-pr-smoke`
   - exact happy-path full-stack browser smoke
   - intended for PR gating
+- `./scripts/test-gameplay.sh compose-browser-queue-pr`
+  - exact queue-promotion full-stack browser shadow
+  - runs only `tests/e2e/full-stack/queue.spec.ts`
+  - runs on PRs/merge-group only after `compose-browser-pr-smoke` passes
 - `./scripts/test-gameplay.sh compose-browser-e2e`
   - heavy scheduled/manual browser suite
   - covers happy path + queue promotion + reconnect
+
+These browser compose lanes rely on isolated GitHub-hosted runners. On shared or self-hosted runners, fixed host ports are not safe without unique per-run host ports or a global compose lock.
 
 ### Automated compose-backed backend/runtime E2E
 Run from repo root:
