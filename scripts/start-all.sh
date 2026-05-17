@@ -19,6 +19,9 @@ NC='\033[0m' # No Color
 
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+source "$SCRIPT_DIR/python-env.sh"
+PYTHON_BIN="${PYTHON_BIN:-$(resolve_repo_python_bin "$SCRIPT_DIR")}"
+PIP_BIN="$(dirname "$PYTHON_BIN")/pip"
 
 # Create logs directory if it doesn't exist
 mkdir -p "$SCRIPT_DIR/logs"
@@ -37,12 +40,11 @@ echo ""
 echo -e "${BLUE}Starting FastAPI Backend (Port 8000)...${NC}"
 cd "$SCRIPT_DIR/poker-api"
 
-# Use workon poker virtual environment
-source ~/.virtualenvs/poker/bin/activate
-pip install -q -r requirements.txt
+# Use configured poker virtual environment tools directly
+"$PIP_BIN" install -q -r requirements.txt
 
 # Start FastAPI
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > ../logs/fastapi.log 2>&1 &
+"$PYTHON_BIN" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > ../logs/fastapi.log 2>&1 &
 FASTAPI_PID=$!
 echo -e "${GREEN}✅ FastAPI started (PID: $FASTAPI_PID)${NC}"
 echo ""
@@ -76,12 +78,9 @@ echo ""
 echo -e "${BLUE}Starting Agent API Service (Port 8001)...${NC}"
 cd "$SCRIPT_DIR/poker-agent-api"
 
-# Use workon poker virtual environment
-source ~/.virtualenvs/poker/bin/activate
-pip install -q -r requirements.txt
-
 # Start Agent API
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8001 > ../logs/agentapi.log 2>&1 &
+"$PIP_BIN" install -q -r requirements.txt
+"$PYTHON_BIN" -m uvicorn app.main:app --host 0.0.0.0 --port 8001 > ../logs/agentapi.log 2>&1 &
 AGENTAPI_PID=$!
 echo -e "${GREEN}✅ Agent API started (PID: $AGENTAPI_PID)${NC}"
 echo ""

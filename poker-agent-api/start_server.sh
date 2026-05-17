@@ -1,10 +1,15 @@
 #!/bin/bash
+set -euo pipefail
+
 # Start script for Poker Agent API
 
 echo "🤖 Starting Poker Agent API..."
 
-# Activate virtual environment
-source ~/.virtualenvs/poker/bin/activate
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$ROOT_DIR/scripts/python-env.sh"
+PYTHON_BIN="$(resolve_repo_python_bin "$ROOT_DIR")"
 
 # Start the server
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
+cd "$SCRIPT_DIR"
+"$PYTHON_BIN" -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8001

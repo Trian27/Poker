@@ -44,12 +44,14 @@ CREATE DATABASE poker_db;
 ```bash
 cd /Users/trian/Projects/Poker/poker-api
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On macOS/Linux
+# Copy the repo env template and point PYTHON_BIN at your virtualenv
+cp ../.env.example ../.env
+# Edit ../.env and set PYTHON_BIN=/absolute/path/to/your/virtualenv/bin/python
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies using the configured interpreter
+source ../scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$(cd .. && pwd)")"
+"$PYTHON_BIN" -m pip install -r requirements.txt
 
 # Set environment variables (optional - defaults shown)
 export DATABASE_URL="postgresql://user:password@localhost/poker_db"
@@ -58,7 +60,7 @@ export ALGORITHM="HS256"
 export ACCESS_TOKEN_EXPIRE_MINUTES="30"
 
 # Run the server
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+"$PYTHON_BIN" -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 The API will be available at: `http://localhost:8000`
@@ -102,8 +104,9 @@ The frontend will be available at: `http://localhost:5173`
 
 ```bash
 cd /Users/trian/Projects/Poker/poker-api
-source venv/bin/activate
-python test_chunk2.py
+source ../scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$(cd .. && pwd)")"
+"$PYTHON_BIN" test_chunk2.py
 ```
 
 Expected output: All 15 tests should pass ✅

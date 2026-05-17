@@ -69,6 +69,16 @@ The Poker Platform is a comprehensive system designed to manage online poker gam
 ### Prerequisites
 - Docker and Docker Compose installed.
 - Node.js and Python installed for development.
+- Copy `.env.example` to `.env` and set `PYTHON_BIN` to the exact Python interpreter inside your local virtual environment.
+
+### Local Python Configuration
+Repo shell scripts do not rely on activating a virtualenv in your shell. They read `PYTHON_BIN` from `.env` and use that interpreter directly.
+
+Example:
+
+```dotenv
+PYTHON_BIN=/Users/your-user/.virtualenvs/poker/bin/python
+```
 
 ### Steps
 1. Clone the repository:
@@ -76,43 +86,57 @@ The Poker Platform is a comprehensive system designed to manage online poker gam
   git clone <repository-url>
   cd Poker
   ```
-2. Start all services (Docker):
+2. Copy the environment template and set your Python interpreter:
+  ```bash
+  cp .env.example .env
+  # Edit .env and set PYTHON_BIN to your virtualenv's python
+  ```
+3. Start all services (Docker):
   ```bash
   docker-compose up --build
   ```
-3. Start all services (Non-Docker, development mode):
+4. Start all services (Non-Docker, development mode):
   ```bash
   ./scripts/start-all.sh
   ```
-4. Stop all services (Non-Docker):
+5. Stop all services (Non-Docker):
   ```bash
   ./scripts/stop-all.sh
   ```
-5. Verify services are running:
+6. Verify services are running:
   ```bash
   ./docker-health-check.sh
   ```
-6. Access the platform:
+7. Access the platform:
   - Backend API: `http://localhost:8000`
   - Game Server: `http://localhost:3000`
   - Frontend: `http://localhost:5173`
 
+### Test Entry Points
+Run the repo test driver from the project root:
+
+```bash
+./scripts/test-gameplay.sh full
+./scripts/test-gameplay.sh compose-autonomous
+./scripts/test-gameplay.sh compose-browser-e2e
+```
+
 ## Additional Guides
 
 ### Deployment Guide
-For detailed deployment instructions, see [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md).
+For detailed deployment instructions, see [DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md).
 
 ### Quickstart Guide
-For a quick setup, see [QUICKSTART.md](QUICKSTART.md).
+For a quick setup, see [QUICKSTART.md](docs/QUICKSTART.md).
 
 ### Docker Guide
-For containerized deployment, see [DOCKER_GUIDE.md](DOCKER_GUIDE.md).
+For containerized deployment, see [DOCKER_GUIDE.md](docs/DOCKER_GUIDE.md).
 
 ### Technical Decisions
-For architectural decisions and design patterns, see [TECHNICAL_DECISIONS.md](TECHNICAL_DECISIONS.md).
+For architectural decisions and design patterns, see [TECHNICAL_DECISIONS.md](docs/TECHNICAL_DECISIONS.md).
 
 ### Testing Status
-For testing coverage and status, see [TESTING_STATUS.md](TESTING_STATUS.md).
+For testing coverage and status, see [TESTING_STATUS.md](docs/TESTING_STATUS.md).
 
 ### Operations Runbook
 For maintenance safety checks (including DB target verification before cleanup), see [OPERATIONS_RUNBOOK.md](docs/OPERATIONS_RUNBOOK.md).

@@ -2,10 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/python-env.sh"
 MODE="${1:-pr}"
 shift || true
 EXTRA_ARGS=("$@")
-PYTHON_BIN="${PYTHON_BIN:-$HOME/.virtualenvs/poker/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$(resolve_repo_python_bin "$ROOT_DIR")}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-poker-gameplay-e2e}"
 POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-15432}"
 REDIS_HOST_PORT="${REDIS_HOST_PORT:-16379}"
@@ -37,8 +38,8 @@ resolve_python_bin() {
   fi
 
   echo "Could not find PYTHON_BIN: $PYTHON_BIN" >&2
-  echo "Expected local default: ~/.virtualenvs/poker/bin/python" >&2
-  echo "Set PYTHON_BIN=python or run the documented bootstrap command." >&2
+  echo "Expected configured interpreter from .env or local default: ~/.virtualenvs/poker/bin/python" >&2
+  echo "Set PYTHON_BIN or PYTHON_VENV in .env, or export PYTHON_BIN explicitly." >&2
   exit 1
 }
 
@@ -161,15 +162,26 @@ run_compose_mode() {
   resolve_python_bin
   echo "==> Running autonomous gameplay driver"
   local driver_log="$ARTIFACT_DIR/driver.log"
-  "$PYTHON_BIN" "$ROOT_DIR/scripts/test_autonomous_bot_gameplay.py" \
-    --mode "$gameplay_mode" \
-    --auth-api-url "http://localhost:${AUTH_API_HOST_PORT}" \
-    --game-server-url "http://localhost:${GAME_SERVER_HOST_PORT}" \
-    --ui-url "http://localhost:${REACT_UI_HOST_PORT}" \
-    --admin-username "$ADMIN_USERNAME" \
-    --admin-password "$ADMIN_PASSWORD" \
-    --artifact-dir "$ARTIFACT_DIR" \
-    "${EXTRA_ARGS[@]}" 2>&1 | tee "$driver_log"
+  if ((${#EXTRA_ARGS[@]} > 0)); then
+    "$PYTHON_BIN" "$ROOT_DIR/scripts/test_autonomous_bot_gameplay.py" \
+      --mode "$gameplay_mode" \
+      --auth-api-url "http://localhost:${AUTH_API_HOST_PORT}" \
+      --game-server-url "http://localhost:${GAME_SERVER_HOST_PORT}" \
+      --ui-url "http://localhost:${REACT_UI_HOST_PORT}" \
+      --admin-username "$ADMIN_USERNAME" \
+      --admin-password "$ADMIN_PASSWORD" \
+      --artifact-dir "$ARTIFACT_DIR" \
+      "${EXTRA_ARGS[@]}" 2>&1 | tee "$driver_log"
+  else
+    "$PYTHON_BIN" "$ROOT_DIR/scripts/test_autonomous_bot_gameplay.py" \
+      --mode "$gameplay_mode" \
+      --auth-api-url "http://localhost:${AUTH_API_HOST_PORT}" \
+      --game-server-url "http://localhost:${GAME_SERVER_HOST_PORT}" \
+      --ui-url "http://localhost:${REACT_UI_HOST_PORT}" \
+      --admin-username "$ADMIN_USERNAME" \
+      --admin-password "$ADMIN_PASSWORD" \
+      --artifact-dir "$ARTIFACT_DIR" 2>&1 | tee "$driver_log"
+  fi
 }
 
 run_compose_browser_e2e() {

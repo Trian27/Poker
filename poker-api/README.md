@@ -12,16 +12,19 @@ FastAPI service for authentication, league/community management, and wallet oper
 
 ## Quick Start
 
-### 1. Activate Virtual Environment
+### 1. Configure Python Interpreter
 
 ```bash
-source venv/bin/activate
+cp ../.env.example ../.env
+# Edit ../.env and set PYTHON_BIN to your virtualenv's python
 ```
 
 ### 2. Run the Server
 
 ```bash
-uvicorn app.main:app --reload --port 8000
+source ../scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$(cd .. && pwd)")"
+"$PYTHON_BIN" -m uvicorn app.main:app --reload --port 8000
 ```
 
 The API will be available at `http://localhost:8000`
@@ -49,7 +52,9 @@ The API uses PostgreSQL with SQLAlchemy ORM. Database: `poker_platform`
 League creation is restricted to admin users. To create or promote an admin:
 
 ```bash
-python poker-api/scripts/create_admin_user.py \
+source ../scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$(cd .. && pwd)")"
+"$PYTHON_BIN" poker-api/scripts/create_admin_user.py \
   --username admin \
   --email admin@example.com \
   --password change-me
@@ -64,7 +69,9 @@ to force a password reset for that user.
 If the user already exists and you want to reset the password:
 
 ```bash
-python poker-api/scripts/create_admin_user.py \
+source ../scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$(cd .. && pwd)")"
+"$PYTHON_BIN" poker-api/scripts/create_admin_user.py \
   --username admin \
   --email admin@example.com \
   --password new-password \
