@@ -327,7 +327,7 @@ npx playwright install
 ### Test 1: Basic Auth Flow (5 minutes)
 ```bash
 # Start all services
-./start-all.sh
+./scripts/start-all.sh
 
 # In browser:
 1. Go to http://localhost:5173
@@ -355,7 +355,7 @@ npx playwright install
 ### Test 3: Two-Player Game (10 minutes)
 ```bash
 # Terminal 1: Start services
-./start-all.sh
+./scripts/start-all.sh
 
 # Browser 1: testuser1
 1. Login, join community, click "Join Game"
@@ -442,9 +442,9 @@ npm test
 
 #### FastAPI Tests:
 ```bash
-cd poker-api
-source venv/bin/activate
-python test_chunk2.py
+source scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$PWD")"
+cd poker-api && "$PYTHON_BIN" test_chunk2.py
 ```
 
 #### Build Verification:

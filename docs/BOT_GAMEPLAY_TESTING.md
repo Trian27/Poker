@@ -23,7 +23,7 @@ That is intentional:
 - compose-backed E2E does not contaminate normal dev data
 
 ## Local Python Environment
-Local execution should go through the `poker` virtualenv.
+Local execution should go through the interpreter configured in the repo `.env`.
 
 Bootstrap once:
 
@@ -34,7 +34,13 @@ Bootstrap once:
   -r poker-agent-api/requirements.txt
 ```
 
-If you keep a different interpreter, set `PYTHON_BIN=python` explicitly when invoking the shell runner.
+Then set `.env`:
+
+```dotenv
+PYTHON_BIN=/Users/your-user/.virtualenvs/poker/bin/python
+```
+
+All repo shell runners use `PYTHON_BIN` directly. They do not require manual virtualenv activation.
 
 ## Main Entry Points
 ### Automated compose-backed backend/runtime E2E
@@ -82,7 +88,9 @@ You can still run the gameplay driver directly if you already have services runn
 Automated bot-vs-bot example:
 
 ```bash
-~/.virtualenvs/poker/bin/python scripts/test_autonomous_bot_gameplay.py \
+source scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$PWD")"
+"$PYTHON_BIN" scripts/test_autonomous_bot_gameplay.py \
   --mode bot-vs-bot \
   --auth-api-url http://localhost:8000 \
   --game-server-url http://localhost:3000 \
@@ -94,7 +102,9 @@ Automated bot-vs-bot example:
 Human-vs-bot example:
 
 ```bash
-~/.virtualenvs/poker/bin/python scripts/test_autonomous_bot_gameplay.py \
+source scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$PWD")"
+"$PYTHON_BIN" scripts/test_autonomous_bot_gameplay.py \
   --mode human-vs-bot \
   --auth-api-url http://localhost:8000 \
   --game-server-url http://localhost:3000 \
@@ -140,7 +150,7 @@ A successful automated run proves all of the following together:
 
 ## Troubleshooting
 1. `Could not find PYTHON_BIN`:
-   - Use `~/.virtualenvs/poker/bin/python`, or export `PYTHON_BIN=python` if your environment is already active.
+   - Set `PYTHON_BIN` in `.env` to the exact interpreter inside your virtual environment.
 2. `Admin login failed after readiness retry window`:
    - Confirm `ENV_MODE=dev`, bootstrap admin credentials, and `ENABLE_TEST_FIXTURE_API=true`.
 3. `run_tag already exists`:

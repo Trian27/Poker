@@ -2,16 +2,29 @@
 
 ## 🚀 Fastest Way to Get Started
 
+### Configure Python Once
+Copy `.env.example` to `.env` and set `PYTHON_BIN` to the exact Python interpreter inside your local virtual environment.
+
+Example:
+
+```dotenv
+PYTHON_BIN=/Users/your-user/.virtualenvs/poker/bin/python
+```
+
+The repo scripts use `PYTHON_BIN` directly. You do not need to activate a separate shell virtualenv before running them.
+
 ### One-Command Start (Recommended)
 ```bash
 cd /Users/trian/Projects/Poker
-./start-all.sh
+cp .env.example .env
+# Edit .env and set PYTHON_BIN
+./scripts/start-all.sh
 ```
 Then open: **http://localhost:5173**
 
 ### One-Command Stop
 ```bash
-./stop-all.sh
+./scripts/stop-all.sh
 ```
 
 ---
@@ -35,8 +48,7 @@ Then open: **http://localhost:5173**
 ### Terminal 1: FastAPI
 ```bash
 cd /Users/trian/Projects/Poker/poker-api
-source venv/bin/activate
-python -m uvicorn app.main:app --reload --port 8000
+/Users/your-user/.virtualenvs/poker/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
 ### Terminal 2: Game Server
@@ -62,7 +74,7 @@ pg_isready
 
 ### Run API Tests
 ```bash
-cd poker-api && source venv/bin/activate && python test_chunk2.py
+./scripts/test-gameplay.sh full
 ```
 
 ### Build React for Production
@@ -113,9 +125,9 @@ brew services list
 
 ### Clear Everything and Restart
 ```bash
-./stop-all.sh
+./scripts/stop-all.sh
 # Wait 5 seconds
-./start-all.sh
+./scripts/start-all.sh
 ```
 
 ### Reset Database
