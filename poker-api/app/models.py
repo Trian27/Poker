@@ -352,14 +352,22 @@ class TableQueue(Base):
     table_id = Column(Integer, ForeignKey("tables.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     position = Column(Integer, nullable=False)  # Queue position (1 = first in line)
+    reserved_buy_in_amount = Column(Integer, nullable=False, default=0)
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
     table = relationship("Table", back_populates="queue")
     user = relationship("User")
     
-    # Unique constraint: one user per table queue
     __table_args__ = (
+        UniqueConstraint("table_id", "user_id", name="uq_table_queue_table_user"),
+        UniqueConstraint(
+            "table_id",
+            "position",
+            name="uq_table_queue_table_position",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         {"schema": None},
     )
 

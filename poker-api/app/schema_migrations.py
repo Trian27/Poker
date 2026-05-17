@@ -4,6 +4,7 @@ Database schema migration helpers.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from .database import Base, engine
 
@@ -20,9 +21,64 @@ def _strip_sql_comments(sql: str) -> str:
 
 def _execute_sql(cursor, sql: str) -> None:
     cleaned = _strip_sql_comments(sql)
-    for statement in cleaned.split(";"):
-        if statement.strip():
-            cursor.execute(statement)
+    statements: list[str] = []
+    current: list[str] = []
+    in_single_quote = False
+    in_double_quote = False
+    dollar_quote_delimiter: str | None = None
+    index = 0
+
+    while index < len(cleaned):
+        if dollar_quote_delimiter is not None:
+            if cleaned.startswith(dollar_quote_delimiter, index):
+                current.append(dollar_quote_delimiter)
+                index += len(dollar_quote_delimiter)
+                dollar_quote_delimiter = None
+                continue
+            current.append(cleaned[index])
+            index += 1
+            continue
+
+        if not in_single_quote and not in_double_quote and cleaned[index] == "$":
+            match = re.match(r"\$[A-Za-z0-9_]*\$", cleaned[index:])
+            if match:
+                dollar_quote_delimiter = match.group(0)
+                current.append(dollar_quote_delimiter)
+                index += len(dollar_quote_delimiter)
+                continue
+
+        char = cleaned[index]
+        previous_char = cleaned[index - 1] if index > 0 else ""
+
+        if char == "'" and not in_double_quote and previous_char != "\\":
+            in_single_quote = not in_single_quote
+            current.append(char)
+            index += 1
+            continue
+
+        if char == '"' and not in_single_quote and previous_char != "\\":
+            in_double_quote = not in_double_quote
+            current.append(char)
+            index += 1
+            continue
+
+        if char == ";" and not in_single_quote and not in_double_quote:
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    trailing_statement = "".join(current).strip()
+    if trailing_statement:
+        statements.append(trailing_statement)
+
+    for statement in statements:
+        cursor.execute(statement)
 
 
 def _has_table(cursor, table_name: str) -> bool:

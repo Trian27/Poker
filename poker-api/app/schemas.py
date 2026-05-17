@@ -267,6 +267,10 @@ class TableResponse(TableBase):
     tournament_completed_at: Optional[datetime] = None
     tournament_registration_count: Optional[int] = None
     tournament_is_registered: Optional[bool] = None
+    occupied_seat_count: int = 0
+    queue_count: int = 0
+    my_queue_position: Optional[int] = None
+    my_queue_buy_in_amount: Optional[int] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -284,6 +288,7 @@ class SeatPlayerRequest(BaseModel):
     username: str
     stack: int
     seat_number: int
+    promotion_id: Optional[str] = None
     community_id: Optional[int] = None
     table_name: Optional[str] = None
     is_test_only: bool = False

@@ -297,28 +297,127 @@ def test_join_table_rejects_insufficient_funds(client, db_session, auth_state, a
 def test_queue_join_leave_and_reorder(client, db_session, auth_state, app_modules):
     models_module = app_modules["models"]
     setup = seed_league_graph(db_session, app_modules)
-    create_wallet(db_session, models_module, setup.member, setup.community, 1000)
-    create_wallet(db_session, models_module, setup.outsider, setup.community, 1000)
-    table = create_cash_table(db_session, models_module, setup.community, setup.owner)
+    member_wallet = create_wallet(db_session, models_module, setup.member, setup.community, 1000)
+    outsider_wallet = create_wallet(db_session, models_module, setup.outsider, setup.community, 1000)
+    occupant = create_user(db_session, app_modules["auth"], models_module, "queue_occupant")
+    table = create_cash_table(db_session, models_module, setup.community, setup.owner, max_seats=2, buy_in=200)
+
+    seat_one = db_session.query(models_module.TableSeat).filter(
+        models_module.TableSeat.table_id == table.id,
+        models_module.TableSeat.seat_number == 1,
+    ).one()
+    seat_two = db_session.query(models_module.TableSeat).filter(
+        models_module.TableSeat.table_id == table.id,
+        models_module.TableSeat.seat_number == 2,
+    ).one()
+    seat_one.user_id = setup.owner.id
+    seat_two.user_id = occupant.id
+    db_session.add_all([
+        models_module.TableSession(
+            user_id=setup.owner.id,
+            table_id=table.id,
+            community_id=setup.community.id,
+            table_name=table.name,
+            buy_in_amount=200,
+        ),
+        models_module.TableSession(
+            user_id=occupant.id,
+            table_id=table.id,
+            community_id=setup.community.id,
+            table_name=table.name,
+            buy_in_amount=200,
+        ),
+    ])
+    db_session.commit()
 
     set_current_user(auth_state, setup.member)
-    first_join = client.post(f"/api/tables/{table.id}/queue/join")
+    first_join = client.post(f"/api/tables/{table.id}/queue/join", json={"buy_in_amount": 250})
     assert first_join.status_code == 200, first_join.text
     assert first_join.json()["position"] == 1
+    db_session.refresh(member_wallet)
+    assert float(member_wallet.balance) == 750.0
 
     set_current_user(auth_state, setup.outsider)
-    second_join = client.post(f"/api/tables/{table.id}/queue/join")
+    second_join = client.post(f"/api/tables/{table.id}/queue/join", json={"buy_in_amount": 300})
     assert second_join.status_code == 200, second_join.text
     assert second_join.json()["position"] == 2
+    db_session.refresh(outsider_wallet)
+    assert float(outsider_wallet.balance) == 700.0
 
     set_current_user(auth_state, setup.member)
     leave_response = client.delete(f"/api/tables/{table.id}/queue/leave")
     assert leave_response.status_code == 204
+    db_session.refresh(member_wallet)
+    assert float(member_wallet.balance) == 1000.0
 
     queue_entries = db_session.query(models_module.TableQueue).filter(models_module.TableQueue.table_id == table.id).order_by(models_module.TableQueue.position).all()
     assert len(queue_entries) == 1
     assert queue_entries[0].user_id == setup.outsider.id
     assert queue_entries[0].position == 1
+    assert int(queue_entries[0].reserved_buy_in_amount) == 300
+
+
+def test_queue_join_rejects_non_full_table(client, db_session, auth_state, app_modules):
+    models_module = app_modules["models"]
+    setup = seed_league_graph(db_session, app_modules)
+    wallet = create_wallet(db_session, models_module, setup.member, setup.community, 1000)
+    table = create_cash_table(db_session, models_module, setup.community, setup.owner, max_seats=2, buy_in=200)
+
+    set_current_user(auth_state, setup.member)
+    response = client.post(f"/api/tables/{table.id}/queue/join", json={"buy_in_amount": 250})
+    assert response.status_code == 409
+    assert "no longer full" in response.json()["detail"].lower()
+    db_session.refresh(wallet)
+    assert float(wallet.balance) == 1000.0
+
+
+def test_community_table_summary_includes_queue_fields(client, db_session, auth_state, app_modules):
+    models_module = app_modules["models"]
+    setup = seed_league_graph(db_session, app_modules)
+    create_wallet(db_session, models_module, setup.member, setup.community, 1000)
+    occupant = create_user(db_session, app_modules["auth"], models_module, "summary_occupant")
+    table = create_cash_table(db_session, models_module, setup.community, setup.owner, max_seats=2, buy_in=200, max_queue_size=3)
+
+    seat_one = db_session.query(models_module.TableSeat).filter(
+        models_module.TableSeat.table_id == table.id,
+        models_module.TableSeat.seat_number == 1,
+    ).one()
+    seat_two = db_session.query(models_module.TableSeat).filter(
+        models_module.TableSeat.table_id == table.id,
+        models_module.TableSeat.seat_number == 2,
+    ).one()
+    seat_one.user_id = setup.owner.id
+    seat_two.user_id = occupant.id
+    db_session.add_all([
+        models_module.TableSession(
+            user_id=setup.owner.id,
+            table_id=table.id,
+            community_id=setup.community.id,
+            table_name=table.name,
+            buy_in_amount=200,
+        ),
+        models_module.TableSession(
+            user_id=occupant.id,
+            table_id=table.id,
+            community_id=setup.community.id,
+            table_name=table.name,
+            buy_in_amount=200,
+        ),
+    ])
+    db_session.commit()
+
+    set_current_user(auth_state, setup.member)
+    queue_join = client.post(f"/api/tables/{table.id}/queue/join", json={"buy_in_amount": 250})
+    assert queue_join.status_code == 200, queue_join.text
+
+    response = client.get(f"/api/communities/{setup.community.id}/tables")
+    assert response.status_code == 200, response.text
+    table_payload = next((entry for entry in response.json() if entry["id"] == table.id), None)
+    assert table_payload is not None
+    assert table_payload["occupied_seat_count"] == 2
+    assert table_payload["queue_count"] == 1
+    assert table_payload["my_queue_position"] == 1
+    assert table_payload["my_queue_buy_in_amount"] == 250
 
 
 
@@ -327,13 +426,22 @@ def test_unseat_promotes_first_queued_player_and_debits_wallet(client, db_sessio
     setup = seed_league_graph(db_session, app_modules)
     create_wallet(db_session, models_module, setup.owner, setup.community, 1000)
     queued_wallet = create_wallet(db_session, models_module, setup.member, setup.community, 1000)
-    table = create_cash_table(db_session, models_module, setup.community, setup.owner, buy_in=200)
+    occupant = create_user(db_session, app_modules["auth"], models_module, "promotion_occupant")
+    table = create_cash_table(db_session, models_module, setup.community, setup.owner, max_seats=2, buy_in=200)
 
     seat_one = db_session.query(models_module.TableSeat).filter(models_module.TableSeat.table_id == table.id, models_module.TableSeat.seat_number == 1).one()
+    seat_two = db_session.query(models_module.TableSeat).filter(models_module.TableSeat.table_id == table.id, models_module.TableSeat.seat_number == 2).one()
     seat_one.user_id = setup.owner.id
+    seat_two.user_id = occupant.id
     db_session.add(models_module.TableSession(user_id=setup.owner.id, table_id=table.id, community_id=setup.community.id, table_name=table.name, buy_in_amount=200))
-    db_session.add(models_module.TableQueue(table_id=table.id, user_id=setup.member.id, position=1))
+    db_session.add(models_module.TableSession(user_id=occupant.id, table_id=table.id, community_id=setup.community.id, table_name=table.name, buy_in_amount=200))
     db_session.commit()
+
+    set_current_user(auth_state, setup.member)
+    queue_join = client.post(f"/api/tables/{table.id}/queue/join", json={"buy_in_amount": 275})
+    assert queue_join.status_code == 200, queue_join.text
+    db_session.refresh(queued_wallet)
+    assert float(queued_wallet.balance) == 725.0
 
     calls: list[dict] = []
 
@@ -351,11 +459,24 @@ def test_unseat_promotes_first_queued_player_and_debits_wallet(client, db_sessio
     assert payload["auto_seated"]["seat_number"] == 1
 
     db_session.refresh(queued_wallet)
-    assert float(queued_wallet.balance) == 800.0
+    assert float(queued_wallet.balance) == 725.0
     db_session.refresh(seat_one)
     assert seat_one.user_id == setup.member.id
     assert db_session.query(models_module.TableQueue).filter(models_module.TableQueue.table_id == table.id).count() == 0
     assert calls and calls[0]["user_id"] == setup.member.id
+    assert calls[0]["promotion_id"]
+    promoted_session = (
+        db_session.query(models_module.TableSession)
+        .filter(
+            models_module.TableSession.table_id == table.id,
+            models_module.TableSession.user_id == setup.member.id,
+            models_module.TableSession.left_at.is_(None),
+        )
+        .order_by(models_module.TableSession.joined_at.desc())
+        .first()
+    )
+    assert promoted_session is not None
+    assert promoted_session.buy_in_amount == 275
 
 
 
@@ -479,7 +600,7 @@ def test_cross_run_test_users_cannot_access_other_run_tables(client, db_session,
     queue_response = client.get(f"/api/tables/{run_b_table.id}/queue")
     assert queue_response.status_code == 404
 
-    join_queue_response = client.post(f"/api/tables/{run_b_table.id}/queue/join")
+    join_queue_response = client.post(f"/api/tables/{run_b_table.id}/queue/join", json={"buy_in_amount": 200})
     assert join_queue_response.status_code == 404
 
 
@@ -610,7 +731,7 @@ def test_fixture_api_can_create_unseated_browser_stack(client, db_session, auth_
             "/api/admin/test-fixtures/gameplay-stack",
             json={
                 "run_tag": "browser-fixture-run-1",
-                "player_count": 2,
+                "player_count": 3,
                 "queued_player_count": 0,
                 "auto_seat_players": False,
                 "starting_balance": "1000.00",
@@ -627,6 +748,7 @@ def test_fixture_api_can_create_unseated_browser_stack(client, db_session, auth_
         assert payload["auto_seat_players"] is False
         assert payload["league_name"] == "E2E League browser-fixture-run-1"
         assert payload["community_name"] == "E2E Community browser-fixture-run-1"
+        assert len(payload["users"]) == 3
         assert all(user["seat_number"] is None for user in payload["users"])
         assert all(user["queue_position"] is None for user in payload["users"])
 

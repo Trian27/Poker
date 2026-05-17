@@ -1,8 +1,17 @@
-import { useEffect, useState, useCallback, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, useCallback, type CSSProperties } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { communitiesApi, tablesApi, walletsApi, inboxApi } from '../api';
 import { useAuth } from '../auth-context';
-import type { Community, Table, Wallet, TableSeat, TableTournamentDetails, InboxMessage, ActiveSeatStatus } from '../types';
+import type {
+  Community,
+  Table,
+  Wallet,
+  TableSeat,
+  TableTournamentDetails,
+  InboxMessage,
+  ActiveSeatStatus,
+  TableQueuePosition,
+} from '../types';
 import UserMenu from '../components/UserMenu';
 import CommunitySettingsModal from '../components/CommunitySettingsModal';
 import './CommunityLobby.css';
@@ -15,6 +24,7 @@ const INBOX_REFRESH_INTERVAL_MS = 5000;
 const TOURNAMENT_PLAYER_LIMIT_OPTIONS = [2, 4, 8];
 const UNREAD_COUNT_STORAGE_KEY = 'poker-inbox-unread-count';
 const SEAT_LOST_BANNER_COPY = 'You are no longer seated at that table.';
+const QUEUE_PROMOTED_BANNER_COPY = 'A seat opened at this table. You are now seated.';
 
 export default function CommunityLobbyPage() {
   const { communityId } = useParams<{ communityId: string }>();
@@ -30,12 +40,16 @@ export default function CommunityLobbyPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeSeat, setActiveSeat] = useState<ActiveSeatStatus | null>(null);
   const [seatLostBanner, setSeatLostBanner] = useState<string | null>(null);
+  const [queuePromotedBanner, setQueuePromotedBanner] = useState<string | null>(null);
   
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showJoinModal, setShowJoinModal] = useState(false);
+  const [joinMode, setJoinMode] = useState<'seat' | 'queue'>('seat');
   const [selectedTable, setSelectedTable] = useState<Table | null>(null);
   const [seats, setSeats] = useState<TableSeat[]>([]);
   const [loadingSeats, setLoadingSeats] = useState(false);
+  const [queueEntries, setQueueEntries] = useState<TableQueuePosition[]>([]);
+  const [loadingQueue, setLoadingQueue] = useState(false);
   const [showTournamentModal, setShowTournamentModal] = useState(false);
   const [tournamentDetails, setTournamentDetails] = useState<TableTournamentDetails | null>(null);
   const [tournamentPayoutEditInput, setTournamentPayoutEditInput] = useState('');
@@ -83,6 +97,7 @@ export default function CommunityLobbyPage() {
   const canCreatePermanentTables = !!(user && community && idsEqual(community.commissioner_id, user.id));
   const authApiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   const gameServerBaseUrl = import.meta.env.VITE_GAME_SERVER_URL || 'http://localhost:3000';
+  const previousQueuePositionsRef = useRef<Record<number, number | null>>({});
 
   useEffect(() => {
     const seatLost = Boolean(
@@ -171,25 +186,11 @@ export default function CommunityLobbyPage() {
 
       setCommunity(comm);
       setTables(tablesData);
-
-      if (tablesData.length > 0) {
-        const seatCountsEntries = await Promise.all(
-          tablesData.map(async (table: Table) => {
-            try {
-              const seatsData = await tablesApi.getSeats(table.id);
-              const occupiedCount = seatsData.filter((seat: TableSeat) => seat.user_id !== null).length;
-              return [table.id, occupiedCount] as const;
-            } catch (error) {
-              console.error(`Failed to load seat count for table ${table.id}:`, error);
-              return [table.id, 0] as const;
-            }
-          })
-        );
-
-        setTableSeatCounts(Object.fromEntries(seatCountsEntries));
-      } else {
-        setTableSeatCounts({});
-      }
+      setTableSeatCounts(
+        Object.fromEntries(
+          tablesData.map((table: Table) => [table.id, Number(table.occupied_seat_count ?? 0)]),
+        ),
+      );
 
       const userWallet = wallets.find((w: Wallet) => w.community_id === parsedCommunityId);
       setWallet(userWallet || null);
@@ -198,6 +199,22 @@ export default function CommunityLobbyPage() {
       } else {
         setActiveSeat(null);
       }
+
+      const nextQueuePositions = Object.fromEntries(
+        tablesData.map((table: Table) => [table.id, table.my_queue_position ?? null]),
+      ) as Record<number, number | null>;
+      const promotedTable = tablesData.find((table: Table) => {
+        const previousQueuePosition = previousQueuePositionsRef.current[table.id];
+        return previousQueuePosition !== null
+          && previousQueuePosition !== undefined
+          && table.my_queue_position == null
+          && Boolean(activeSeatData?.active)
+          && Number(activeSeatData?.table_id) === table.id;
+      });
+      if (promotedTable) {
+        setQueuePromotedBanner(QUEUE_PROMOTED_BANNER_COPY);
+      }
+      previousQueuePositionsRef.current = nextQueuePositions;
     } catch (err: unknown) {
       const message = getApiErrorMessage(err, 'Failed to load community data');
       if (silent) {
@@ -604,6 +621,51 @@ export default function CommunityLobbyPage() {
     }
   };
 
+  const handleJoinQueue = async () => {
+    if (!selectedTable || !wallet) {
+      return;
+    }
+
+    const walletBalance = typeof wallet.balance === 'string'
+      ? parseFloat(wallet.balance)
+      : wallet.balance;
+
+    if (buyInAmount > walletBalance) {
+      alert(`Insufficient funds! You have ${walletBalance} chips but need ${buyInAmount}.`);
+      return;
+    }
+
+    if (buyInAmount < selectedTable.buy_in) {
+      alert(`Minimum buy-in is ${selectedTable.buy_in} chips.`);
+      return;
+    }
+
+    try {
+      await tablesApi.joinQueue(selectedTable.id, buyInAmount);
+      setShowJoinModal(false);
+      setQueueEntries([]);
+      await loadData({ silent: true });
+    } catch (err: unknown) {
+      console.error('Error joining queue:', err);
+      await loadData({ silent: true });
+      alert(getApiErrorMessage(err, 'Failed to join queue'));
+    }
+  };
+
+  const handleLeaveQueue = async (table: Table) => {
+    try {
+      await tablesApi.leaveQueue(table.id);
+      if (selectedTable?.id === table.id) {
+        setShowJoinModal(false);
+        setSelectedTable(null);
+        setQueueEntries([]);
+      }
+      await loadData({ silent: true });
+    } catch (err: unknown) {
+      alert(getApiErrorMessage(err, 'Failed to leave queue'));
+    }
+  };
+
   const openJoinModal = async (table: Table) => {
     if (activeSeat?.active && activeSeat.table_id === table.id) {
       clearAutoRejoinSuppressionForUserTable(user?.id ?? null, table.id);
@@ -615,11 +677,18 @@ export default function CommunityLobbyPage() {
     }
 
     setSelectedTable(table);
-    setBuyInAmount(table.game_type === 'tournament' ? (table.tournament_starting_stack || 1000) : table.buy_in);
+    setBuyInAmount(table.my_queue_buy_in_amount ?? (table.game_type === 'tournament' ? (table.tournament_starting_stack || 1000) : table.buy_in));
     setSelectedSeat(null);
+    setQueueEntries([]);
     setShowApiJoinInfo(false);
     setApiJoinCopyFeedback(null);
     setShowJoinModal(true);
+    if (isQueueEnabledForTable(table) && isTableFull(table)) {
+      setJoinMode('queue');
+      await loadQueue(table, true);
+      return;
+    }
+    setJoinMode('seat');
     await loadSeats(table, true);
   };
 
@@ -745,20 +814,64 @@ export default function CommunityLobbyPage() {
     }
   }, [loadData, selectedSeat]);
 
+  const getOccupiedSeatCount = useCallback((table: Table) => {
+    return Number(table.occupied_seat_count ?? tableSeatCounts[table.id] ?? 0);
+  }, [tableSeatCounts]);
+
+  const isQueueEnabledForTable = useCallback((table: Table) => {
+    return table.game_type === 'cash' && Number(table.max_queue_size ?? 0) > 0;
+  }, []);
+
+  const isTableFull = useCallback((table: Table) => {
+    return getOccupiedSeatCount(table) >= table.max_seats;
+  }, [getOccupiedSeatCount]);
+
+  const loadQueue = useCallback(async (table: Table, showLoading: boolean = false) => {
+    if (showLoading) {
+      setLoadingQueue(true);
+    }
+
+    try {
+      const queueData = await tablesApi.getQueue(table.id);
+      setQueueEntries(queueData);
+    } catch (err: unknown) {
+      console.error('Error loading queue:', err);
+      if (getApiErrorStatus(err) === 404) {
+        setShowJoinModal(false);
+        setSelectedTable(null);
+        setQueueEntries([]);
+        await loadData({ silent: true });
+        alert('This table is no longer available.');
+        return;
+      }
+      if (showLoading) {
+        alert(getApiErrorMessage(err, 'Failed to load queue information'));
+      }
+    } finally {
+      if (showLoading) {
+        setLoadingQueue(false);
+      }
+    }
+  }, [loadData]);
+
   useEffect(() => {
     if (!showJoinModal || !selectedTable) {
       return;
     }
 
-    const refreshSeats = () => {
-      loadSeats(selectedTable, false);
+    const refreshDetails = () => {
+      if (joinMode === 'queue') {
+        void loadQueue(selectedTable, false);
+        return;
+      }
+      void loadSeats(selectedTable, false);
     };
 
-    const intervalId = window.setInterval(refreshSeats, 3000);
+    const intervalId = window.setInterval(refreshDetails, 3000);
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [showJoinModal, selectedTable, loadSeats]);
+  }, [showJoinModal, selectedTable, joinMode, loadQueue, loadSeats]);
 
   const getSeatPositionStyle = (seatIndex: number, totalSeats: number): CSSProperties => {
     const normalizedSeats = Math.max(totalSeats, 2);
@@ -868,6 +981,12 @@ export default function CommunityLobbyPage() {
             {seatLostBanner}
           </div>
         )}
+
+        {queuePromotedBanner && (
+          <div className="rejoin-banner" data-testid="queue-promoted-banner">
+            {queuePromotedBanner}
+          </div>
+        )}
         
         {wallet && (
           <div className="wallet-balance">
@@ -975,8 +1094,14 @@ export default function CommunityLobbyPage() {
                   )}
                   <div className="info-row">
                     <span>Seats:</span>
-                    <strong>{tableSeatCounts[table.id] ?? 0}/{table.max_seats}</strong>
+                    <strong>{getOccupiedSeatCount(table)}/{table.max_seats}</strong>
                   </div>
+                  {isQueueEnabledForTable(table) && (
+                    <div className="info-row">
+                      <span>Queue:</span>
+                      <strong>{table.queue_count ?? 0}/{table.max_queue_size ?? 0}</strong>
+                    </div>
+                  )}
                   <div className="info-row">
                     <span>Agents:</span>
                     <span className={`agent-badge ${table.agents_allowed !== false ? 'allowed' : 'not-allowed'}`}>
@@ -1075,17 +1200,59 @@ export default function CommunityLobbyPage() {
                         Spectate
                       </button>
                     )}
-                    <button
-                      className="join-button"
-                      onClick={() => openJoinModal(table)}
-                      disabled={((!wallet && !(activeSeat?.active && activeSeat.table_id === table.id)) || table.status === 'finished')}
-                      data-testid="join-table-button"
-                      data-table-id={table.id}
-                    >
-                      {table.status === 'finished'
-                        ? 'Finished'
-                        : (activeSeat?.active && activeSeat.table_id === table.id ? 'Rejoin Table' : 'Join Table')}
-                    </button>
+                    {activeSeat?.active && activeSeat.table_id === table.id ? (
+                      <button
+                        className="join-button"
+                        onClick={() => openJoinModal(table)}
+                        disabled={table.status === 'finished'}
+                        data-testid="join-table-button"
+                        data-table-id={table.id}
+                      >
+                        {table.status === 'finished' ? 'Finished' : 'Rejoin Table'}
+                      </button>
+                    ) : table.my_queue_position != null ? (
+                      <>
+                        <div
+                          className="queue-state-pill"
+                          data-testid="queue-position-label"
+                          data-table-id={table.id}
+                        >
+                          In Queue (#{table.my_queue_position})
+                        </div>
+                        <button
+                          className="join-button secondary"
+                          onClick={() => void handleLeaveQueue(table)}
+                          data-testid="leave-queue-button"
+                          data-table-id={table.id}
+                        >
+                          Leave Queue
+                        </button>
+                      </>
+                    ) : !isTableFull(table) ? (
+                      <button
+                        className="join-button"
+                        onClick={() => openJoinModal(table)}
+                        disabled={!wallet || table.status === 'finished'}
+                        data-testid="join-table-button"
+                        data-table-id={table.id}
+                      >
+                        {table.status === 'finished' ? 'Finished' : 'Join Table'}
+                      </button>
+                    ) : isQueueEnabledForTable(table) && Number(table.queue_count ?? 0) < Number(table.max_queue_size ?? 0) ? (
+                      <button
+                        className="join-button"
+                        onClick={() => openJoinModal(table)}
+                        disabled={!wallet || table.status === 'finished'}
+                        data-testid="join-queue-button"
+                        data-table-id={table.id}
+                      >
+                        Join Queue
+                      </button>
+                    ) : (
+                      <button className="join-button" disabled>
+                        {isQueueEnabledForTable(table) ? 'Queue Full' : 'Table Full'}
+                      </button>
+                    )}
                   </div>
                   {canManageTables && (
                     <button
@@ -1386,7 +1553,7 @@ export default function CommunityLobbyPage() {
         <div className="modal-overlay" onClick={() => setShowJoinModal(false)}>
           <div className="modal-content seat-selection-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>Join {selectedTable.name}</h2>
+              <h2>{joinMode === 'queue' ? `Join Queue for ${selectedTable.name}` : `Join ${selectedTable.name}`}</h2>
               <button className="close-button" onClick={() => setShowJoinModal(false)}>×</button>
             </div>
             
@@ -1394,7 +1561,10 @@ export default function CommunityLobbyPage() {
               <p><strong>Game Type:</strong> {selectedTable.game_type === 'cash' ? '💵 Cash Game' : '🏆 Tournament'}</p>
               <p><strong>Blinds:</strong> {selectedTable.small_blind}/{selectedTable.big_blind}</p>
               <p><strong>Buy-in:</strong> {selectedTable.buy_in} chips</p>
-              <p><strong>Seats:</strong> {tableSeatCounts[selectedTable.id] ?? 0}/{selectedTable.max_seats}</p>
+              <p><strong>Seats:</strong> {getOccupiedSeatCount(selectedTable)}/{selectedTable.max_seats}</p>
+              {isQueueEnabledForTable(selectedTable) && (
+                <p><strong>Queue:</strong> {selectedTable.queue_count ?? 0}/{selectedTable.max_queue_size ?? 0}</p>
+              )}
               <p><strong>Agents:</strong> {selectedTable.agents_allowed !== false ? '🤖 Allowed' : '🚫 Humans Only'}</p>
               <p><strong>Status:</strong> {selectedTable.status}</p>
             </div>
@@ -1409,67 +1579,94 @@ export default function CommunityLobbyPage() {
                   min={selectedTable.buy_in}
                   max={wallet ? (typeof wallet.balance === 'string' ? parseFloat(wallet.balance) : wallet.balance) : 0}
                   step="1"
+                  data-testid={joinMode === 'queue' ? 'queue-buy-in-input' : undefined}
                 />
                 <small>Minimum: {selectedTable.buy_in} chips</small>
               </div>
             )}
 
-            {/* Seat Selection */}
-            <div className="seat-selection">
-              <h3>Select Your Seat</h3>
-              {loadingSeats ? (
-                <div className="loading-seats">Loading available seats...</div>
-              ) : (
-                <div className="poker-table-visual">
-                  <div className="table-felt">
-                    {seats.map((seat, seatIndex) => {
-                      const isTakenByMe = seat.user_id !== null && seat.user_id === user?.id;
-                      const isOccupied = seat.user_id !== null && !isTakenByMe;
-                      const isSelected = selectedSeat === seat.seat_number;
-                      const seatPositionStyle = getSeatPositionStyle(seatIndex, seats.length);
-                      
-                      return (
-                        <div key={seat.id} className="seat-slot" style={seatPositionStyle}>
-                          <button
-                            className={`seat-button ${isOccupied ? 'occupied' : 'available'} ${isTakenByMe ? 'yours' : ''} ${isSelected ? 'selected' : ''}`}
-                            onClick={() => !isOccupied && setSelectedSeat(seat.seat_number)}
-                            disabled={isOccupied}
-                            data-testid="seat-button"
-                            data-seat-number={seat.seat_number}
-                            title={
-                              isOccupied
-                                ? `Occupied by ${seat.username}`
-                                : isTakenByMe
-                                  ? `Seat ${seat.seat_number} - Your current seat`
-                                  : `Seat ${seat.seat_number} - Available`
-                            }
-                          >
-                            <div className="seat-number">{seat.seat_number}</div>
-                            {isOccupied || isTakenByMe ? (
-                              <div className="seat-player">
-                                <div className="seat-player-avatar">👤</div>
-                                <div className="seat-player-name">{isTakenByMe ? `${seat.username} (You)` : seat.username}</div>
-                              </div>
-                            ) : (
-                              <div className="seat-empty">
-                                {isSelected ? '✓' : '+'}
-                              </div>
-                            )}
-                          </button>
+            {joinMode === 'queue' ? (
+              <div className="seat-selection">
+                <h3>Queue</h3>
+                {loadingQueue ? (
+                  <div className="loading-seats">Loading queue...</div>
+                ) : (
+                  <div className="queue-list">
+                    {queueEntries.length === 0 ? (
+                      <p>No one is in line yet.</p>
+                    ) : (
+                      queueEntries.map((entry) => (
+                        <div
+                          key={`${entry.user_id}-${entry.position}`}
+                          className="queue-row"
+                          data-testid={entry.user_id === user?.id ? 'queue-position-label' : undefined}
+                          data-table-id={selectedTable.id}
+                        >
+                          <span>#{entry.position}</span>
+                          <span>{entry.username}</span>
                         </div>
-                      );
-                    })}
+                      ))
+                    )}
                   </div>
-                </div>
-              )}
-              {selectedSeat !== null && (
-                <div className="seat-selected-info">
-                  ✅ Seat {selectedSeat} selected
-                </div>
-              )}
-            </div>
+                )}
+              </div>
+            ) : (
+              <div className="seat-selection">
+                <h3>Select Your Seat</h3>
+                {loadingSeats ? (
+                  <div className="loading-seats">Loading available seats...</div>
+                ) : (
+                  <div className="poker-table-visual">
+                    <div className="table-felt">
+                      {seats.map((seat, seatIndex) => {
+                        const isTakenByMe = seat.user_id !== null && seat.user_id === user?.id;
+                        const isOccupied = seat.user_id !== null && !isTakenByMe;
+                        const isSelected = selectedSeat === seat.seat_number;
+                        const seatPositionStyle = getSeatPositionStyle(seatIndex, seats.length);
+                        
+                        return (
+                          <div key={seat.id} className="seat-slot" style={seatPositionStyle}>
+                            <button
+                              className={`seat-button ${isOccupied ? 'occupied' : 'available'} ${isTakenByMe ? 'yours' : ''} ${isSelected ? 'selected' : ''}`}
+                              onClick={() => !isOccupied && setSelectedSeat(seat.seat_number)}
+                              disabled={isOccupied}
+                              data-testid="seat-button"
+                              data-seat-number={seat.seat_number}
+                              title={
+                                isOccupied
+                                  ? `Occupied by ${seat.username}`
+                                  : isTakenByMe
+                                    ? `Seat ${seat.seat_number} - Your current seat`
+                                    : `Seat ${seat.seat_number} - Available`
+                              }
+                            >
+                              <div className="seat-number">{seat.seat_number}</div>
+                              {isOccupied || isTakenByMe ? (
+                                <div className="seat-player">
+                                  <div className="seat-player-avatar">👤</div>
+                                  <div className="seat-player-name">{isTakenByMe ? `${seat.username} (You)` : seat.username}</div>
+                                </div>
+                              ) : (
+                                <div className="seat-empty">
+                                  {isSelected ? '✓' : '+'}
+                                </div>
+                              )}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+                {selectedSeat !== null && (
+                  <div className="seat-selected-info">
+                    ✅ Seat {selectedSeat} selected
+                  </div>
+                )}
+              </div>
+            )}
 
-            {showApiJoinInfo && (
+            {joinMode === 'seat' && showApiJoinInfo && (
               <div className="api-join-info">
                 <h4>Join via API</h4>
                 <p>
@@ -1495,13 +1692,26 @@ export default function CommunityLobbyPage() {
               <button type="button" onClick={() => setShowJoinModal(false)}>
                 Cancel
               </button>
-              <button
-                type="button"
-                className="secondary-action"
-                onClick={() => setShowApiJoinInfo((current) => !current)}
-              >
-                {showApiJoinInfo ? 'Hide API Join' : 'Join via API'}
-              </button>
+              {joinMode === 'seat' && (
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => setShowApiJoinInfo((current) => !current)}
+                >
+                  {showApiJoinInfo ? 'Hide API Join' : 'Join via API'}
+                </button>
+              )}
+              {joinMode === 'queue' ? (
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={handleJoinQueue}
+                  disabled={loadingQueue}
+                  data-testid="confirm-queue-button"
+                >
+                  Join Queue with {buyInAmount} chips
+                </button>
+              ) : (
                 <button 
                   type="button" 
                   className="primary"
@@ -1515,8 +1725,9 @@ export default function CommunityLobbyPage() {
                       ? `Enter at Seat ${selectedSeat}`
                       : `Join at Seat ${selectedSeat} with ${buyInAmount} chips`}
                 </button>
-              </div>
+              )}
             </div>
+          </div>
         </div>
       )}
 

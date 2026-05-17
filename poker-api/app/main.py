@@ -62,6 +62,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import random
+import uuid
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,23 @@ async def post_game_server_json(path: str, payload: dict, timeout: float = 10.0)
         )
 
 
+async def get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+    base_url = settings.GAME_SERVER_URL.rstrip("/")
+    async with httpx.AsyncClient() as client:
+        return await client.get(
+            f"{base_url}{path}",
+            timeout=timeout,
+        )
+
+
+async def rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+    return await post_game_server_json(
+        f"/_internal/promotions/{promotion_id}/rollback",
+        {},
+        timeout=timeout,
+    )
+
+
 def _issue_access_token_for_user(user: User) -> str:
     return create_access_token(
         data={
@@ -255,6 +273,51 @@ def _serialize_public_user(user: User) -> dict:
         "is_banned": user.is_banned,
         "is_test_user": bool(user.is_test_user),
     }
+
+
+def _lock_table_for_update(db: Session, table_id: int) -> Table | None:
+    return (
+        db.query(Table)
+        .filter(Table.id == table_id)
+        .with_for_update()
+        .first()
+    )
+
+
+def _lock_wallet_for_update(db: Session, user_id: int, community_id: int) -> Wallet | None:
+    return (
+        db.query(Wallet)
+        .filter(
+            Wallet.user_id == user_id,
+            Wallet.community_id == community_id,
+        )
+        .with_for_update()
+        .first()
+    )
+
+
+def _compact_table_queue_positions(db: Session, table_id: int) -> None:
+    db.flush()
+    entries = (
+        db.query(TableQueue)
+        .filter(TableQueue.table_id == table_id)
+        .order_by(TableQueue.position.asc(), TableQueue.joined_at.asc(), TableQueue.id.asc())
+        .all()
+    )
+    for next_position, entry in enumerate(entries, start=1):
+        entry.position = next_position
+
+
+def _occupied_seat_count(db: Session, table_id: int) -> int:
+    return int(
+        db.query(func.count(TableSeat.id))
+        .filter(
+            TableSeat.table_id == table_id,
+            TableSeat.user_id.isnot(None),
+        )
+        .scalar()
+        or 0
+    )
 
 
 def _is_league_admin(db: Session, league_id: int, user_id: int) -> bool:
@@ -471,7 +534,7 @@ def _generate_test_password() -> str:
 
 def _validate_fixture_stack_request(payload: TestFixtureGameplayStackCreate) -> str:
     run_tag = _validate_run_tag(payload.run_tag)
-    if payload.player_count > payload.max_seats:
+    if payload.auto_seat_players and payload.player_count > payload.max_seats:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="player_count cannot exceed max_seats")
     if payload.queued_player_count > payload.max_queue_size:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="queued_player_count cannot exceed max_queue_size")
@@ -1545,6 +1608,59 @@ def _table_to_response_with_tournament_meta(db: Session, table: Table, user_id: 
     return TableResponse(**payload)
 
 
+def _table_responses_with_metadata(db: Session, tables: list[Table], user_id: int | None) -> list[TableResponse]:
+    if not tables:
+        return []
+
+    table_ids = [table.id for table in tables]
+
+    occupied_counts = {
+        int(table_id): int(count)
+        for table_id, count in (
+            db.query(TableSeat.table_id, func.count(TableSeat.id))
+            .filter(
+                TableSeat.table_id.in_(table_ids),
+                TableSeat.user_id.isnot(None),
+            )
+            .group_by(TableSeat.table_id)
+            .all()
+        )
+    }
+    queue_counts = {
+        int(table_id): int(count)
+        for table_id, count in (
+            db.query(TableQueue.table_id, func.count(TableQueue.id))
+            .filter(TableQueue.table_id.in_(table_ids))
+            .group_by(TableQueue.table_id)
+            .all()
+        )
+    }
+
+    my_queue_rows: dict[int, TableQueue] = {}
+    if user_id is not None:
+        for entry in (
+            db.query(TableQueue)
+            .filter(
+                TableQueue.table_id.in_(table_ids),
+                TableQueue.user_id == user_id,
+            )
+            .all()
+        ):
+            my_queue_rows[int(entry.table_id)] = entry
+
+    responses: list[TableResponse] = []
+    for table in tables:
+        response = _table_to_response_with_tournament_meta(db, table, user_id)
+        response.occupied_seat_count = occupied_counts.get(table.id, 0)
+        response.queue_count = queue_counts.get(table.id, 0)
+        my_queue_entry = my_queue_rows.get(table.id)
+        response.my_queue_position = int(my_queue_entry.position) if my_queue_entry else None
+        response.my_queue_buy_in_amount = int(my_queue_entry.reserved_buy_in_amount) if my_queue_entry else None
+        responses.append(response)
+
+    return responses
+
+
 # ============================================================================
 # Authentication Endpoints (Public)
 # ============================================================================
@@ -2150,11 +2266,14 @@ async def create_test_fixture_gameplay_stack(
                 )
             elif payload.auto_seat_players:
                 queue_position = index - payload.player_count
+                queued_wallet = wallet_rows[user.id]
+                queued_wallet.balance -= payload.buy_in
                 db.add(
                     TableQueue(
                         table_id=table.id,
                         user_id=user.id,
                         position=queue_position,
+                        reserved_buy_in_amount=payload.buy_in,
                     )
                 )
                 db.commit()
@@ -3159,7 +3278,7 @@ def get_community_tables(
         Table,
         partition,
     ).all()
-    return [_table_to_response_with_tournament_meta(db, table, user_id) for table in refreshed_tables]
+    return _table_responses_with_metadata(db, refreshed_tables, user_id)
 
 
 @app.post("/api/communities/{community_id}/tables", response_model=TableResponse, status_code=status.HTTP_201_CREATED)
@@ -3823,6 +3942,7 @@ def get_my_active_table_seat(
 @app.post("/api/tables/{table_id}/queue/join", response_model=TableQueuePosition)
 def join_table_queue(
     table_id: int,
+    request: QueueJoinRequest,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -3843,68 +3963,111 @@ def join_table_queue(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Queueing is not available for tournament tables"
         )
-    
-    # Check if user is already in queue
-    existing_queue_entry = db.query(TableQueue).filter(
-        TableQueue.table_id == table_id,
-        TableQueue.user_id == user_id
-    ).first()
-    
+
+    if request.buy_in_amount < table.buy_in:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Minimum buy-in is {table.buy_in} chips"
+        )
+
+    locked_table = _lock_table_for_update(db, table_id)
+    if not locked_table:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+
+    if locked_table.max_queue_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Queue is not enabled for this table"
+        )
+
+    existing_queue_entry = (
+        db.query(TableQueue)
+        .filter(
+            TableQueue.table_id == table_id,
+            TableQueue.user_id == user_id,
+        )
+        .with_for_update()
+        .first()
+    )
     if existing_queue_entry:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You are already in the queue for this table"
         )
-    
-    # Check if user is already seated
-    from .models import TableSeat
-    seated = db.query(TableSeat).filter(
-        TableSeat.table_id == table_id,
-        TableSeat.user_id == user_id
-    ).first()
-    
+
+    seated = (
+        db.query(TableSeat)
+        .filter(
+            TableSeat.table_id == table_id,
+            TableSeat.user_id == user_id,
+        )
+        .with_for_update()
+        .first()
+    )
     if seated:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You are already seated at this table"
         )
-    
-    # Count current queue size
-    current_queue_size = db.query(TableQueue).filter(
-        TableQueue.table_id == table_id
-    ).count()
-    
-    # Check if queue is full
-    if table.max_queue_size and current_queue_size >= table.max_queue_size:
+
+    occupied_seat_count = _occupied_seat_count(db, table_id)
+    if occupied_seat_count < locked_table.max_seats:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Queue is full (max {table.max_queue_size} players)"
+            detail="Table is no longer full; join a seat instead."
         )
-    
-    # Add to queue with next position
-    next_position = current_queue_size + 1
-    
-    from datetime import datetime, timezone
+
+    current_queue_size = int(
+        db.query(func.count(TableQueue.id))
+        .filter(TableQueue.table_id == table_id)
+        .scalar()
+        or 0
+    )
+    if current_queue_size >= locked_table.max_queue_size:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Queue is full (max {locked_table.max_queue_size} players)"
+        )
+
+    wallet = _lock_wallet_for_update(db, user_id, locked_table.community_id)
+    if not wallet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="You don't have a wallet in this community. Join the community first."
+        )
+
+    requested_buy_in = Decimal(request.buy_in_amount)
+    if wallet.balance < requested_buy_in:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient funds. Available: {wallet.balance}, Required: {request.buy_in_amount}"
+        )
+
+    wallet.balance -= requested_buy_in
     queue_entry = TableQueue(
         table_id=table_id,
         user_id=user_id,
-        position=next_position,
-        joined_at=datetime.now(timezone.utc)
+        position=current_queue_size + 1,
+        reserved_buy_in_amount=request.buy_in_amount,
     )
-    
     db.add(queue_entry)
     db.commit()
     db.refresh(queue_entry)
-    
-    logger.info(f"User {user_id} joined queue for table {table_id} at position {next_position}")
-    
+
+    logger.info(
+        "User %s joined queue for table %s at position %s with reserved buy-in %s",
+        user_id,
+        table_id,
+        queue_entry.position,
+        request.buy_in_amount,
+    )
+
     return TableQueuePosition(
-        id=queue_entry.id,
         table_id=table_id,
         user_id=user_id,
         username=user.username,
-        position=next_position,
-        joined_at=queue_entry.joined_at
+        position=queue_entry.position,
+        joined_at=queue_entry.joined_at,
     )
 
 
@@ -3920,45 +4083,42 @@ def leave_table_queue(
     """
     user_id = current_user.get("user_id")
     partition = _get_partition_context_for_user_id(db, user_id)
-    _get_visible_table_or_404(db, table_id, partition)
-    
-    # Find queue entry
-    queue_entry = db.query(TableQueue).filter(
-        TableQueue.table_id == table_id,
-        TableQueue.user_id == user_id
-    ).first()
-
-    table = db.query(Table).filter(Table.id == table_id).first()
-    if table and table.game_type == GameType.TOURNAMENT:
+    visible_table = _get_visible_table_or_404(db, table_id, partition)
+    if visible_table.game_type == GameType.TOURNAMENT:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Queueing is not available for tournament tables"
         )
-    
+
+    table = _lock_table_for_update(db, table_id)
+    if not table:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not found")
+
+    queue_entry = (
+        db.query(TableQueue)
+        .filter(
+            TableQueue.table_id == table_id,
+            TableQueue.user_id == user_id,
+        )
+        .with_for_update()
+        .first()
+    )
     if not queue_entry:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="You are not in the queue for this table"
         )
-    
-    removed_position = queue_entry.position
-    
-    # Remove from queue
+
+    wallet = _lock_wallet_for_update(db, user_id, table.community_id)
+    if not wallet:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wallet not found")
+
+    wallet.balance += Decimal(queue_entry.reserved_buy_in_amount)
     db.delete(queue_entry)
+    _compact_table_queue_positions(db, table_id)
     db.commit()
-    
-    # Reorder remaining queue entries
-    remaining_entries = db.query(TableQueue).filter(
-        TableQueue.table_id == table_id,
-        TableQueue.position > removed_position
-    ).order_by(TableQueue.position).all()
-    
-    for entry in remaining_entries:
-        entry.position -= 1
-    
-    db.commit()
-    
-    logger.info(f"User {user_id} left queue for table {table_id} from position {removed_position}")
+
+    logger.info(f"User {user_id} left queue for table {table_id}")
     
     return None
 
@@ -4517,6 +4677,39 @@ def get_table_config(table_id: int, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/api/internal/tables/{table_id}/active-sessions")
+def get_table_active_sessions(table_id: int, db: Session = Depends(get_db)):
+    table = db.query(Table).filter(Table.id == table_id).first()
+    if not table:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Table not found"
+        )
+
+    sessions = (
+        db.query(TableSession)
+        .filter(
+            TableSession.table_id == table_id,
+            TableSession.left_at.is_(None),
+        )
+        .order_by(TableSession.joined_at.asc(), TableSession.id.asc())
+        .all()
+    )
+    return [
+        {
+            "session_id": session.id,
+            "user_id": session.user_id,
+            "table_id": session.table_id,
+            "community_id": session.community_id,
+            "buy_in_amount": session.buy_in_amount,
+            "joined_at": session.joined_at.isoformat() if session.joined_at else None,
+            "is_test_only": bool(session.is_test_only),
+            "test_run_tag": session.test_run_tag,
+        }
+        for session in sessions
+    ]
+
+
 @app.post("/api/internal/tables/{table_id}/check-cleanup")
 def check_table_cleanup(table_id: int, db: Session = Depends(get_db)):
     """
@@ -4568,198 +4761,265 @@ async def unseat_player(table_id: int, user_id: int, db: Session = Depends(get_d
     This endpoint is called by the game server when a player leaves.
     It clears the seat and automatically seats the first player in queue (if any).
     """
-    from .models import TableSeat
-    
-    # Find the seat
-    seat = db.query(TableSeat).filter(
-        TableSeat.table_id == table_id,
-        TableSeat.user_id == user_id
-    ).first()
-    
+    table = _lock_table_for_update(db, table_id)
+    if not table:
+        return {"success": False, "message": "Table not found"}
+
+    seat = (
+        db.query(TableSeat)
+        .filter(
+            TableSeat.table_id == table_id,
+            TableSeat.user_id == user_id,
+        )
+        .with_for_update()
+        .first()
+    )
     if not seat:
         return {"success": False, "message": "Player not seated at this table"}
-    
-    # Store the seat number before clearing it
+
     freed_seat_number = seat.seat_number
-    
-    # Clear the seat
     seat.user_id = None
     seat.occupied_at = None
 
-    # Close the user's active table session for this table.
-    from sqlalchemy.sql import func
-    active_session = db.query(TableSession).filter(
-        TableSession.user_id == user_id,
-        TableSession.table_id == table_id,
-        TableSession.left_at.is_(None)
-    ).order_by(TableSession.joined_at.desc()).first()
+    active_session = (
+        db.query(TableSession)
+        .filter(
+            TableSession.user_id == user_id,
+            TableSession.table_id == table_id,
+            TableSession.left_at.is_(None),
+        )
+        .order_by(TableSession.joined_at.desc())
+        .first()
+    )
     if active_session:
         active_session.left_at = func.now()
-    db.commit()
-    
-    logger.info(f"Unseated user {user_id} from table {table_id} seat {freed_seat_number}")
-    
-    # Check if there's anyone in the queue
-    first_in_queue = db.query(TableQueue).filter(
-        TableQueue.table_id == table_id
-    ).order_by(TableQueue.position).first()
-    
-    while first_in_queue:
+
+    logger.info("Unseating user %s from table %s seat %s", user_id, table_id, freed_seat_number)
+
+    auto_seated_payload: dict[str, object] | None = None
+
+    while True:
+        first_in_queue = (
+            db.query(TableQueue)
+            .filter(TableQueue.table_id == table_id)
+            .order_by(TableQueue.position.asc(), TableQueue.joined_at.asc(), TableQueue.id.asc())
+            .first()
+        )
+        if not first_in_queue:
+            db.commit()
+            return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
+
         queued_user = db.query(User).filter(User.id == first_in_queue.user_id).first()
         if not queued_user or queued_user.is_banned:
+            refund_amount = int(first_in_queue.reserved_buy_in_amount or table.buy_in)
+            queued_wallet = _lock_wallet_for_update(db, first_in_queue.user_id, table.community_id)
+            if queued_wallet:
+                queued_wallet.balance += Decimal(refund_amount)
             db.delete(first_in_queue)
-            db.commit()
-            remaining_queue = db.query(TableQueue).filter(
-                TableQueue.table_id == table_id,
-                TableQueue.position > first_in_queue.position
-            ).order_by(TableQueue.position).all()
-            for entry in remaining_queue:
-                entry.position -= 1
-            db.commit()
-            first_in_queue = db.query(TableQueue).filter(
-                TableQueue.table_id == table_id
-            ).order_by(TableQueue.position).first()
+            _compact_table_queue_positions(db, table_id)
+            db.flush()
             continue
-        break
-    
-    if first_in_queue:
-        queued_user_id = first_in_queue.user_id
-        queued_user = db.query(User).filter(User.id == queued_user_id).first()
-        
-        if not queued_user:
-            logger.error(f"Queued user {queued_user_id} not found")
-            return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
-        
-        # Get table info for buy-in requirement
-        table = db.query(Table).filter(Table.id == table_id).first()
-        if not table:
-            logger.error(f"Table {table_id} not found")
-            return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
-        
-        # Check user's wallet
-        wallet = db.query(Wallet).filter(
-            Wallet.user_id == queued_user_id,
-            Wallet.community_id == table.community_id
-        ).first()
-        
-        if not wallet:
-            logger.warning(f"User {queued_user_id} has no wallet in community {table.community_id}, cannot auto-seat")
-            return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
-        
-        # Check if wallet has sufficient funds for minimum buy-in
-        if wallet.balance < table.buy_in:
-            logger.warning(f"User {queued_user_id} has insufficient funds ({wallet.balance} < {table.buy_in}), cannot auto-seat")
-            return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
-        
-        # Auto-seat the queued player!
-        buy_in_amount = table.buy_in  # Use minimum buy-in
-        
-        # Debit wallet
-        wallet.balance -= buy_in_amount
-        
-        # Occupy the freed seat
-        seat.user_id = queued_user_id
-        seat.occupied_at = func.now()
 
-        # Close any stale active sessions and create a new session for the auto-seated user.
-        stale_sessions = db.query(TableSession).filter(
-            TableSession.user_id == queued_user_id,
-            TableSession.table_id == table_id,
-            TableSession.left_at.is_(None)
-        ).all()
-        for stale_session in stale_sessions:
-            stale_session.left_at = func.now()
-
-        auto_session = TableSession(
-            user_id=queued_user_id,
+        promotion_id = str(uuid.uuid4())
+        reserved_buy_in_amount = int(first_in_queue.reserved_buy_in_amount or table.buy_in)
+        seat_request = SeatPlayerRequest(
             table_id=table_id,
+            user_id=queued_user.id,
+            username=queued_user.username,
+            stack=reserved_buy_in_amount,
+            seat_number=freed_seat_number,
+            promotion_id=promotion_id,
             community_id=table.community_id,
             table_name=table.name,
-            buy_in_amount=buy_in_amount,
             is_test_only=table.is_test_only,
             test_run_tag=table.test_run_tag,
         )
-        db.add(auto_session)
-        
-        # Remove from queue
-        db.delete(first_in_queue)
-        
-        # Update queue positions for remaining players
-        remaining_queue = db.query(TableQueue).filter(
-            TableQueue.table_id == table_id,
-            TableQueue.position > first_in_queue.position
-        ).order_by(TableQueue.position).all()
-        
-        for entry in remaining_queue:
-            entry.position -= 1
-        
-        db.commit()
-        db.refresh(wallet)
-        
-        logger.info(f"Auto-seated user {queued_user_id} ({queued_user.username}) from queue to seat {freed_seat_number}")
-        logger.info(f"Debited {buy_in_amount} from wallet. New balance: {wallet.balance}")
-        
-        # Notify game server to seat the player
+
+        runtime_applied = False
+        runtime_response_text: str | None = None
         try:
-            seat_request = SeatPlayerRequest(
-                table_id=table_id,
-                user_id=queued_user_id,
-                username=queued_user.username,
-                stack=buy_in_amount,
-                seat_number=freed_seat_number,
-                community_id=table.community_id,
-                table_name=table.name,
-                is_test_only=table.is_test_only,
-                test_run_tag=table.test_run_tag,
-            )
-            
             response = await post_game_server_json(
                 "/_internal/seat-player",
                 seat_request.model_dump(),
-                timeout=5.0
+                timeout=2.0,
             )
-
+            runtime_response_text = response.text
             if response.status_code == 200:
-                logger.info(f"Successfully seated queued player {queued_user.username} in game server")
+                runtime_applied = True
+            else:
+                logger.error(
+                    "Promotion %s rejected by game server for table %s user %s: %s",
+                    promotion_id,
+                    table_id,
+                    queued_user.id,
+                    runtime_response_text,
+                )
+        except httpx.RequestError as exc:
+            logger.warning(
+                "Promotion %s transport failure for table %s user %s: %s",
+                promotion_id,
+                table_id,
+                queued_user.id,
+                exc,
+            )
+            try:
+                confirm_response = await get_game_server_json(
+                    f"/_internal/promotions/{promotion_id}",
+                    timeout=2.0,
+                )
+            except httpx.RequestError as confirm_exc:
+                logger.error(
+                    "Promotion %s confirmation unavailable after transport failure: %s",
+                    promotion_id,
+                    confirm_exc,
+                )
+                db.commit()
                 return {
                     "success": True,
                     "message": f"Player unseated from seat {freed_seat_number}",
-                    "auto_seated": {
-                        "user_id": queued_user_id,
-                        "username": queued_user.username,
-                        "seat_number": freed_seat_number,
-                        "buy_in": buy_in_amount
-                    }
+                    "promotion_pending_confirmation": True,
+                    "promotion_id": promotion_id,
                 }
+
+            if confirm_response.status_code == 200:
+                confirmation_payload = confirm_response.json()
+                confirmation_status = str(confirmation_payload.get("status") or "")
+                if confirmation_status == "applied":
+                    runtime_applied = True
+                elif confirmation_status == "not_found":
+                    runtime_applied = False
+                else:
+                    db.commit()
+                    return {
+                        "success": True,
+                        "message": f"Player unseated from seat {freed_seat_number}",
+                        "promotion_pending_confirmation": True,
+                        "promotion_id": promotion_id,
+                    }
             else:
-                logger.error(f"Failed to seat player in game server: {response.text}")
-                # Rollback the seat assignment since game server failed
-                seat.user_id = None
-                seat.occupied_at = None
-                wallet.balance += buy_in_amount
-                db.query(TableSession).filter(
-                    TableSession.user_id == queued_user_id,
-                    TableSession.table_id == table_id,
-                    TableSession.left_at.is_(None)
-                ).update({"left_at": func.now()})
                 db.commit()
-                return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
-                    
-        except Exception as e:
-            logger.error(f"Error notifying game server: {e}")
-            # Rollback the seat assignment since game server failed
-            seat.user_id = None
-            seat.occupied_at = None
-            wallet.balance += buy_in_amount
-            db.query(TableSession).filter(
-                TableSession.user_id == queued_user_id,
-                TableSession.table_id == table_id,
-                TableSession.left_at.is_(None)
-            ).update({"left_at": func.now()})
-            db.commit()
-            return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
-    
-    return {"success": True, "message": f"Player unseated from seat {freed_seat_number}"}
+                return {
+                    "success": True,
+                    "message": f"Player unseated from seat {freed_seat_number}",
+                    "promotion_pending_confirmation": True,
+                    "promotion_id": promotion_id,
+                }
+
+        if runtime_applied:
+            seat.user_id = queued_user.id
+            seat.occupied_at = func.now()
+
+            stale_sessions = (
+                db.query(TableSession)
+                .filter(
+                    TableSession.user_id == queued_user.id,
+                    TableSession.table_id == table_id,
+                    TableSession.left_at.is_(None),
+                )
+                .all()
+            )
+            for stale_session in stale_sessions:
+                stale_session.left_at = func.now()
+
+            promoted_session = TableSession(
+                user_id=queued_user.id,
+                table_id=table_id,
+                community_id=table.community_id,
+                table_name=table.name,
+                buy_in_amount=reserved_buy_in_amount,
+                is_test_only=table.is_test_only,
+                test_run_tag=table.test_run_tag,
+            )
+            db.add(promoted_session)
+            db.delete(first_in_queue)
+            _compact_table_queue_positions(db, table_id)
+
+            try:
+                db.commit()
+            except Exception as commit_exc:
+                db.rollback()
+                logger.error(
+                    "Promotion %s runtime applied but DB commit failed for table %s user %s: %s",
+                    promotion_id,
+                    table_id,
+                    queued_user.id,
+                    commit_exc,
+                )
+                try:
+                    await rollback_game_server_promotion(promotion_id, timeout=3.0)
+                except Exception as rollback_exc:
+                    logger.error("Promotion %s rollback failed: %s", promotion_id, rollback_exc)
+
+                recovery_table = _lock_table_for_update(db, table_id)
+                recovery_seat = (
+                    db.query(TableSeat)
+                    .filter(
+                        TableSeat.table_id == table_id,
+                        TableSeat.seat_number == freed_seat_number,
+                    )
+                    .with_for_update()
+                    .first()
+                )
+                if recovery_table and recovery_seat and recovery_seat.user_id == user_id:
+                    recovery_seat.user_id = None
+                    recovery_seat.occupied_at = None
+                recovery_session = (
+                    db.query(TableSession)
+                    .filter(
+                        TableSession.user_id == user_id,
+                        TableSession.table_id == table_id,
+                        TableSession.left_at.is_(None),
+                    )
+                    .order_by(TableSession.joined_at.desc())
+                    .first()
+                )
+                if recovery_session:
+                    recovery_session.left_at = func.now()
+                db.commit()
+
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Promotion runtime applied but database commit failed",
+                ) from commit_exc
+
+            auto_seated_payload = {
+                "user_id": queued_user.id,
+                "username": queued_user.username,
+                "seat_number": freed_seat_number,
+                "buy_in": reserved_buy_in_amount,
+                "promotion_id": promotion_id,
+            }
+            logger.info(
+                "Auto-seated user %s (%s) from queue to seat %s with reserved buy-in %s",
+                queued_user.id,
+                queued_user.username,
+                freed_seat_number,
+                reserved_buy_in_amount,
+            )
+            return {
+                "success": True,
+                "message": f"Player unseated from seat {freed_seat_number}",
+                "auto_seated": auto_seated_payload,
+            }
+
+        queued_wallet = _lock_wallet_for_update(db, queued_user.id, table.community_id)
+        if queued_wallet:
+            queued_wallet.balance += Decimal(reserved_buy_in_amount)
+        db.delete(first_in_queue)
+        _compact_table_queue_positions(db, table_id)
+        db.commit()
+        logger.warning(
+            "Promotion failed definitively for table %s user %s; queue row removed and funds refunded",
+            table_id,
+            queued_user.id,
+        )
+        return {
+            "success": True,
+            "message": f"Player unseated from seat {freed_seat_number}",
+            "promotion_failed": True,
+            "promotion_id": promotion_id,
+            "runtime_error": runtime_response_text,
+        }
 
 
 @app.post("/api/tables/{table_id}/leave")
