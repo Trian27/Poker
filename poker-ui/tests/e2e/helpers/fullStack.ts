@@ -103,8 +103,9 @@ interface DisruptionSummary {
 }
 
 interface FullStackSummary {
-  mode: 'compose-browser-e2e';
+  mode: 'compose-browser-pr-smoke' | 'compose-browser-e2e';
   scenario: string;
+  required_check: boolean;
   phase: string;
   status: 'running' | 'passed' | 'failed';
   error: string | null;
@@ -158,10 +159,15 @@ export class SummaryTracker {
   private currentPhase: string | null = null;
   private phaseStartedAt: number | null = null;
 
-  constructor(artifactDir: string, scenario: string) {
+  constructor(
+    artifactDir: string,
+    scenario: string,
+    mode: FullStackSummary['mode'] = 'compose-browser-e2e',
+  ) {
     this.artifactDir = artifactDir;
     this.summary = {
-      mode: 'compose-browser-e2e',
+      mode,
+      required_check: mode === 'compose-browser-pr-smoke',
       scenario,
       phase: 'starting',
       status: 'running',
