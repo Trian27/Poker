@@ -146,6 +146,36 @@ jobs:
           path: logs/compose-browser-pr-smoke
           if-no-files-found: ignore
 
+  compose-browser-queue-pr:
+    name: compose-browser-queue-pr
+    needs: compose-browser-pr-smoke
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs['compose-browser-pr-smoke'].result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: compose-browser-queue-pr-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      COMPOSE_PROJECT_NAME: gameplay-browser-queue-pr-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: poker-ui/package-lock.json
+      - run: npm ci
+        working-directory: poker-ui
+      - run: npx playwright install --with-deps chromium
+        working-directory: poker-ui
+      - run: ./scripts/test-gameplay.sh compose-browser-queue-pr
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-browser-queue-pr-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/compose-browser-queue-pr
+          if-no-files-found: ignore
+
   compose-autonomous-e2e:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

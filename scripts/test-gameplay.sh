@@ -240,7 +240,7 @@ run_compose_browser_suite() {
   local browser_log="$ARTIFACT_DIR/browser-e2e.log"
   (
     cd "$ROOT_DIR/poker-ui"
-    # Smoke mode intentionally targets only happy-path.spec.ts via the npm script.
+    # PR smoke and queue shadow modes intentionally target a single spec via the npm script.
     PLAYWRIGHT_FULL_STACK=1 \
     PLAYWRIGHT_FULL_STACK_MODE="$full_stack_mode" \
     PLAYWRIGHT_SKIP_WEB_SERVER=1 \
@@ -271,11 +271,14 @@ case "$MODE" in
   compose-browser-pr-smoke)
     run_compose_browser_suite "compose-browser-pr-smoke" "test:e2e:gameplay:full-stack:smoke" "compose-browser-pr-smoke"
     ;;
+  compose-browser-queue-pr)
+    run_compose_browser_suite "compose-browser-queue-pr" "test:e2e:gameplay:full-stack:queue" "compose-browser-queue-pr"
+    ;;
   compose-browser-e2e)
     run_compose_browser_suite "compose-browser-e2e" "test:e2e:gameplay:full-stack" "compose-browser-e2e"
     ;;
   *)
-    echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot|compose-browser-pr-smoke|compose-browser-e2e] [driver args...]" >&2
+    echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot|compose-browser-pr-smoke|compose-browser-queue-pr|compose-browser-e2e] [driver args...]" >&2
     exit 1
     ;;
 esac

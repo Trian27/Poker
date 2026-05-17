@@ -34,7 +34,7 @@ export const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 export const ARTIFACT_ROOT_DIR = process.env.PLAYWRIGHT_ARTIFACT_DIR || 'test-results/browser-full-stack';
 export const FULL_STACK_MODE =
-  (process.env.PLAYWRIGHT_FULL_STACK_MODE as 'compose-browser-pr-smoke' | 'compose-browser-e2e' | undefined)
+  (process.env.PLAYWRIGHT_FULL_STACK_MODE as 'compose-browser-pr-smoke' | 'compose-browser-queue-pr' | 'compose-browser-e2e' | undefined)
   || 'compose-browser-e2e';
 export const BROWSER_VIEWPORT = { width: 1366, height: 768 };
 const CLEANUP_TIMEOUT_MS = 60_000;
