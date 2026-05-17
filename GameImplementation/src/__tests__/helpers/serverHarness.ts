@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import axios from 'axios';
+import axios, { type AxiosResponse } from 'axios';
 import net from 'net';
 import { io as ioc, type Socket as ClientSocket } from 'socket.io-client';
 import { PokerServer } from '../../server';
@@ -13,6 +13,19 @@ export interface HarnessUser {
   email?: string;
   isTestUser?: boolean;
   testRunTag?: string | null;
+}
+
+export interface SeatPlayerRequestPayload {
+  tableId: number;
+  userId: number;
+  username: string;
+  stack: number;
+  seatNumber: number;
+  communityId?: number;
+  tableName?: string;
+  isTestOnly?: boolean;
+  testRunTag?: string | null;
+  promotionId?: string | null;
 }
 
 export const createAuthToken = (user: HarnessUser): string => jwt.sign(
@@ -78,18 +91,8 @@ export class ServerHarness {
     });
   }
 
-  async seatPlayer(payload: {
-    tableId: number;
-    userId: number;
-    username: string;
-    stack: number;
-    seatNumber: number;
-    communityId?: number;
-    tableName?: string;
-    isTestOnly?: boolean;
-    testRunTag?: string | null;
-  }): Promise<void> {
-    const response = await axios.post(`${this.baseHttpUrl}/_internal/seat-player`, {
+  async seatPlayerRaw(payload: SeatPlayerRequestPayload): Promise<AxiosResponse<any>> {
+    return axios.post(`${this.baseHttpUrl}/_internal/seat-player`, {
       table_id: payload.tableId,
       user_id: payload.userId,
       username: payload.username,
@@ -99,8 +102,32 @@ export class ServerHarness {
       table_name: payload.tableName,
       is_test_only: payload.isTestOnly,
       test_run_tag: payload.testRunTag,
+      promotion_id: payload.promotionId,
+    }, {
+      validateStatus: () => true,
     });
+  }
+
+  async seatPlayer(payload: SeatPlayerRequestPayload): Promise<void> {
+    const response = await this.seatPlayerRaw(payload);
     expect(response.status).toBe(200);
+  }
+
+  async getPromotionStatus(promotionId: string): Promise<AxiosResponse<any>> {
+    return axios.get(`${this.baseHttpUrl}/_internal/promotions/${promotionId}`, {
+      validateStatus: () => true,
+    });
+  }
+
+  async rollbackPromotion(promotionId: string): Promise<void> {
+    const response = await this.rollbackPromotionRaw(promotionId);
+    expect(response.status).toBe(200);
+  }
+
+  async rollbackPromotionRaw(promotionId: string): Promise<AxiosResponse<any>> {
+    return axios.post(`${this.baseHttpUrl}/_internal/promotions/${promotionId}/rollback`, {}, {
+      validateStatus: () => true,
+    });
   }
 
   async getGameState(gameId: string, userId: number): Promise<any> {

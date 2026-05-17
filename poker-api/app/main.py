@@ -4881,21 +4881,24 @@ async def unseat_player(table_id: int, user_id: int, db: Session = Depends(get_d
                     "promotion_id": promotion_id,
                 }
 
-            if confirm_response.status_code == 200:
+            try:
                 confirmation_payload = confirm_response.json()
-                confirmation_status = str(confirmation_payload.get("status") or "")
-                if confirmation_status == "applied":
-                    runtime_applied = True
-                elif confirmation_status == "not_found":
-                    runtime_applied = False
-                else:
-                    db.commit()
-                    return {
-                        "success": True,
-                        "message": f"Player unseated from seat {freed_seat_number}",
-                        "promotion_pending_confirmation": True,
-                        "promotion_id": promotion_id,
-                    }
+            except ValueError:
+                confirmation_payload = {}
+
+            confirmation_status = str(confirmation_payload.get("status") or "")
+            if confirm_response.status_code == 200 and confirmation_status == "applied":
+                runtime_applied = True
+            elif confirmation_status == "not_found" and confirm_response.status_code in {200, 404}:
+                runtime_applied = False
+            elif confirm_response.status_code == 200:
+                db.commit()
+                return {
+                    "success": True,
+                    "message": f"Player unseated from seat {freed_seat_number}",
+                    "promotion_pending_confirmation": True,
+                    "promotion_id": promotion_id,
+                }
             else:
                 db.commit()
                 return {
