@@ -27,6 +27,25 @@ class SetupBundle:
     community: Any
 
 
+@dataclass
+class QueuePromotionCandidate:
+    user: Any
+    wallet: Any
+    reserved_buy_in_amount: int
+    queue_entry_id: int
+    position: int
+
+
+@dataclass
+class QueuePromotionFixture:
+    setup: SetupBundle
+    table: Any
+    leaving_user: Any
+    occupant: Any
+    queued_players: list[QueuePromotionCandidate]
+    freed_seat_number: int = 1
+
+
 def create_user(
     db,
     auth_module: Any,
@@ -172,6 +191,189 @@ def create_cash_table(db, models_module: Any, community: Any, owner: Any, *, max
         db.add(models_module.TableSeat(table_id=table.id, seat_number=seat_number))
     db.commit()
     return table
+
+
+def build_request_error(message: str) -> httpx.RequestError:
+    return httpx.RequestError(message, request=httpx.Request("POST", "http://game-server.test"))
+
+
+def get_active_table_session(db, models_module: Any, table_id: int, user_id: int) -> Any:
+    return (
+        db.query(models_module.TableSession)
+        .filter(
+            models_module.TableSession.table_id == table_id,
+            models_module.TableSession.user_id == user_id,
+            models_module.TableSession.left_at.is_(None),
+        )
+        .order_by(models_module.TableSession.joined_at.desc())
+        .first()
+    )
+
+
+def assert_leaving_player_unseated(db, models_module: Any, *, table_id: int, user_id: int, freed_seat_number: int) -> None:
+    seat = (
+        db.query(models_module.TableSeat)
+        .filter(
+            models_module.TableSeat.table_id == table_id,
+            models_module.TableSeat.seat_number == freed_seat_number,
+        )
+        .one()
+    )
+    assert seat.user_id != user_id
+    assert get_active_table_session(db, models_module, table_id, user_id) is None
+
+
+def assert_queue_entry_preserved(db, models_module: Any, *, table_id: int, candidate: QueuePromotionCandidate) -> Any:
+    entry = (
+        db.query(models_module.TableQueue)
+        .filter(models_module.TableQueue.id == candidate.queue_entry_id)
+        .one()
+    )
+    assert entry.user_id == candidate.user.id
+    assert entry.table_id == table_id
+    assert int(entry.reserved_buy_in_amount) == candidate.reserved_buy_in_amount
+    assert entry.position == candidate.position
+    return entry
+
+
+def assert_queue_entry_deleted(db, models_module: Any, *, queue_entry_id: int) -> None:
+    assert (
+        db.query(models_module.TableQueue)
+        .filter(models_module.TableQueue.id == queue_entry_id)
+        .first()
+        is None
+    )
+
+
+def assert_wallet_balance(db, wallet: Any, expected_balance: float) -> None:
+    db.refresh(wallet)
+    assert float(wallet.balance) == expected_balance
+
+
+def assert_seat_empty(db, models_module: Any, *, table_id: int, seat_number: int) -> None:
+    seat = (
+        db.query(models_module.TableSeat)
+        .filter(
+            models_module.TableSeat.table_id == table_id,
+            models_module.TableSeat.seat_number == seat_number,
+        )
+        .one()
+    )
+    assert seat.user_id is None
+
+
+def assert_seat_occupied_by(db, models_module: Any, *, table_id: int, seat_number: int, user_id: int) -> None:
+    seat = (
+        db.query(models_module.TableSeat)
+        .filter(
+            models_module.TableSeat.table_id == table_id,
+            models_module.TableSeat.seat_number == seat_number,
+        )
+        .one()
+    )
+    assert seat.user_id == user_id
+
+
+def assert_no_promoted_session(db, models_module: Any, *, table_id: int, user_id: int) -> None:
+    assert get_active_table_session(db, models_module, table_id, user_id) is None
+
+
+def assert_promoted_session(db, models_module: Any, *, table_id: int, user_id: int, buy_in_amount: int) -> None:
+    session = get_active_table_session(db, models_module, table_id, user_id)
+    assert session is not None
+    assert session.buy_in_amount == buy_in_amount
+
+
+def setup_queue_promotion_fixture(
+    client,
+    db,
+    auth_state: dict[str, Any],
+    app_modules: dict[str, Any],
+    *,
+    queue_specs: list[dict[str, Any]],
+    table_buy_in: int = 200,
+) -> QueuePromotionFixture:
+    models_module = app_modules["models"]
+    setup = seed_league_graph(db, app_modules)
+    create_wallet(db, models_module, setup.owner, setup.community, 1000)
+    occupant = create_user(db, app_modules["auth"], models_module, "promotion_occupant")
+    table = create_cash_table(db, models_module, setup.community, setup.owner, max_seats=2, buy_in=table_buy_in)
+
+    seat_one = (
+        db.query(models_module.TableSeat)
+        .filter(models_module.TableSeat.table_id == table.id, models_module.TableSeat.seat_number == 1)
+        .one()
+    )
+    seat_two = (
+        db.query(models_module.TableSeat)
+        .filter(models_module.TableSeat.table_id == table.id, models_module.TableSeat.seat_number == 2)
+        .one()
+    )
+    seat_one.user_id = setup.owner.id
+    seat_two.user_id = occupant.id
+    db.add_all([
+        models_module.TableSession(
+            user_id=setup.owner.id,
+            table_id=table.id,
+            community_id=setup.community.id,
+            table_name=table.name,
+            buy_in_amount=table_buy_in,
+        ),
+        models_module.TableSession(
+            user_id=occupant.id,
+            table_id=table.id,
+            community_id=setup.community.id,
+            table_name=table.name,
+            buy_in_amount=table_buy_in,
+        ),
+    ])
+    db.commit()
+
+    queued_players: list[QueuePromotionCandidate] = []
+    for expected_position, spec in enumerate(queue_specs, start=1):
+        user = spec.get("user")
+        if user is None:
+            user_key = spec.get("user_key")
+            if not user_key:
+                raise AssertionError("queue_specs entries must define either user or user_key")
+            user = getattr(setup, user_key)
+        wallet = create_wallet(db, models_module, user, setup.community, spec.get("wallet_balance", 1000))
+        reserved_buy_in_amount = int(spec["buy_in_amount"])
+
+        set_current_user(auth_state, user)
+        queue_join = client.post(f"/api/tables/{table.id}/queue/join", json={"buy_in_amount": reserved_buy_in_amount})
+        assert queue_join.status_code == 200, queue_join.text
+
+        queue_entry = (
+            db.query(models_module.TableQueue)
+            .filter(
+                models_module.TableQueue.table_id == table.id,
+                models_module.TableQueue.user_id == user.id,
+            )
+            .one()
+        )
+        if spec.get("ban_after_join"):
+            user.is_banned = True
+            db.commit()
+            db.refresh(user)
+
+        queued_players.append(
+            QueuePromotionCandidate(
+                user=user,
+                wallet=wallet,
+                reserved_buy_in_amount=reserved_buy_in_amount,
+                queue_entry_id=queue_entry.id,
+                position=expected_position,
+            )
+        )
+
+    return QueuePromotionFixture(
+        setup=setup,
+        table=table,
+        leaving_user=setup.owner,
+        occupant=occupant,
+        queued_players=queued_players,
+    )
 
 
 def test_create_table_populates_seats_and_defaults(client, db_session, auth_state, app_modules):
@@ -479,6 +681,571 @@ def test_unseat_promotes_first_queued_player_and_debits_wallet(client, db_sessio
     assert promoted_session.buy_in_amount == 275
 
 
+def test_queue_promotion_definitive_runtime_409_rejection_refunds_and_drops_head(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[str] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        return httpx.Response(409, json={"error": "seat_unavailable"})
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        raise AssertionError("confirmation should not be requested after definitive runtime rejection")
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append(promotion_id)
+        raise AssertionError("rollback should not be requested after definitive runtime rejection")
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["promotion_failed"] is True
+    assert payload["promotion_id"]
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_empty(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+    )
+    assert_queue_entry_deleted(db_session, models_module, queue_entry_id=queued_player.queue_entry_id)
+    assert_wallet_balance(db_session, queued_player.wallet, 1000.0)
+    assert_no_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+    )
+    assert len(post_calls) == 1
+    assert post_calls[0]["payload"]["user_id"] == queued_player.user.id
+    assert confirm_calls == []
+    assert rollback_calls == []
+
+
+def test_queue_promotion_transport_failure_confirmation_applied_commits_promotion(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[str] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        raise build_request_error("seat-player transport failure")
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        promotion_id = path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json={
+            "status": "applied",
+            "promotion_id": promotion_id,
+            "table_id": fixture.table.id,
+            "user_id": queued_player.user.id,
+            "seat_number": fixture.freed_seat_number,
+        })
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append(promotion_id)
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["auto_seated"]["user_id"] == queued_player.user.id
+    assert payload["auto_seated"]["buy_in"] == queued_player.reserved_buy_in_amount
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_occupied_by(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+        user_id=queued_player.user.id,
+    )
+    assert_queue_entry_deleted(db_session, models_module, queue_entry_id=queued_player.queue_entry_id)
+    assert_wallet_balance(db_session, queued_player.wallet, 725.0)
+    assert_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+        buy_in_amount=queued_player.reserved_buy_in_amount,
+    )
+    assert len(post_calls) == 1
+    assert len(confirm_calls) == 1
+    assert rollback_calls == []
+
+
+def test_queue_promotion_transport_failure_confirmation_not_found_refunds_and_drops_head(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[str] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        raise build_request_error("seat-player transport failure")
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        promotion_id = path.rsplit("/", 1)[-1]
+        return httpx.Response(404, json={"status": "not_found", "promotion_id": promotion_id})
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append(promotion_id)
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["promotion_failed"] is True
+    assert payload["promotion_id"]
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_empty(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+    )
+    assert_queue_entry_deleted(db_session, models_module, queue_entry_id=queued_player.queue_entry_id)
+    assert_wallet_balance(db_session, queued_player.wallet, 1000.0)
+    assert_no_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+    )
+    assert len(post_calls) == 1
+    assert len(confirm_calls) == 1
+    assert rollback_calls == []
+
+
+def test_queue_promotion_transport_failure_confirmation_unavailable_preserves_reservation(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[str] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        raise build_request_error("seat-player transport failure")
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        raise build_request_error("promotion confirmation unavailable")
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append(promotion_id)
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["promotion_pending_confirmation"] is True
+    assert payload["promotion_id"]
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_empty(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+    )
+    preserved_entry = assert_queue_entry_preserved(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        candidate=queued_player,
+    )
+    assert preserved_entry.id == queued_player.queue_entry_id
+    assert_wallet_balance(db_session, queued_player.wallet, 725.0)
+    assert_no_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+    )
+    assert len(post_calls) == 1
+    assert len(confirm_calls) == 1
+    assert rollback_calls == []
+
+
+def test_queue_promotion_transport_failure_confirmation_unknown_status_preserves_reservation(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[str] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        raise build_request_error("seat-player transport failure")
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        return httpx.Response(200, json={"status": "unexpected_test_status"})
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append(promotion_id)
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["promotion_pending_confirmation"] is True
+    assert payload["promotion_id"]
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_empty(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+    )
+    preserved_entry = assert_queue_entry_preserved(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        candidate=queued_player,
+    )
+    assert preserved_entry.id == queued_player.queue_entry_id
+    assert_wallet_balance(db_session, queued_player.wallet, 725.0)
+    assert_no_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+    )
+    assert len(post_calls) == 1
+    assert len(confirm_calls) == 1
+    assert rollback_calls == []
+
+
+def test_transport_failure_confirmation_rolled_back_preserves_current_pending_policy(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[str] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        raise build_request_error("seat-player transport failure")
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        promotion_id = path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json={
+            "status": "rolled_back",
+            "promotion_id": promotion_id,
+            "table_id": fixture.table.id,
+            "user_id": queued_player.user.id,
+            "seat_number": fixture.freed_seat_number,
+        })
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append(promotion_id)
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["promotion_pending_confirmation"] is True
+    assert payload["promotion_id"]
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_empty(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+    )
+    preserved_entry = assert_queue_entry_preserved(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        candidate=queued_player,
+    )
+    assert preserved_entry.id == queued_player.queue_entry_id
+    assert_wallet_balance(db_session, queued_player.wallet, 725.0)
+    assert_no_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+    )
+    assert len(post_calls) == 1
+    assert len(confirm_calls) == 1
+    assert rollback_calls == []
+
+
+def test_queue_promotion_runtime_applied_then_db_commit_failure_rolls_back_and_preserves_reservation(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 275},
+        ],
+    )
+    queued_player = fixture.queued_players[0]
+    post_calls: list[dict[str, Any]] = []
+    confirm_calls: list[dict[str, Any]] = []
+    rollback_calls: list[dict[str, Any]] = []
+    commit_armed = {"value": False}
+    commit_failed = {"value": False}
+    session_class = app_modules["database"].SessionLocal.class_
+    real_commit = session_class.commit
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        commit_armed["value"] = True
+        return httpx.Response(200, json={"success": True})
+
+    async def fake_get_game_server_json(path: str, timeout: float = 10.0) -> httpx.Response:
+        confirm_calls.append({"path": path, "timeout": timeout})
+        raise AssertionError("confirmation should not be used after a successful seat-player response")
+
+    async def fake_rollback_game_server_promotion(promotion_id: str, timeout: float = 3.0) -> httpx.Response:
+        rollback_calls.append({"promotion_id": promotion_id, "timeout": timeout})
+        return httpx.Response(200, json={"success": True})
+
+    def fail_final_promotion_commit(self, *args, **kwargs):
+        if commit_armed["value"] and not commit_failed["value"]:
+            commit_failed["value"] = True
+            raise RuntimeError("forced promotion commit failure")
+        return real_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "get_game_server_json", fake_get_game_server_json)
+    monkeypatch.setattr(app_modules["main"], "rollback_game_server_promotion", fake_rollback_game_server_promotion)
+    monkeypatch.setattr(session_class, "commit", fail_final_promotion_commit)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 503, response.text
+    assert "database commit failed" in response.json()["detail"].lower()
+
+    db_session.rollback()
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_empty(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+    )
+    preserved_entry = assert_queue_entry_preserved(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        candidate=queued_player,
+    )
+    assert preserved_entry.id == queued_player.queue_entry_id
+    assert_wallet_balance(db_session, queued_player.wallet, 725.0)
+    assert_no_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=queued_player.user.id,
+    )
+    assert len(post_calls) == 1
+    assert confirm_calls == []
+    assert len(rollback_calls) == 1
+    assert rollback_calls[0]["promotion_id"] == post_calls[0]["payload"]["promotion_id"]
+
+
+def test_queue_promotion_skips_banned_head_refunds_them_and_promotes_next_valid_user(client, db_session, auth_state, app_modules, monkeypatch):
+    models_module = app_modules["models"]
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[
+            {"user_key": "member", "buy_in_amount": 250, "ban_after_join": True},
+            {"user_key": "outsider", "buy_in_amount": 300},
+        ],
+    )
+    banned_player, valid_player = fixture.queued_players
+    post_calls: list[dict[str, Any]] = []
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        post_calls.append({"path": path, "payload": payload, "timeout": timeout})
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["auto_seated"]["user_id"] == valid_player.user.id
+    assert payload["auto_seated"]["buy_in"] == valid_player.reserved_buy_in_amount
+
+    db_session.expire_all()
+    assert_leaving_player_unseated(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=fixture.leaving_user.id,
+        freed_seat_number=fixture.freed_seat_number,
+    )
+    assert_seat_occupied_by(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        seat_number=fixture.freed_seat_number,
+        user_id=valid_player.user.id,
+    )
+    assert_queue_entry_deleted(db_session, models_module, queue_entry_id=banned_player.queue_entry_id)
+    assert_queue_entry_deleted(db_session, models_module, queue_entry_id=valid_player.queue_entry_id)
+    assert_wallet_balance(db_session, banned_player.wallet, 1000.0)
+    assert_wallet_balance(db_session, valid_player.wallet, 700.0)
+    assert_promoted_session(
+        db_session,
+        models_module,
+        table_id=fixture.table.id,
+        user_id=valid_player.user.id,
+        buy_in_amount=valid_player.reserved_buy_in_amount,
+    )
+    assert len(post_calls) == 1
+    assert post_calls[0]["payload"]["user_id"] == valid_player.user.id
+    assert post_calls[0]["payload"]["promotion_id"] == payload["auto_seated"]["promotion_id"]
 
 def test_active_seat_endpoint_reflects_join_and_leave(client, db_session, auth_state, app_modules, monkeypatch):
     models_module = app_modules["models"]
