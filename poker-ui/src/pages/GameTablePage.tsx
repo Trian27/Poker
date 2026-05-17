@@ -954,16 +954,14 @@ export const GameTablePage: React.FC = () => {
     if (!spectatorMode && currentUserId !== null && Number.isFinite(tableId) && tableId > 0) {
       suppressAutoRejoinForUserTable(currentUserId, tableId);
     }
-    if (!spectatorMode && Number.isFinite(tableId)) {
+    if (socket) {
+      socket.emit('leave_game', !spectatorMode && Number.isFinite(tableId) ? { tableId } : undefined);
+    } else if (!spectatorMode && Number.isFinite(tableId)) {
       try {
         await tablesApi.leave(tableId);
       } catch (err) {
         console.warn('Failed to leave table via API fallback:', getApiErrorMessage(err, 'Leave fallback failed'));
       }
-    }
-    if (socket) {
-      socket.emit('leave_game', !spectatorMode && Number.isFinite(tableId) ? { tableId } : undefined);
-      socket.close();
     }
     backToCommunity();
   };
@@ -1343,7 +1341,7 @@ export const GameTablePage: React.FC = () => {
           <div className="spinner"></div>
           <p>{reconnecting ? 'Reconnecting to game...' : 'Connecting to game server...'}</p>
           {error && <p className="error">{error}</p>}
-          <button onClick={handleLeaveGame} className="btn-secondary">
+          <button onClick={handleLeaveGame} className="btn-secondary" data-testid="leave-game-button">
             Back to Lobby
           </button>
         </div>
@@ -1357,7 +1355,7 @@ export const GameTablePage: React.FC = () => {
         <div className="waiting-overlay">
           <h2>{spectatorMode ? 'Starting spectator mode...' : 'Waiting for game to start...'}</h2>
           <p>{spectatorMode ? 'Waiting for live table state.' : 'Please wait while other players join.'}</p>
-          <button onClick={handleLeaveGame} className="btn-secondary">
+          <button onClick={handleLeaveGame} className="btn-secondary" data-testid="leave-game-button">
             {spectatorMode ? 'Back to Community' : 'Leave Game'}
           </button>
         </div>
@@ -1381,7 +1379,7 @@ export const GameTablePage: React.FC = () => {
             </span>
           )}
           <RulesScrollHelp variant="game" />
-          <button onClick={handleLeaveGame} className="btn-leave">
+          <button onClick={handleLeaveGame} className="btn-leave" data-testid="leave-game-button">
             Leave
           </button>
         </div>

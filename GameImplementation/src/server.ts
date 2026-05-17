@@ -72,6 +72,30 @@ interface TableReadiness {
   playerIds: Map<string, string>; // userId -> playerId mapping
   gameStarted: boolean;
 }
+
+interface PromotionPayloadIdentity {
+  table_id: number;
+  user_id: number;
+  username: string;
+  stack: number;
+  seat_number: number;
+  community_id?: number;
+  table_name?: string;
+  is_test_only?: boolean;
+  test_run_tag?: string | null;
+}
+
+interface PromotionRecord {
+  promotionId: string;
+  payloadKey: string;
+  gameId: string;
+  tableId: number;
+  userId: number;
+  seatNumber: number;
+  playerId: string;
+  status: 'applied' | 'rolled_back';
+  createdAt: number;
+}
 /**
  * Real-time poker game server using Socket.io
  */
@@ -93,12 +117,14 @@ export class PokerServer {
   private spectatorsByGame: Map<string, Map<string, number>> = new Map(); // gameId -> socketId -> userId
   private spectatorSocketToGame: Map<string, string> = new Map(); // socketId -> gameId
   private spectatorReadOnlySockets: Set<string> = new Set(); // sockets that requested spectator mode
+  private promotions: Map<string, PromotionRecord> = new Map();
   private readonly RECONNECT_TIMEOUT = 30000; // 30 seconds to reconnect
   private readonly HAND_RESULT_DELAY = 7000; // 7 seconds to show showdown results
   private staleTableSweepTimer?: NodeJS.Timeout;
   private shuttingDown = false;
   private closePromise?: Promise<void>;
   private pendingDisconnects: Set<Promise<void>> = new Set();
+  private leaveInProgressSockets: Set<string> = new Set();
   private server: any; // HTTP server instance
   private app: express.Application; // Express app
 
@@ -136,6 +162,88 @@ export class PokerServer {
       console.log(`   - Socket.IO for real-time game play`);
       console.log(`   - HTTP endpoints for agent API`);
     });
+  }
+
+  private buildPromotionPayloadKey(payload: PromotionPayloadIdentity): string {
+    return JSON.stringify({
+      table_id: Number(payload.table_id),
+      user_id: Number(payload.user_id),
+      username: String(payload.username),
+      stack: Number(payload.stack),
+      seat_number: Number(payload.seat_number),
+      community_id: payload.community_id === undefined || payload.community_id === null ? null : Number(payload.community_id),
+      table_name: payload.table_name ?? null,
+      is_test_only: Boolean(payload.is_test_only),
+      test_run_tag: payload.test_run_tag ?? null,
+    });
+  }
+
+  private getPromotionRecord(promotionId: string): PromotionRecord | undefined {
+    return this.promotions.get(promotionId);
+  }
+
+  private deletePromotionsForGame(gameId: string): void {
+    for (const [promotionId, record] of Array.from(this.promotions.entries())) {
+      if (record.gameId === gameId) {
+        this.promotions.delete(promotionId);
+      }
+    }
+  }
+
+  private async rollbackPromotionRuntime(promotionId: string): Promise<{ success: boolean; notFound?: boolean }> {
+    const record = this.promotions.get(promotionId);
+    if (!record) {
+      return { success: false, notFound: true };
+    }
+    if (record.status === 'rolled_back') {
+      return { success: true };
+    }
+
+    const gameData = await GameStateStorage.loadGameState(record.gameId);
+    if (!gameData) {
+      record.status = 'rolled_back';
+      return { success: true };
+    }
+
+    const game = Game.fromJSON(gameData);
+    const targetPlayer = game.getPlayers().find((player) => player.id === record.playerId)
+      || game.getPlayers().find((player) => this.extractUserIdFromPlayerId(player.id) === record.userId);
+
+    if (!targetPlayer) {
+      record.status = 'rolled_back';
+      return { success: true };
+    }
+
+    if (!game.removePlayer(targetPlayer.id)) {
+      return { success: false };
+    }
+
+    this.playerGameMap.delete(targetPlayer.id);
+    const tableState = this.tableReadiness.get(record.gameId);
+    if (tableState) {
+      tableState.seatedPlayers.delete(record.userId.toString());
+      tableState.playerIds.delete(record.userId.toString());
+    }
+
+    if (game.getPlayers().length > 0) {
+      await GameStateStorage.saveGameState(record.gameId, game.toJSON());
+      for (const [socketId, playerInfo] of this.connectedPlayers.entries()) {
+        if (playerInfo.gameId === record.gameId) {
+          const socket = this.io.sockets.sockets.get(socketId);
+          if (socket) {
+            this.emitPlayerState(socketId, record.gameId, playerInfo.playerId, game);
+          }
+        }
+      }
+    } else {
+      await GameStateStorage.deleteGameState(record.gameId);
+      this.clearActionTimer(record.gameId);
+      this.showdownCardReveals.delete(record.gameId);
+      this.apiDrivenUsersByGame.delete(record.gameId);
+    }
+
+    record.status = 'rolled_back';
+    return { success: true };
   }
 
   private startStaleTableSweep(): void {
@@ -586,6 +694,7 @@ export class PokerServer {
     this.clearActionTimer(gameId);
     this.showdownCardReveals.delete(gameId);
     this.apiDrivenUsersByGame.delete(gameId);
+    this.deletePromotionsForGame(gameId);
     this.tableReadiness.delete(gameId);
 
     const gameSpectators = this.spectatorsByGame.get(gameId);
@@ -2173,119 +2282,128 @@ export class PokerServer {
   }
 
   private async handleLeaveGame(socketId: string, tableIdHint?: number, userHint?: AuthenticatedUser): Promise<void> {
-    this.clearDisconnectCleanupTimer(socketId);
-
-    if (this.spectatorReadOnlySockets.has(socketId)) {
-      const socketUser = this.io.sockets.sockets.get(socketId)?.data.user;
-      if (socketUser && this.userIdToSocketId.get(socketUser.id) === socketId) {
-        this.userIdToSocketId.delete(socketUser.id);
-      }
-      this.removeSpectatorSocket(socketId);
-      this.connectedPlayers.delete(socketId);
-      this.disconnectedPlayers.delete(socketId);
+    if (this.leaveInProgressSockets.has(socketId)) {
       return;
     }
+    this.leaveInProgressSockets.add(socketId);
 
-    const playerInfo = this.connectedPlayers.get(socketId);
-    if (!playerInfo) {
-      if (!tableIdHint || !userHint) {
+    try {
+      this.clearDisconnectCleanupTimer(socketId);
+
+      if (this.spectatorReadOnlySockets.has(socketId)) {
+        const socketUser = this.io.sockets.sockets.get(socketId)?.data.user;
+        if (socketUser && this.userIdToSocketId.get(socketUser.id) === socketId) {
+          this.userIdToSocketId.delete(socketUser.id);
+        }
+        this.removeSpectatorSocket(socketId);
+        this.connectedPlayers.delete(socketId);
+        this.disconnectedPlayers.delete(socketId);
         return;
       }
 
-      const fallbackGameId = `table_${tableIdHint}`;
-      const fallbackUserId = userHint.id;
-
-      // Best-effort cleanup path when socket-player mapping is missing.
-      const removal = await this.removeAndRefundPlayerFromGame(
-        fallbackGameId,
-        fallbackUserId,
-        userHint.username
-      );
-      if (removal.removed && removal.remainingPlayers > 0 && removal.gameStateUpdated) {
-        await this.broadcastGameState(fallbackGameId);
-      }
-
-      await this.unseatPlayer(fallbackGameId, fallbackUserId);
-      await this.checkAndCleanupTable(fallbackGameId);
-
-      return;
-    }
-
-    const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
-    if (gameId) {
-      this.clearApiDrivenUser(gameId, playerInfo.userId);
-      let remainingPlayers = 0;
-      let gameStateUpdated = false;
-
-      // Load game from Redis and remove leaving player from the live game state.
-      const removal = await this.removeAndRefundPlayerFromGame(
-        gameId,
-        playerInfo.userId,
-        playerInfo.playerName,
-        playerInfo.communityId
-      );
-      if (removal.removed) {
-        remainingPlayers = removal.remainingPlayers;
-        gameStateUpdated = removal.gameStateUpdated;
-        if (remainingPlayers === 0) {
-          console.log(`🗑️  Game ${gameId} deleted - no players remaining`);
+      const playerInfo = this.connectedPlayers.get(socketId);
+      if (!playerInfo) {
+        if (!tableIdHint || !userHint) {
+          return;
         }
-      } else {
-        // Missing state should still allow seat cleanup in the auth API.
-        this.clearActionTimer(gameId);
-        this.showdownCardReveals.delete(gameId);
-        this.apiDrivenUsersByGame.delete(gameId);
-      }
 
-      this.io.to(gameId).emit('player_left', {
-        playerName: playerInfo.playerName
-      });
+        const fallbackGameId = `table_${tableIdHint}`;
+        const fallbackUserId = userHint.id;
 
-      const tableState = this.tableReadiness.get(gameId);
-      if (tableState) {
-        tableState.connectedPlayers.delete(playerInfo.userId.toString());
-      }
-
-      // Unseat player from table in database for both leave and timeout cleanup.
-      await this.unseatPlayer(gameId, playerInfo.userId);
-      const tableDeleted = await this.checkAndCleanupTable(gameId);
-      if (!tableDeleted && remainingPlayers > 0 && gameStateUpdated) {
-        await this.broadcastGameState(gameId);
-      }
-
-      this.playerGameMap.delete(playerInfo.playerId);
-      for (const [playerId, mappedGameId] of Array.from(this.playerGameMap.entries())) {
-        const match = playerId.match(/^player_(\d+)_/);
-        if (mappedGameId === gameId && match && Number(match[1]) === playerInfo.userId) {
-          this.playerGameMap.delete(playerId);
-        }
-      }
-    }
-
-    // Remove from lobby if waiting
-    const lobbyIndex = this.lobby.indexOf(socketId);
-    if (lobbyIndex > -1) {
-      this.lobby.splice(lobbyIndex, 1);
-      
-      // Refund buy-in if player leaves before game starts
-      if (playerInfo.communityId) {
-        await this.creditWallet(
-          playerInfo.userId,
-          playerInfo.communityId,
-          1000, // buy-in amount
-          'Refund: Left lobby before game started'
+        // Best-effort cleanup path when socket-player mapping is missing.
+        const removal = await this.removeAndRefundPlayerFromGame(
+          fallbackGameId,
+          fallbackUserId,
+          userHint.username
         );
-        console.log(`💸 ${playerInfo.playerName} refunded buy-in (left lobby)`);
-      }
-    }
+        if (removal.removed && removal.remainingPlayers > 0 && removal.gameStateUpdated) {
+          await this.broadcastGameState(fallbackGameId);
+        }
 
-    // Clean up socket mappings for this session.
-    // Keep newer sockets for the same user intact (reconnection uses a different socketId).
-    this.connectedPlayers.delete(socketId);
-    this.disconnectedPlayers.delete(socketId);
-    this.clearDisconnectCleanupTimer(socketId);
-    if (this.userIdToSocketId.get(playerInfo.userId) === socketId) {
-      this.userIdToSocketId.delete(playerInfo.userId);
+        await this.unseatPlayer(fallbackGameId, fallbackUserId);
+        await this.checkAndCleanupTable(fallbackGameId);
+
+        return;
+      }
+
+      const gameId = this.playerGameMap.get(playerInfo.playerId) || playerInfo.gameId;
+      if (gameId) {
+        this.clearApiDrivenUser(gameId, playerInfo.userId);
+        let remainingPlayers = 0;
+        let gameStateUpdated = false;
+
+        // Load game from Redis and remove leaving player from the live game state.
+        const removal = await this.removeAndRefundPlayerFromGame(
+          gameId,
+          playerInfo.userId,
+          playerInfo.playerName,
+          playerInfo.communityId
+        );
+        if (removal.removed) {
+          remainingPlayers = removal.remainingPlayers;
+          gameStateUpdated = removal.gameStateUpdated;
+          if (remainingPlayers === 0) {
+            console.log(`🗑️  Game ${gameId} deleted - no players remaining`);
+          }
+        } else {
+          // Missing state should still allow seat cleanup in the auth API.
+          this.clearActionTimer(gameId);
+          this.showdownCardReveals.delete(gameId);
+          this.apiDrivenUsersByGame.delete(gameId);
+        }
+
+        this.io.to(gameId).emit('player_left', {
+          playerName: playerInfo.playerName
+        });
+
+        const tableState = this.tableReadiness.get(gameId);
+        if (tableState) {
+          tableState.connectedPlayers.delete(playerInfo.userId.toString());
+        }
+
+        // Unseat player from table in database for both leave and timeout cleanup.
+        await this.unseatPlayer(gameId, playerInfo.userId);
+        const tableDeleted = await this.checkAndCleanupTable(gameId);
+        if (!tableDeleted && remainingPlayers > 0 && gameStateUpdated) {
+          await this.broadcastGameState(gameId);
+        }
+
+        this.playerGameMap.delete(playerInfo.playerId);
+        for (const [playerId, mappedGameId] of Array.from(this.playerGameMap.entries())) {
+          const match = playerId.match(/^player_(\d+)_/);
+          if (mappedGameId === gameId && match && Number(match[1]) === playerInfo.userId) {
+            this.playerGameMap.delete(playerId);
+          }
+        }
+      }
+
+      // Remove from lobby if waiting
+      const lobbyIndex = this.lobby.indexOf(socketId);
+      if (lobbyIndex > -1) {
+        this.lobby.splice(lobbyIndex, 1);
+        
+        // Refund buy-in if player leaves before game starts
+        if (playerInfo.communityId) {
+          await this.creditWallet(
+            playerInfo.userId,
+            playerInfo.communityId,
+            1000, // buy-in amount
+            'Refund: Left lobby before game started'
+          );
+          console.log(`💸 ${playerInfo.playerName} refunded buy-in (left lobby)`);
+        }
+      }
+
+      // Clean up socket mappings for this session.
+      // Keep newer sockets for the same user intact (reconnection uses a different socketId).
+      this.connectedPlayers.delete(socketId);
+      this.disconnectedPlayers.delete(socketId);
+      this.clearDisconnectCleanupTimer(socketId);
+      if (this.userIdToSocketId.get(playerInfo.userId) === socketId) {
+        this.userIdToSocketId.delete(playerInfo.userId);
+      }
+    } finally {
+      this.leaveInProgressSockets.delete(socketId);
     }
   }
 
@@ -2579,17 +2697,113 @@ export class PokerServer {
       }
     });
 
+    this.app.get('/_internal/promotions/:promotionId', async (req: Request, res: Response) => {
+      const promotionId = String(req.params.promotionId || '').trim();
+      if (!promotionId) {
+        return res.status(400).json({ error: 'promotion_id_required' });
+      }
+
+      const record = this.getPromotionRecord(promotionId);
+      if (!record) {
+        return res.status(404).json({ status: 'not_found', promotion_id: promotionId });
+      }
+
+      return res.json({
+        status: record.status,
+        promotion_id: promotionId,
+        game_id: record.gameId,
+        table_id: record.tableId,
+        user_id: record.userId,
+        seat_number: record.seatNumber,
+      });
+    });
+
+    this.app.post('/_internal/promotions/:promotionId/rollback', async (req: Request, res: Response) => {
+      try {
+        const promotionId = String(req.params.promotionId || '').trim();
+        if (!promotionId) {
+          return res.status(400).json({ error: 'promotion_id_required' });
+        }
+
+        const rollback = await this.rollbackPromotionRuntime(promotionId);
+        if (rollback.notFound) {
+          return res.status(404).json({ status: 'not_found', promotion_id: promotionId });
+        }
+        if (!rollback.success) {
+          return res.status(500).json({ status: 'rollback_failed', promotion_id: promotionId });
+        }
+
+        return res.json({ success: true, promotion_id: promotionId });
+      } catch (error: any) {
+        console.error('❌ Error rolling back promotion:', error);
+        return res.status(500).json({
+          error: 'Internal server error',
+          message: error.message,
+        });
+      }
+    });
+
     // Seat player endpoint (for buy-in orchestration)
     // Called by poker-api when a user joins a table
     this.app.post('/_internal/seat-player', async (req: Request, res: Response) => {
       try {
-  const { table_id, user_id, username, stack, seat_number, community_id, table_name, is_test_only, test_run_tag } = req.body;
+        const {
+          table_id,
+          user_id,
+          username,
+          stack,
+          seat_number,
+          promotion_id,
+          community_id,
+          table_name,
+          is_test_only,
+          test_run_tag,
+        } = req.body;
 
         // Validate request
         if (!table_id || !user_id || !username || !stack || !seat_number) {
           return res.status(400).json({ 
             error: 'Missing required fields: table_id, user_id, username, stack, seat_number' 
           });
+        }
+
+        const normalizedPromotionId = typeof promotion_id === 'string' && promotion_id.trim().length > 0
+          ? promotion_id.trim()
+          : null;
+        const promotionPayloadKey = this.buildPromotionPayloadKey({
+          table_id: Number(table_id),
+          user_id: Number(user_id),
+          username: String(username),
+          stack: Number(stack),
+          seat_number: Number(seat_number),
+          community_id: community_id === undefined || community_id === null ? undefined : Number(community_id),
+          table_name: typeof table_name === 'string' ? table_name : undefined,
+          is_test_only: Boolean(is_test_only),
+          test_run_tag: typeof test_run_tag === 'string' ? test_run_tag : null,
+        });
+        if (normalizedPromotionId) {
+          const existingPromotion = this.promotions.get(normalizedPromotionId);
+          if (existingPromotion) {
+            if (existingPromotion.payloadKey !== promotionPayloadKey) {
+              return res.status(409).json({
+                error: 'promotion_payload_mismatch',
+                promotion_id: normalizedPromotionId,
+              });
+            }
+            if (existingPromotion.status === 'applied') {
+              return res.json({
+                success: true,
+                idempotent: true,
+                promotion_id: normalizedPromotionId,
+                game_id: existingPromotion.gameId,
+                player_id: existingPromotion.playerId,
+              });
+            }
+            return res.status(409).json({
+              error: 'promotion_already_rolled_back',
+              promotion_id: normalizedPromotionId,
+            });
+          }
         }
 
         console.log(`💺 Seating player: ${username} (User ${user_id}) at table ${table_id} seat ${seat_number} with ${stack} chips`);
@@ -2703,11 +2917,26 @@ export class PokerServer {
 
           await this.checkAndStartGame(gameId);
 
+          if (normalizedPromotionId) {
+            this.promotions.set(normalizedPromotionId, {
+              promotionId: normalizedPromotionId,
+              payloadKey: promotionPayloadKey,
+              gameId,
+              tableId: Number(table_id),
+              userId: Number(user_id),
+              seatNumber: Number(seat_number),
+              playerId: existingPlayer.id,
+              status: 'applied',
+              createdAt: Date.now(),
+            });
+          }
+
           return res.json({
             success: true,
             message: `Player ${username} already seated at this table`,
             game_id: gameId,
             player_id: existingPlayer.id,
+            promotion_id: normalizedPromotionId,
             players_count: game.getPlayers().length,
             max_seats: maxSeats
           });
@@ -2795,6 +3024,20 @@ export class PokerServer {
           // TODO: Load tournament config, call tournament.start(), set up blind timer
         }
 
+        if (normalizedPromotionId) {
+          this.promotions.set(normalizedPromotionId, {
+            promotionId: normalizedPromotionId,
+            payloadKey: promotionPayloadKey,
+            gameId,
+            tableId: Number(table_id),
+            userId: Number(user_id),
+            seatNumber: Number(seat_number),
+            playerId,
+            status: 'applied',
+            createdAt: Date.now(),
+          });
+        }
+
         res.json({ 
           success: true,
           message: waitingForBigBlind
@@ -2802,6 +3045,7 @@ export class PokerServer {
             : `Player ${username} seated successfully`,
           game_id: gameId,
           player_id: playerId,
+          promotion_id: normalizedPromotionId,
           players_count: currentPlayerCount,
           max_seats: maxSeats,
           waiting_for_big_blind: waitingForBigBlind,

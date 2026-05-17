@@ -101,6 +101,10 @@ export interface Table {
   tournament_completed_at?: string | null;
   tournament_registration_count?: number;
   tournament_is_registered?: boolean;
+  occupied_seat_count?: number;
+  queue_count?: number;
+  my_queue_position?: number | null;
+  my_queue_buy_in_amount?: number | null;
 }
 
 export interface CreateTableRequest {
@@ -177,6 +181,14 @@ export interface TableSeat {
   user_id: number | null;
   username: string | null;
   occupied_at: string | null;
+}
+
+export interface TableQueuePosition {
+  table_id: number;
+  user_id: number;
+  username: string;
+  position: number;
+  joined_at: string;
 }
 
 export interface ActiveSeatStatus {

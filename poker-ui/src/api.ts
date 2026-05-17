@@ -2,7 +2,12 @@
  * API Client for communicating with FastAPI backend
  */
 import axios from 'axios';
-import type { ActiveSeatStatus, CommunityWalletAdjustResponse, CommunityWalletSummary } from './types';
+import type {
+  ActiveSeatStatus,
+  CommunityWalletAdjustResponse,
+  CommunityWalletSummary,
+  TableQueuePosition,
+} from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const TOKEN_STORAGE_KEY = 'token';
@@ -353,11 +358,28 @@ export const tablesApi = {
     return response.data;
   },
 
+  getQueue: async (tableId: number): Promise<TableQueuePosition[]> => {
+    const response = await api.get(`/api/tables/${tableId}/queue`);
+    return response.data as TableQueuePosition[];
+  },
+
   join: async (tableId: number, buyInAmount: number, seatNumber: number) => {
     const response = await api.post(`/api/tables/${tableId}/join`, {
       buy_in_amount: buyInAmount,
       seat_number: seatNumber,
     });
+    return response.data;
+  },
+
+  joinQueue: async (tableId: number, buyInAmount: number): Promise<TableQueuePosition> => {
+    const response = await api.post(`/api/tables/${tableId}/queue/join`, {
+      buy_in_amount: buyInAmount,
+    });
+    return response.data as TableQueuePosition;
+  },
+
+  leaveQueue: async (tableId: number) => {
+    const response = await api.delete(`/api/tables/${tableId}/queue/leave`);
     return response.data;
   },
 

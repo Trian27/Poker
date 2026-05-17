@@ -79,6 +79,12 @@ export interface SeatSnapshot {
   }>;
 }
 
+export interface QueueSnapshot {
+  userId: string;
+  position: number;
+  reservedBuyInAmount: number | null;
+}
+
 interface CleanupSummary {
   attempted: boolean;
   succeeded: boolean;
@@ -114,6 +120,16 @@ interface FullStackSummary {
   table_name: string | null;
   game_id: string | null;
   common_hand_id: string | null;
+  reserved_buy_in_amount: number | null;
+  wallet_before_queue: number | null;
+  wallet_after_queue: number | null;
+  wallet_after_promotion: number | null;
+  queue_position_before_promotion: number | null;
+  promoted_table_id: number | null;
+  promoted_seat_number: number | null;
+  promotion_observed_at: string | null;
+  active_seat_observed_at: string | null;
+  banner_observed_at: string | null;
   action_timeout_seconds: number | null;
   reconnect_grace_ms_expected: number | null;
   active_seat_inactive_deadline_ms: number | null;
@@ -162,6 +178,16 @@ export class SummaryTracker {
       table_name: null,
       game_id: null,
       common_hand_id: null,
+      reserved_buy_in_amount: null,
+      wallet_before_queue: null,
+      wallet_after_queue: null,
+      wallet_after_promotion: null,
+      queue_position_before_promotion: null,
+      promoted_table_id: null,
+      promoted_seat_number: null,
+      promotion_observed_at: null,
+      active_seat_observed_at: null,
+      banner_observed_at: null,
       action_timeout_seconds: null,
       reconnect_grace_ms_expected: null,
       active_seat_inactive_deadline_ms: null,
@@ -448,6 +474,67 @@ export const getActiveSeatStatus = async (userRequest: APIRequestContext): Promi
   return (await response.json()) as Record<string, unknown>;
 };
 
+export const getCommunityTables = async (
+  userRequest: APIRequestContext,
+  communityId: number,
+): Promise<Array<Record<string, unknown>>> => {
+  const response = await userRequest.get(`/api/communities/${communityId}/tables`);
+  await assertOk(response, `Load community tables ${communityId}`);
+  return (await response.json()) as Array<Record<string, unknown>>;
+};
+
+export const getWalletBalance = async (
+  userRequest: APIRequestContext,
+  communityId: number,
+): Promise<number> => {
+  const response = await userRequest.get('/api/wallets');
+  await assertOk(response, 'Load wallets');
+  const wallets = (await response.json()) as Array<Record<string, unknown>>;
+  const wallet = wallets.find((entry) => Number(entry.community_id) === communityId);
+  if (!wallet) {
+    throw new Error(`Wallet for community ${communityId} not found`);
+  }
+  return Number(wallet.balance);
+};
+
+export const getTableQueueEntries = async (
+  userRequest: APIRequestContext,
+  tableId: number,
+): Promise<QueueSnapshot[]> => {
+  const response = await userRequest.get(`/api/tables/${tableId}/queue`);
+  await assertOk(response, `Load table queue ${tableId}`);
+  const payload = (await response.json()) as Array<Record<string, unknown>>;
+  return payload.map((entry) => ({
+    userId: String(entry.user_id),
+    position: Number(entry.position),
+    reservedBuyInAmount: entry.reserved_buy_in_amount === undefined || entry.reserved_buy_in_amount === null
+      ? null
+      : Number(entry.reserved_buy_in_amount),
+  }));
+};
+
+export const getActiveSessionsForTable = async (
+  adminRequest: APIRequestContext,
+  tableId: number,
+): Promise<Array<Record<string, unknown>>> => {
+  const response = await adminRequest.get(`/api/internal/tables/${tableId}/active-sessions`);
+  await assertOk(response, `Load active sessions for table ${tableId}`);
+  return (await response.json()) as Array<Record<string, unknown>>;
+};
+
+export const getCommunityTableSummary = async (
+  userRequest: APIRequestContext,
+  communityId: number,
+  tableId: number,
+): Promise<Record<string, unknown>> => {
+  const tables = await getCommunityTables(userRequest, communityId);
+  const table = tables.find((entry) => Number(entry.id) === tableId);
+  if (!table) {
+    throw new Error(`Table ${tableId} not found in community summary ${communityId}`);
+  }
+  return table;
+};
+
 export const waitForSeatAssignment = async (
   userRequest: APIRequestContext,
   tableId: number,
@@ -490,6 +577,17 @@ export const joinSeat = async (
   await locatorByDataValue(page, 'seat-button', 'data-seat-number', seatNumber).click();
   await page.getByTestId('confirm-join-button').click();
   await expect(page).toHaveURL(new RegExp(`/game/${fixture.table_id}\\?communityId=${fixture.community_id}$`));
+};
+
+export const joinQueueFromLobby = async (
+  page: Page,
+  fixture: { table_id: number },
+  buyInAmount: number,
+): Promise<void> => {
+  await locatorByDataValue(page, 'join-queue-button', 'data-table-id', fixture.table_id).click();
+  await expect(page.getByTestId('confirm-queue-button')).toBeVisible();
+  await page.getByTestId('queue-buy-in-input').fill(String(buyInAmount));
+  await page.getByTestId('confirm-queue-button').click();
 };
 
 export const isAcceptablePersistedHand = (
@@ -665,6 +763,12 @@ export const awaitActionabilityPair = async (
 
 export const awaitReconnectingOverlay = async (page: Page, timeout = 10_000): Promise<void> => {
   await expect(page.getByTestId('reconnecting-overlay')).toBeVisible({ timeout });
+};
+
+export const awaitImmediateLeaveAvailable = async (page: Page, timeout = 15_000): Promise<void> => {
+  const leaveButton = page.getByTestId('leave-game-button').first();
+  await expect(leaveButton).toBeVisible({ timeout });
+  await expect(leaveButton).toBeEnabled({ timeout });
 };
 
 export const locatorByDataValue = (page: Page, testId: string, attributeName: string, attributeValue: string | number) => {

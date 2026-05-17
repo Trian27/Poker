@@ -72,12 +72,18 @@ export class FullStackRuntime {
 
   adminApi: APIRequestContext | null = null;
   fixture: GameplayFixture | null = null;
+  apiUsers: AuthenticatedApiUser[] = [];
+  pageContexts: BrowserContext[] = [];
+  pages: Page[] = [];
   userAApi: AuthenticatedApiUser | null = null;
   userBApi: AuthenticatedApiUser | null = null;
+  userCApi: AuthenticatedApiUser | null = null;
   pageAContext: BrowserContext | null = null;
   pageBContext: BrowserContext | null = null;
+  pageCContext: BrowserContext | null = null;
   pageA: Page | null = null;
   pageB: Page | null = null;
+  pageC: Page | null = null;
   fixtureCreateDispatched = false;
   cleanupSkippedByConflict = false;
   private cleanupDone = false;
@@ -172,10 +178,12 @@ export class FullStackRuntime {
       game_id: this.fixture.game_id,
     });
 
-    [this.userAApi, this.userBApi] = await Promise.all([
-      createAuthenticatedApiUser(this.authApiUrl, this.fixture.users[0]),
-      createAuthenticatedApiUser(this.authApiUrl, this.fixture.users[1]),
-    ]);
+    this.apiUsers = await Promise.all(
+      this.fixture.users.map((user) => createAuthenticatedApiUser(this.authApiUrl, user)),
+    );
+    this.userAApi = this.apiUsers[0] ?? null;
+    this.userBApi = this.apiUsers[1] ?? null;
+    this.userCApi = this.apiUsers[2] ?? null;
 
     return this.fixture;
   }
@@ -186,20 +194,24 @@ export class FullStackRuntime {
     }
 
     await this.summary.markPhase('browser_login');
-    const [{ context: contextA, page: pageA }, { context: contextB, page: pageB }] = await Promise.all([
-      createBrowserContext(this.browser, this.baseUrl, BROWSER_VIEWPORT),
-      createBrowserContext(this.browser, this.baseUrl, BROWSER_VIEWPORT),
-    ]);
+    const browserSessions = await Promise.all(
+      this.fixture.users.map(() => createBrowserContext(this.browser, this.baseUrl, BROWSER_VIEWPORT)),
+    );
+    this.pageContexts = browserSessions.map((session) => session.context);
+    this.pages = browserSessions.map((session) => session.page);
 
-    this.pageAContext = contextA;
-    this.pageBContext = contextB;
-    this.pageA = pageA;
-    this.pageB = pageB;
+    this.pageAContext = this.pageContexts[0] ?? null;
+    this.pageBContext = this.pageContexts[1] ?? null;
+    this.pageCContext = this.pageContexts[2] ?? null;
+    this.pageA = this.pages[0] ?? null;
+    this.pageB = this.pages[1] ?? null;
+    this.pageC = this.pages[2] ?? null;
 
-    await loginViaUi(pageA, this.fixture.users[0].username, this.fixture.users[0].password);
-    await loginViaUi(pageB, this.fixture.users[1].username, this.fixture.users[1].password);
+    await Promise.all(
+      this.fixture.users.map((user, index) => loginViaUi(this.pages[index]!, user.username, user.password)),
+    );
 
-    return { pageA, pageB };
+    return { pageA: this.pageA!, pageB: this.pageB! };
   }
 
   async recordFailure(error: unknown): Promise<void> {
@@ -264,15 +276,12 @@ export class FullStackRuntime {
         }).catch(() => undefined);
       }
     } finally {
-      await disposeApiUsers(this.userAApi, this.userBApi);
+      await disposeApiUsers(...this.apiUsers);
       if (this.adminApi) {
         await this.adminApi.dispose();
       }
-      if (this.pageAContext) {
-        await this.pageAContext.close();
-      }
-      if (this.pageBContext) {
-        await this.pageBContext.close();
+      for (const context of this.pageContexts) {
+        await context.close();
       }
     }
 
