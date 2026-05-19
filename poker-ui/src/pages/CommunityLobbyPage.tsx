@@ -26,6 +26,10 @@ const UNREAD_COUNT_STORAGE_KEY = 'poker-inbox-unread-count';
 const SEAT_LOST_BANNER_COPY = 'You are no longer seated at that table.';
 const QUEUE_PROMOTED_BANNER_COPY = 'A seat opened at this table. You are now seated.';
 
+const isQueueNoLongerFullConflict = (error: unknown): boolean => {
+  return getApiErrorStatus(error) === 409 && /no longer full/i.test(getApiErrorMessage(error, ''));
+};
+
 export default function CommunityLobbyPage() {
   const { communityId } = useParams<{ communityId: string }>();
   const navigate = useNavigate();
@@ -98,6 +102,7 @@ export default function CommunityLobbyPage() {
   const authApiBaseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
   const gameServerBaseUrl = import.meta.env.VITE_GAME_SERVER_URL || 'http://localhost:3000';
   const previousQueuePositionsRef = useRef<Record<number, number | null>>({});
+  const queueFallbackSeatLoadTableIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     const seatLost = Boolean(
@@ -265,30 +270,10 @@ export default function CommunityLobbyPage() {
   }, []);
 
   useEffect(() => {
-    if (!showJoinModal || !selectedTable) {
-      return;
-    }
-
-    const updatedSelectedTable = tables.find((table) => table.id === selectedTable.id);
-    if (!updatedSelectedTable) {
-      setShowJoinModal(false);
-      setSelectedTable(null);
-      setSelectedSeat(null);
-      setSeats([]);
-      alert('This table is no longer available.');
-      return;
-    }
-
-    // Keep modal table details in sync with server updates without triggering fetch loops.
-    if (updatedSelectedTable !== selectedTable) {
-      setSelectedTable(updatedSelectedTable);
-    }
-  }, [showJoinModal, selectedTable, tables]);
-
-  useEffect(() => {
     if (showJoinModal) {
       return;
     }
+    queueFallbackSeatLoadTableIdRef.current = null;
     setShowApiJoinInfo(false);
     setApiJoinCopyFeedback(null);
   }, [showJoinModal]);
@@ -647,6 +632,10 @@ export default function CommunityLobbyPage() {
       await loadData({ silent: true });
     } catch (err: unknown) {
       console.error('Error joining queue:', err);
+      if (isQueueNoLongerFullConflict(err)) {
+        await loadData({ silent: true });
+        return;
+      }
       await loadData({ silent: true });
       alert(getApiErrorMessage(err, 'Failed to join queue'));
     }
@@ -676,6 +665,7 @@ export default function CommunityLobbyPage() {
       return;
     }
 
+    queueFallbackSeatLoadTableIdRef.current = null;
     setSelectedTable(table);
     setBuyInAmount(table.my_queue_buy_in_amount ?? (table.game_type === 'tournament' ? (table.tournament_starting_stack || 1000) : table.buy_in));
     setSelectedSeat(null);
@@ -853,6 +843,40 @@ export default function CommunityLobbyPage() {
       }
     }
   }, [loadData]);
+
+  useEffect(() => {
+    if (!showJoinModal || !selectedTable) {
+      return;
+    }
+
+    const updatedSelectedTable = tables.find((table) => table.id === selectedTable.id);
+    if (!updatedSelectedTable) {
+      setShowJoinModal(false);
+      setSelectedTable(null);
+      setSelectedSeat(null);
+      setSeats([]);
+      alert('This table is no longer available.');
+      return;
+    }
+
+    // Keep modal table details in sync with server updates without triggering fetch loops.
+    if (updatedSelectedTable !== selectedTable) {
+      setSelectedTable(updatedSelectedTable);
+    }
+
+    if (
+      joinMode === 'queue'
+      && updatedSelectedTable.my_queue_position == null
+      && Number(updatedSelectedTable.occupied_seat_count ?? 0) < updatedSelectedTable.max_seats
+      && queueFallbackSeatLoadTableIdRef.current !== updatedSelectedTable.id
+    ) {
+      queueFallbackSeatLoadTableIdRef.current = updatedSelectedTable.id;
+      setJoinMode('seat');
+      setSelectedSeat(null);
+      setQueueEntries([]);
+      void loadSeats(updatedSelectedTable, true);
+    }
+  }, [joinMode, loadSeats, selectedTable, showJoinModal, tables]);
 
   useEffect(() => {
     if (!showJoinModal || !selectedTable) {
