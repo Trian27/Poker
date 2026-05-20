@@ -34,8 +34,8 @@ def get_hand_details(token: str, hand_id: str):
     return response
 
 if len(sys.argv) < 2:
-    print("Usage: python check_user_history.py <username>")
-    print("Example: python check_user_history.py bot_player_1_1761441092")
+    print("Usage: python scripts/manual_checks/check_user_history.py <username>")
+    print("Example: python scripts/manual_checks/check_user_history.py bot_player_1_1761441092")
     sys.exit(1)
 
 username = sys.argv[1]

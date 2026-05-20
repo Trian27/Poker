@@ -323,11 +323,12 @@ curl http://localhost:3000/_internal/health
 # From project root
 cd /Users/trian/Projects/Poker
 
-# Activate virtualenv (for test script)
-workon poker
+# Resolve the repo Python interpreter
+source scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$PWD")"
 
 # Run end-to-end test
-python test_chunk5_buyin.py
+"$PYTHON_BIN" scripts/manual_checks/chunk5_buyin_check.py
 ```
 
 ### 4. Manual UI Test
