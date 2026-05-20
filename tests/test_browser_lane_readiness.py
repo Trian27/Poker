@@ -1,10 +1,14 @@
 from pathlib import Path
 import json
+import subprocess
+import sys
 
 from scripts.browser_lane_readiness import (
     QUEUE_SCENARIO_NAME,
     build_queue_metadata_from_mode_root,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -162,6 +166,87 @@ def test_build_queue_metadata_for_non_dict_phase_timings_returns_red_metadata(tm
     assert metadata["run_dir_name"] == "20260517-140003"
     assert metadata["compose_teardown_succeeded"] is True
     assert "Invalid phase_timings payload" in metadata["metadata_error"]
+
+
+def test_build_queue_metadata_surfaces_missing_summary_without_crashing(tmp_path: Path) -> None:
+    mode_root = tmp_path / "logs" / "compose-browser-e2e"
+    run_dir = mode_root / "20260516-204113"
+    run_dir.mkdir(parents=True)
+    (run_dir / "compose-teardown-status.txt").write_text(
+        "compose_teardown_succeeded=false\n",
+        encoding="utf-8",
+    )
+
+    metadata = build_queue_metadata_from_mode_root(mode_root, "compose-browser-e2e")
+
+    assert metadata["compose_teardown_succeeded"] is False
+    assert metadata["queue_summary"]["found"] is False
+    assert "Queue scenario summary not found" in metadata["metadata_error"]
+
+
+def test_metadata_cli_writes_queue_readiness_json(tmp_path: Path) -> None:
+    mode_root = tmp_path / "logs" / "compose-browser-queue-pr"
+    run_dir = mode_root / "20260517-135954"
+    scenario_dir = run_dir / "full-table-queue-promotion-reserves-buy-in-promotes-and-rejoins"
+    scenario_dir.mkdir(parents=True)
+    (run_dir / "compose-teardown-status.txt").write_text(
+        "compose_teardown_succeeded=true\n",
+        encoding="utf-8",
+    )
+    write_json(scenario_dir / "summary.json", queue_summary_payload("compose-browser-queue-pr"))
+
+    output_path = tmp_path / "queue-readiness-metadata.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.browser_lane_readiness_metadata",
+            "--mode",
+            "compose-browser-queue-pr",
+            "--artifact-root",
+            str(mode_root),
+            "--output",
+            str(output_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "compose-browser-queue-pr"
+    assert payload["queue_summary"]["status"] == "passed"
+
+
+def test_metadata_cli_writes_red_metadata_for_missing_mode_root(tmp_path: Path) -> None:
+    mode_root = tmp_path / "logs" / "compose-browser-e2e"
+    output_path = tmp_path / "queue-readiness-metadata.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.browser_lane_readiness_metadata",
+            "--mode",
+            "compose-browser-e2e",
+            "--artifact-root",
+            str(mode_root),
+            "--output",
+            str(output_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+
+    assert result.returncode == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "compose-browser-e2e"
+    assert payload["queue_summary"]["found"] is False
+    assert "Mode root does not exist" in payload["metadata_error"]
 
 
 def test_build_queue_metadata_for_missing_mode_root_returns_red_metadata(tmp_path: Path) -> None:

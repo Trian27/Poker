@@ -169,6 +169,20 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: poker-ui
       - run: ./scripts/test-gameplay.sh compose-browser-queue-pr
+      - name: Emit queue PR readiness metadata
+        if: ${{ always() }}
+        run: |
+          python3 -m scripts.browser_lane_readiness_metadata \
+            --mode compose-browser-queue-pr \
+            --artifact-root logs/compose-browser-queue-pr \
+            --output logs/compose-browser-queue-pr/queue-readiness-metadata.json
+      - name: Upload queue PR readiness metadata
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-browser-queue-pr-readiness-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/compose-browser-queue-pr/queue-readiness-metadata.json
+          if-no-files-found: error
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -222,6 +236,20 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: poker-ui
       - run: ./scripts/test-gameplay.sh compose-browser-e2e
+      - name: Emit heavy queue readiness metadata
+        if: ${{ always() }}
+        run: |
+          python3 -m scripts.browser_lane_readiness_metadata \
+            --mode compose-browser-e2e \
+            --artifact-root logs/compose-browser-e2e \
+            --output logs/compose-browser-e2e/queue-readiness-metadata.json
+      - name: Upload heavy queue readiness metadata
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-browser-e2e-queue-readiness-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: logs/compose-browser-e2e/queue-readiness-metadata.json
+          if-no-files-found: error
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
