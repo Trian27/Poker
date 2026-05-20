@@ -5,7 +5,13 @@ import sys
 
 from scripts.browser_lane_readiness import (
     QUEUE_SCENARIO_NAME,
+    WorkflowJobInfo,
     build_queue_metadata_from_mode_root,
+    classify_heavy_queue_sample,
+    classify_pr_queue_sample,
+    consecutive_green_streak,
+    evaluate_readiness,
+    parse_iso8601,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -326,3 +332,420 @@ def test_build_queue_metadata_for_invalid_phase_timings_returns_red_metadata(tmp
     assert metadata["run_dir_name"] == "20260517-140001"
     assert metadata["compose_teardown_succeeded"] is True
     assert "Invalid phase_timings" in metadata["metadata_error"]
+
+
+def make_job_info(
+    run_id: int,
+    *,
+    event: str,
+    head_branch: str,
+    job_name: str,
+    conclusion: str,
+    created_at: str,
+    started_at: str,
+    completed_at: str | None,
+) -> WorkflowJobInfo:
+    return WorkflowJobInfo(
+        run_id=run_id,
+        run_attempt=1,
+        created_at=parse_iso8601(created_at),
+        event=event,
+        head_branch=head_branch,
+        job_name=job_name,
+        job_conclusion=conclusion,
+        job_started_at=parse_iso8601(started_at),
+        job_completed_at=parse_iso8601(completed_at),
+    )
+
+
+def test_classify_pr_queue_sample_ignores_skipped_jobs() -> None:
+    job = make_job_info(
+        100,
+        event="pull_request",
+        head_branch="feature-branch",
+        job_name="compose-browser-queue-pr",
+        conclusion="skipped",
+        created_at="2026-05-19T16:54:28Z",
+        started_at="2026-05-19T16:56:31Z",
+        completed_at="2026-05-19T16:56:31Z",
+    )
+    metadata = {
+        "compose_teardown_succeeded": None,
+        "metadata_error": None,
+        "queue_summary": {
+            "status": None,
+            "cleanup_succeeded": None,
+            "scenario_duration_seconds": None,
+        },
+    }
+
+    assert classify_pr_queue_sample(job, metadata) is None
+
+
+def test_heavy_sample_can_be_green_when_the_job_failed_but_queue_passed() -> None:
+    job = make_job_info(
+        101,
+        event="schedule",
+        head_branch="main",
+        job_name="compose-browser-e2e",
+        conclusion="failure",
+        created_at="2026-05-18T12:29:16Z",
+        started_at="2026-05-18T12:29:16Z",
+        completed_at="2026-05-18T13:05:16Z",
+    )
+    metadata = {
+        "compose_teardown_succeeded": True,
+        "metadata_error": None,
+        "queue_summary": {
+            "found": True,
+            "status": "passed",
+            "error": None,
+            "cleanup_succeeded": True,
+            "cleanup_error": None,
+            "scenario_duration_seconds": 8.5,
+        },
+    }
+
+    sample = classify_heavy_queue_sample(job, metadata)
+
+    assert sample is not None
+    assert sample.job_conclusion == "failure"
+    assert sample.queue_summary_status == "passed"
+    assert sample.is_green is True
+
+
+def test_heavy_sample_is_red_when_queue_status_failed() -> None:
+    job = make_job_info(
+        102,
+        event="schedule",
+        head_branch="main",
+        job_name="compose-browser-e2e",
+        conclusion="success",
+        created_at="2026-05-18T12:29:16Z",
+        started_at="2026-05-18T12:29:16Z",
+        completed_at="2026-05-18T13:05:16Z",
+    )
+    sample = classify_heavy_queue_sample(
+        job,
+        {
+            "compose_teardown_succeeded": True,
+            "metadata_error": None,
+            "queue_summary": {
+                "found": True,
+                "status": "failed",
+                "error": "queue broke",
+                "cleanup_succeeded": True,
+                "cleanup_error": None,
+                "scenario_duration_seconds": 8.5,
+            },
+        },
+    )
+
+    assert sample is not None
+    assert sample.is_green is False
+
+
+def test_heavy_sample_is_red_when_cleanup_failed() -> None:
+    job = make_job_info(
+        103,
+        event="schedule",
+        head_branch="main",
+        job_name="compose-browser-e2e",
+        conclusion="success",
+        created_at="2026-05-18T12:29:16Z",
+        started_at="2026-05-18T12:29:16Z",
+        completed_at="2026-05-18T13:05:16Z",
+    )
+    sample = classify_heavy_queue_sample(
+        job,
+        {
+            "compose_teardown_succeeded": True,
+            "metadata_error": None,
+            "queue_summary": {
+                "found": True,
+                "status": "passed",
+                "error": None,
+                "cleanup_succeeded": False,
+                "cleanup_error": "fixture cleanup failed",
+                "scenario_duration_seconds": 8.5,
+            },
+        },
+    )
+
+    assert sample is not None
+    assert sample.is_green is False
+
+
+def test_heavy_sample_is_red_when_teardown_failed() -> None:
+    job = make_job_info(
+        104,
+        event="schedule",
+        head_branch="main",
+        job_name="compose-browser-e2e",
+        conclusion="success",
+        created_at="2026-05-18T12:29:16Z",
+        started_at="2026-05-18T12:29:16Z",
+        completed_at="2026-05-18T13:05:16Z",
+    )
+    sample = classify_heavy_queue_sample(
+        job,
+        {
+            "compose_teardown_succeeded": False,
+            "metadata_error": None,
+            "queue_summary": {
+                "found": True,
+                "status": "passed",
+                "error": None,
+                "cleanup_succeeded": True,
+                "cleanup_error": None,
+                "scenario_duration_seconds": 8.5,
+            },
+        },
+    )
+
+    assert sample is not None
+    assert sample.is_green is False
+
+
+def test_consecutive_green_streak_stops_on_first_non_green() -> None:
+    green = classify_pr_queue_sample(
+        make_job_info(
+            1,
+            event="pull_request",
+            head_branch="feature-a",
+            job_name="compose-browser-queue-pr",
+            conclusion="success",
+            created_at="2026-05-19T16:54:28Z",
+            started_at="2026-05-19T16:56:31Z",
+            completed_at="2026-05-19T16:58:12Z",
+        ),
+        {
+            "compose_teardown_succeeded": True,
+            "metadata_error": None,
+            "queue_summary": {
+                "found": True,
+                "status": "passed",
+                "error": None,
+                "cleanup_succeeded": True,
+                "cleanup_error": None,
+                "scenario_duration_seconds": 10.0,
+            },
+        },
+    )
+    red = classify_pr_queue_sample(
+        make_job_info(
+            2,
+            event="pull_request",
+            head_branch="feature-b",
+            job_name="compose-browser-queue-pr",
+            conclusion="failure",
+            created_at="2026-05-18T16:54:28Z",
+            started_at="2026-05-18T16:56:31Z",
+            completed_at="2026-05-18T16:58:12Z",
+        ),
+        {
+            "compose_teardown_succeeded": True,
+            "metadata_error": None,
+            "queue_summary": {
+                "found": True,
+                "status": "failed",
+                "error": "queue broke",
+                "cleanup_succeeded": True,
+                "cleanup_error": None,
+                "scenario_duration_seconds": 12.0,
+            },
+        },
+    )
+
+    assert consecutive_green_streak([green, red]) == 1
+
+
+def test_evaluate_readiness_requires_streaks_runtime_and_span() -> None:
+    pr_samples = []
+    heavy_samples = []
+    for index in range(10):
+        pr_samples.append(
+            classify_pr_queue_sample(
+                make_job_info(
+                    200 + index,
+                    event="merge_group" if index == 0 else "pull_request",
+                    head_branch=f"feature-{index}",
+                    job_name="compose-browser-queue-pr",
+                    conclusion="success",
+                    created_at=f"2026-05-{10 + index:02d}T12:00:00Z",
+                    started_at=f"2026-05-{10 + index:02d}T12:00:00Z",
+                    completed_at=f"2026-05-{10 + index:02d}T12:02:00Z",
+                ),
+                {
+                    "compose_teardown_succeeded": True,
+                    "metadata_error": None,
+                    "queue_summary": {
+                        "found": True,
+                        "status": "passed",
+                        "error": None,
+                        "cleanup_succeeded": True,
+                        "cleanup_error": None,
+                        "scenario_duration_seconds": 9.0,
+                    },
+                },
+            )
+        )
+        heavy_samples.append(
+            classify_heavy_queue_sample(
+                make_job_info(
+                    300 + index,
+                    event="schedule",
+                    head_branch="main",
+                    job_name="compose-browser-e2e",
+                    conclusion="success",
+                    created_at=f"2026-05-{10 + index:02d}T09:00:00Z",
+                    started_at=f"2026-05-{10 + index:02d}T09:00:00Z",
+                    completed_at=f"2026-05-{10 + index:02d}T09:30:00Z",
+                ),
+                {
+                    "compose_teardown_succeeded": True,
+                    "metadata_error": None,
+                    "queue_summary": {
+                        "found": True,
+                        "status": "passed",
+                        "error": None,
+                        "cleanup_succeeded": True,
+                        "cleanup_error": None,
+                        "scenario_duration_seconds": 11.0,
+                    },
+                },
+            )
+        )
+
+    evaluation = evaluate_readiness(pr_samples, heavy_samples, require_merge_group_sample=True)
+
+    assert evaluation["ready_to_require"] is True
+    assert evaluation["pr_queue_shadow"]["green_streak"] == 10
+    assert evaluation["heavy_queue"]["green_streak"] == 10
+    assert evaluation["pr_queue_shadow"]["merge_group_samples_in_streak"] == 1
+
+
+def test_evaluate_readiness_fails_when_green_prefix_duration_data_is_missing() -> None:
+    pr_samples = []
+    heavy_samples = []
+    for index in range(10):
+        pr_samples.append(
+            classify_pr_queue_sample(
+                make_job_info(
+                    400 + index,
+                    event="pull_request",
+                    head_branch=f"feature-{index}",
+                    job_name="compose-browser-queue-pr",
+                    conclusion="success",
+                    created_at=f"2026-05-{10 + index:02d}T12:00:00Z",
+                    started_at=f"2026-05-{10 + index:02d}T12:00:00Z",
+                    completed_at=f"2026-05-{10 + index:02d}T12:02:00Z" if index else None,
+                ),
+                {
+                    "compose_teardown_succeeded": True,
+                    "metadata_error": None,
+                    "queue_summary": {
+                        "found": True,
+                        "status": "passed",
+                        "error": None,
+                        "cleanup_succeeded": True,
+                        "cleanup_error": None,
+                        "scenario_duration_seconds": 9.0,
+                    },
+                },
+            )
+        )
+        heavy_samples.append(
+            classify_heavy_queue_sample(
+                make_job_info(
+                    500 + index,
+                    event="schedule",
+                    head_branch="main",
+                    job_name="compose-browser-e2e",
+                    conclusion="success",
+                    created_at=f"2026-05-{10 + index:02d}T09:00:00Z",
+                    started_at=f"2026-05-{10 + index:02d}T09:00:00Z",
+                    completed_at=f"2026-05-{10 + index:02d}T09:30:00Z",
+                ),
+                {
+                    "compose_teardown_succeeded": True,
+                    "metadata_error": None,
+                    "queue_summary": {
+                        "found": True,
+                        "status": "passed",
+                        "error": None,
+                        "cleanup_succeeded": True,
+                        "cleanup_error": None,
+                        "scenario_duration_seconds": 11.0,
+                    },
+                },
+            )
+        )
+
+    evaluation = evaluate_readiness(pr_samples, heavy_samples)
+
+    assert evaluation["ready_to_require"] is False
+    assert evaluation["pr_queue_shadow"]["missing_job_duration_count"] == 1
+
+
+def test_evaluate_readiness_with_short_streak_does_not_emit_duration_noise() -> None:
+    pr_samples = [
+        classify_pr_queue_sample(
+            make_job_info(
+                600,
+                event="pull_request",
+                head_branch="feature-short",
+                job_name="compose-browser-queue-pr",
+                conclusion="success",
+                created_at="2026-05-19T12:00:00Z",
+                started_at="2026-05-19T12:00:00Z",
+                completed_at="2026-05-19T12:02:00Z",
+            ),
+            {
+                "compose_teardown_succeeded": True,
+                "metadata_error": None,
+                "queue_summary": {
+                    "found": True,
+                    "status": "passed",
+                    "error": None,
+                    "cleanup_succeeded": True,
+                    "cleanup_error": None,
+                    "scenario_duration_seconds": 9.0,
+                },
+            },
+        )
+    ]
+    heavy_samples = [
+        classify_heavy_queue_sample(
+            make_job_info(
+                700,
+                event="schedule",
+                head_branch="main",
+                job_name="compose-browser-e2e",
+                conclusion="success",
+                created_at="2026-05-19T09:00:00Z",
+                started_at="2026-05-19T09:00:00Z",
+                completed_at="2026-05-19T09:30:00Z",
+            ),
+            {
+                "compose_teardown_succeeded": True,
+                "metadata_error": None,
+                "queue_summary": {
+                    "found": True,
+                    "status": "passed",
+                    "error": None,
+                    "cleanup_succeeded": True,
+                    "cleanup_error": None,
+                    "scenario_duration_seconds": 11.0,
+                },
+            },
+        )
+    ]
+
+    evaluation = evaluate_readiness(pr_samples, heavy_samples)
+
+    assert evaluation["ready_to_require"] is False
+    assert any("need 10" in reason for reason in evaluation["reasons"])
+    assert not any("median" in reason for reason in evaluation["reasons"])
+    assert not any("p95" in reason for reason in evaluation["reasons"])
+    assert not any("span" in reason for reason in evaluation["reasons"])
