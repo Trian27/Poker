@@ -132,6 +132,8 @@ Run the repo test driver from the project root:
 - Compose Browser PR Smoke:
   - `./scripts/test-gameplay.sh compose-browser-pr-smoke`
   - required real-stack happy path only
+  - always posts a check result on pull_request and merge_group events
+  - unrelated PRs short-circuit the job before Node and Playwright setup
 - Compose Browser Queue PR Shadow:
   - `./scripts/test-gameplay.sh compose-browser-queue-pr`
   - informational PR/merge-group queue promotion shadow
