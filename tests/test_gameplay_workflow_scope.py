@@ -126,3 +126,16 @@ def test_gameplay_workflow_uses_scope_job_and_required_smoke_noop_path() -> None
     assert "python3 -m scripts.gameplay_workflow_scope" in workflow_text
     assert "name: Skip compose-browser-pr-smoke on non-gameplay PR" in workflow_text
     assert "needs: [gameplay-scope, compose-browser-pr-smoke]" in workflow_text
+
+README_PATH = REPO_ROOT / "README.md"
+BOT_GAMEPLAY_TESTING_PATH = REPO_ROOT / "docs" / "BOT_GAMEPLAY_TESTING.md"
+
+
+def test_docs_explain_required_smoke_always_reports() -> None:
+    readme_text = README_PATH.read_text(encoding="utf-8")
+    bot_text = BOT_GAMEPLAY_TESTING_PATH.read_text(encoding="utf-8")
+
+    assert "always posts a check result on pull_request and merge_group events" in readme_text
+    assert "unrelated PRs short-circuit the job before Node and Playwright setup" in readme_text
+    assert "required branch-protection check" in bot_text
+    assert "non-gameplay PRs, it exits successfully after scope detection instead of starting the browser stack" in bot_text

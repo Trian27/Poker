@@ -48,7 +48,9 @@ Use these three browser compose modes deliberately:
 
 - `./scripts/test-gameplay.sh compose-browser-pr-smoke`
   - exact happy-path full-stack browser smoke
+  - required branch-protection check
   - intended for PR gating
+  - for non-gameplay PRs, it exits successfully after scope detection instead of starting the browser stack
 - `./scripts/test-gameplay.sh compose-browser-queue-pr`
   - exact queue-promotion full-stack browser shadow
   - runs only `tests/e2e/full-stack/queue.spec.ts`
