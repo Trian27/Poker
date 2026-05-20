@@ -84,4 +84,4 @@ print(f"\n📊 Total hands in database: {count}")
 cur.close()
 conn.close()
 
-print("\n✅ Done! Now test with: python check_user_history.py bot_player_1_1761441092")
+print("\n✅ Done! Now test with: python scripts/manual_checks/check_user_history.py bot_player_1_1761441092")
