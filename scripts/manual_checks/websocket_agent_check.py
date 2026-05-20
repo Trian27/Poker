@@ -5,7 +5,7 @@ Tests the complete flow: Register bot → Login → Create/Join game → Bot pla
 
 Usage:
     workon poker
-    python test_websocket_agent.py
+    python scripts/manual_checks/websocket_agent_check.py
 """
 
 import requests

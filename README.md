@@ -32,8 +32,10 @@ The Poker Platform is a comprehensive system designed to manage online poker gam
   - See [poker-ui/README.md](poker-ui/README.md) for details.
 
 ### 4. **Testing**
-- Multiple test scripts are available for unit and integration testing.
-  - Example: `test_action_timeout.py`, `test_auto_seat_queue.py`.
+- Multiple automated and manual test entrypoints are available.
+  - Automated gameplay coverage lives under `poker-api/tests/` and the browser/UI suites.
+  - Manual localhost-dependent checks live under `scripts/manual_checks/`.
+  - Examples: `scripts/manual_checks/action_timeout_check.py`, `scripts/manual_checks/auto_seat_queue_check.py`.
 
 ### 5. **Deployment**
 - Dockerized setup for easy deployment.
@@ -45,12 +47,12 @@ The Poker Platform is a comprehensive system designed to manage online poker gam
 ### 1. **Action Timeout System**
 - Ensures players act within a specified time.
 - Automatically folds or checks if the timer expires.
-- Fully tested with `test_action_timeout.py`.
+- Manual localhost verification script: `scripts/manual_checks/action_timeout_check.py`.
 
 ### 2. **Auto-Seat Queue System**
 - Automatically seats players from a queue when a spot becomes available.
 - Validates player wallet balance before seating.
-- Tested at the API level with `test_auto_seat_queue.py`.
+- Manual localhost verification script: `scripts/manual_checks/auto_seat_queue_check.py`.
 
 ### 3. **Redis Integration**
 - Caches game states and player data for fast access.
