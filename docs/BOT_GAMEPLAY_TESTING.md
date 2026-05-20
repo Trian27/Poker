@@ -57,6 +57,24 @@ Use these three browser compose modes deliberately:
   - heavy scheduled/manual browser suite
   - covers happy path + queue promotion + reconnect
 
+### Queue Readiness Report
+Use the queue-readiness report when deciding whether `compose-browser-queue-pr` should become required.
+
+Run:
+
+```bash
+source scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$PWD")"
+"$PYTHON_BIN" -m scripts.browser_lane_readiness_report --require-merge-group-sample
+```
+
+Notes:
+- `compose-browser-queue-pr` is evaluated directly from its own queue metadata artifact.
+- Heavy queue readiness is evaluated from the queue scenario metadata published by `compose-browser-e2e`.
+- `--limit` is a raw `Gameplay Tests` workflow-run fetch cap before PR/heavy filtering and defaults to `200`.
+- This metadata artifact is intentionally tiny and always uploaded; it does not replace the existing failure-only rich artifacts.
+- runs from before the metadata rollout are expected to show up as metadata failures and do not count toward the green streak
+
 These browser compose lanes rely on isolated GitHub-hosted runners. On shared or self-hosted runners, fixed host ports are not safe without unique per-run host ports or a global compose lock.
 
 ### Automated compose-backed backend/runtime E2E

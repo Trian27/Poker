@@ -138,6 +138,31 @@ Run the repo test driver from the project root:
   - `./scripts/test-gameplay.sh compose-browser-e2e`
   - scheduled/manual heavy suite for happy path + queue + reconnect
 
+### Browser Lane Readiness Report
+Run the queue-readiness report from the repo root:
+
+```bash
+source scripts/python-env.sh
+PYTHON_BIN="$(resolve_repo_python_bin "$PWD")"
+"$PYTHON_BIN" -m scripts.browser_lane_readiness_report
+```
+
+What it reports:
+- current consecutive green `compose-browser-queue-pr` streak
+- current consecutive green heavy queue streak derived from `compose-browser-e2e`
+- fetched sample counts
+- metadata / cleanup / teardown / other failure counts in the fetched sample
+- most recent red sample details
+- PR shadow job runtime stats
+- heavy queue scenario runtime stats
+- whether `compose-browser-queue-pr` is ready to become required
+
+Implementation note:
+- `--limit` is a raw `Gameplay Tests` workflow-run fetch cap before PR/heavy filtering and defaults to `200`
+- rich browser artifacts remain failure-only
+- a tiny `queue-readiness-metadata.json` artifact is uploaded on every `compose-browser-queue-pr` and `compose-browser-e2e` run so the report can evaluate queue readiness from green runs too
+- runs from before the metadata rollout do not count as green readiness samples because they do not have metadata artifacts
+
 These compose browser modes assume GitHub-hosted isolated runners in CI. If they are ever moved to shared or self-hosted runners, fixed host ports will need unique per-run values or a global compose lock.
 
 ## Additional Guides
