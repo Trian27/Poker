@@ -29,6 +29,20 @@ def test_repo_root_pytest_collects_cleanly() -> None:
         f"stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}"
     )
+    collected_node_ids = [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if "::" in line
+    ]
+    approved_prefixes = {
+        f"tests/{name}::"
+        for name in APPROVED_ROOT_TEST_FILES
+    }
+    assert collected_node_ids, "Expected bare repo-root pytest collection to return node ids."
+    assert all(
+        any(node_id.startswith(prefix) for prefix in approved_prefixes)
+        for node_id in collected_node_ids
+    ), f"Unexpected repo-root collected node ids: {collected_node_ids}"
 
 
 def test_only_approved_repo_root_pytest_files_exist() -> None:
