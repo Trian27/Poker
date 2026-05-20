@@ -8,6 +8,9 @@ import json
 import math
 from pathlib import Path
 import statistics
+import subprocess
+import sys
+import tempfile
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -21,6 +24,8 @@ MAX_PR_P95_JOB_DURATION_SECONDS = 1080.0
 MAX_HEAVY_MEDIAN_QUEUE_DURATION_SECONDS = 720.0
 MAX_HEAVY_P95_QUEUE_DURATION_SECONDS = 1080.0
 MIN_STREAK_SPAN_DAYS = 3.0
+DEFAULT_REPORT_LIMIT = 200
+CLI_ERROR_EXIT_CODE = 2
 
 
 def missing_metadata_payload(mode: str, error_text: str) -> dict[str, Any]:
@@ -422,6 +427,277 @@ def evaluate_readiness(
         "pr_queue_shadow": pr_stats,
         "heavy_queue": heavy_stats,
     }
+
+
+def artifact_name_for_job(job_name: str, run_id: int, run_attempt: int) -> str:
+    """Return the exact readiness metadata artifact name for one run attempt."""
+    if job_name == QUEUE_PR_JOB_NAME:
+        return f"compose-browser-queue-pr-readiness-metadata-{run_id}-{run_attempt}"
+    if job_name == HEAVY_JOB_NAME:
+        return f"compose-browser-e2e-queue-readiness-metadata-{run_id}-{run_attempt}"
+    raise ValueError(f"Unsupported job name for readiness metadata: {job_name}")
+
+
+def run_gh_json(args: list[str], repo: str | None = None) -> Any:
+    """Run one `gh` JSON command and parse the stdout payload."""
+    cmd = ["gh"]
+    if repo:
+        cmd.extend(["--repo", repo])
+    cmd.extend(args)
+    try:
+        completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        joined_cmd = " ".join(cmd)
+        raise RuntimeError(
+            f"`{joined_cmd}` failed with exit code {exc.returncode}\nstderr:\n{exc.stderr}"
+        ) from exc
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        joined_cmd = " ".join(cmd)
+        raise ValueError(f"`gh` returned invalid JSON for command: {joined_cmd}") from exc
+
+
+def download_metadata_artifact(
+    run_id: int, run_attempt: int, job_name: str, repo: str | None = None
+) -> dict[str, Any]:
+    """Download and parse the single readiness metadata artifact for one job."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cmd = ["gh"]
+        if repo:
+            cmd.extend(["--repo", repo])
+        cmd.extend(
+            [
+                "run",
+                "download",
+                str(run_id),
+                "--dir",
+                tmp_dir,
+                "--name",
+                artifact_name_for_job(job_name, run_id, run_attempt),
+            ]
+        )
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            joined_cmd = " ".join(cmd)
+            raise RuntimeError(
+                f"`{joined_cmd}` failed with exit code {exc.returncode}\nstderr:\n{exc.stderr}"
+            ) from exc
+        candidates = list(Path(tmp_dir).rglob("queue-readiness-metadata.json"))
+        if len(candidates) != 1:
+            raise FileNotFoundError(
+                "Expected exactly one queue-readiness-metadata.json for "
+                f"run {run_id} attempt {run_attempt} job {job_name}, found {len(candidates)}"
+            )
+        return read_json_object(candidates[0])
+
+
+def validate_metadata_payload(metadata: dict[str, Any], expected_mode: str) -> dict[str, Any]:
+    """Validate metadata shape and convert schema drift into a red payload."""
+    if metadata.get("schema_version") != SCHEMA_VERSION:
+        return missing_metadata_payload(
+            expected_mode,
+            f"Unsupported metadata schema_version: {metadata.get('schema_version')}",
+        )
+    if metadata.get("mode") != expected_mode:
+        return missing_metadata_payload(
+            expected_mode,
+            f"Metadata mode mismatch: expected {expected_mode}, got {metadata.get('mode')}",
+        )
+    queue_summary = metadata.get("queue_summary")
+    if not isinstance(queue_summary, dict):
+        return missing_metadata_payload(
+            expected_mode, "Metadata queue_summary is missing or not an object"
+        )
+    if queue_summary.get("found") is True and queue_summary.get("scenario") != QUEUE_SCENARIO_NAME:
+        return missing_metadata_payload(
+            expected_mode,
+            "Metadata queue_summary.scenario mismatch: "
+            f"expected {QUEUE_SCENARIO_NAME}, got {queue_summary.get('scenario')}",
+        )
+    return metadata
+
+
+def list_gameplay_runs(limit: int, repo: str | None = None) -> list[dict[str, Any]]:
+    """List recent `Gameplay Tests` workflow runs as machine-readable JSON."""
+    return run_gh_json(
+        [
+            "run",
+            "list",
+            "--workflow",
+            "Gameplay Tests",
+            "--limit",
+            str(limit),
+            "--json",
+            "attempt,conclusion,createdAt,event,headBranch,status,workflowName,databaseId",
+        ],
+        repo=repo,
+    )
+
+
+def list_jobs_for_run(run_id: int, run_attempt: int, repo: str | None = None) -> list[dict[str, Any]]:
+    """List jobs for one GitHub Actions run attempt."""
+    payload = run_gh_json(
+        ["run", "view", str(run_id), "--attempt", str(run_attempt), "--json", "jobs"],
+        repo=repo,
+    )
+    return payload["jobs"]
+
+
+def parse_required_iso8601(value: str | None, field_name: str) -> datetime:
+    """Parse a required ISO 8601 timestamp and fail with a contextual error when missing."""
+    parsed = parse_iso8601(value)
+    if parsed is None:
+        raise ValueError(f"Missing required timestamp: {field_name}")
+    return parsed
+
+
+def workflow_job_info_from_payload(run_payload: dict[str, Any], job_payload: dict[str, Any]) -> WorkflowJobInfo:
+    """Normalize one run payload plus one job payload into typed job info."""
+    return WorkflowJobInfo(
+        run_id=int(run_payload["databaseId"]),
+        run_attempt=int(run_payload["attempt"]),
+        created_at=parse_required_iso8601(run_payload.get("createdAt"), "createdAt"),
+        event=str(run_payload["event"]),
+        head_branch=str(run_payload["headBranch"]),
+        job_name=str(job_payload["name"]),
+        job_conclusion=str(job_payload.get("conclusion") or ""),
+        job_started_at=parse_iso8601(job_payload.get("startedAt")),
+        job_completed_at=parse_iso8601(job_payload.get("completedAt")),
+    )
+
+
+def collect_queue_samples(
+    limit: int, repo: str | None = None
+) -> tuple[list[QueueLaneSample], list[QueueLaneSample]]:
+    """Collect PR-shadow and heavy-queue samples from recent GitHub Actions runs."""
+    pr_samples: list[QueueLaneSample] = []
+    heavy_samples: list[QueueLaneSample] = []
+
+    for run_payload in list_gameplay_runs(limit=limit, repo=repo):
+        if run_payload["status"] != "completed":
+            continue
+        run_id = int(run_payload["databaseId"])
+        run_attempt = int(run_payload["attempt"])
+        jobs = {job["name"]: job for job in list_jobs_for_run(run_id, run_attempt, repo=repo)}
+        event = str(run_payload["event"])
+        head_branch = str(run_payload["headBranch"])
+
+        if event in {"pull_request", "merge_group"} and QUEUE_PR_JOB_NAME in jobs:
+            job_info = workflow_job_info_from_payload(run_payload, jobs[QUEUE_PR_JOB_NAME])
+            if job_info.job_conclusion in {"", "skipped"}:
+                continue
+            try:
+                metadata = download_metadata_artifact(
+                    run_id, job_info.run_attempt, QUEUE_PR_JOB_NAME, repo=repo
+                )
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                print(
+                    f"warning: run_id={run_id} job={QUEUE_PR_JOB_NAME} metadata download failed: {exc}",
+                    file=sys.stderr,
+                )
+                metadata = missing_metadata_payload(QUEUE_PR_JOB_NAME, str(exc))
+            metadata = validate_metadata_payload(metadata, QUEUE_PR_JOB_NAME)
+            sample = classify_pr_queue_sample(job_info, metadata)
+            if sample is not None:
+                pr_samples.append(sample)
+
+        if event in {"schedule", "workflow_dispatch"} and head_branch == "main" and HEAVY_JOB_NAME in jobs:
+            job_info = workflow_job_info_from_payload(run_payload, jobs[HEAVY_JOB_NAME])
+            if job_info.job_conclusion in {"", "skipped"}:
+                continue
+            try:
+                metadata = download_metadata_artifact(
+                    run_id, job_info.run_attempt, HEAVY_JOB_NAME, repo=repo
+                )
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                print(
+                    f"warning: run_id={run_id} job={HEAVY_JOB_NAME} metadata download failed: {exc}",
+                    file=sys.stderr,
+                )
+                metadata = missing_metadata_payload(HEAVY_JOB_NAME, str(exc))
+            metadata = validate_metadata_payload(metadata, HEAVY_JOB_NAME)
+            sample = classify_heavy_queue_sample(job_info, metadata)
+            if sample is not None:
+                heavy_samples.append(sample)
+
+    return pr_samples, heavy_samples
+
+
+def render_text_report(evaluation: dict[str, Any]) -> str:
+    """Render a human-readable readiness report for terminal use."""
+    pr_stats = evaluation.get("pr_queue_shadow") or {}
+    heavy_stats = evaluation.get("heavy_queue") or {}
+    ready_text = "yes" if evaluation["ready_to_require"] else "no"
+    lines = [
+        "Browser Lane Readiness Report",
+        "",
+        "PR Queue Shadow",
+        f"  Fetched samples: {pr_stats.get('sample_count')}",
+        f"  Green streak: {pr_stats.get('green_streak')}",
+        f"  Median job duration: {pr_stats.get('median_job_duration_seconds')}",
+        f"  P95 job duration: {pr_stats.get('p95_job_duration_seconds')}",
+        f"  Missing job durations in streak: {pr_stats.get('missing_job_duration_count')}",
+        f"  Span days: {pr_stats.get('span_days')}",
+        f"  Merge-group samples in streak: {pr_stats.get('merge_group_samples_in_streak')}",
+        f"  Metadata failures in fetched sample: {pr_stats.get('metadata_failures')}",
+        f"  Cleanup failures in fetched sample: {pr_stats.get('cleanup_failures')}",
+        f"  Teardown failures in fetched sample: {pr_stats.get('teardown_failures')}",
+        f"  Other failures in fetched sample: {pr_stats.get('other_failures')}",
+        "",
+        "Heavy Queue Soak",
+        f"  Fetched samples: {heavy_stats.get('sample_count')}",
+        f"  Green streak: {heavy_stats.get('green_streak')}",
+        f"  Median queue duration: {heavy_stats.get('median_queue_duration_seconds')}",
+        f"  P95 queue duration: {heavy_stats.get('p95_queue_duration_seconds')}",
+        f"  Missing queue durations in streak: {heavy_stats.get('missing_queue_duration_count')}",
+        f"  Span days: {heavy_stats.get('span_days')}",
+        f"  Metadata failures in fetched sample: {heavy_stats.get('metadata_failures')}",
+        f"  Cleanup failures in fetched sample: {heavy_stats.get('cleanup_failures')}",
+        f"  Teardown failures in fetched sample: {heavy_stats.get('teardown_failures')}",
+        f"  Other failures in fetched sample: {heavy_stats.get('other_failures')}",
+        "",
+        f"Ready to require compose-browser-queue-pr: {ready_text}",
+    ]
+    if pr_stats.get("most_recent_red_sample") is not None:
+        red = pr_stats["most_recent_red_sample"]
+        lines.append("Most recent PR red sample:")
+        lines.extend(
+            [
+                f"  run_id: {red['run_id']}",
+                f"  run_attempt: {red['run_attempt']}",
+                f"  event: {red['event']}",
+                f"  job_conclusion: {red['job_conclusion']}",
+                f"  queue_summary_status: {red['queue_summary_status']}",
+                f"  metadata_error: {red['metadata_error']}",
+                f"  cleanup_succeeded: {red['cleanup_succeeded']}",
+                f"  compose_teardown_succeeded: {red['compose_teardown_succeeded']}",
+            ]
+        )
+    if heavy_stats.get("most_recent_red_sample") is not None:
+        red = heavy_stats["most_recent_red_sample"]
+        lines.append("Most recent heavy red sample:")
+        lines.extend(
+            [
+                f"  run_id: {red['run_id']}",
+                f"  run_attempt: {red['run_attempt']}",
+                f"  event: {red['event']}",
+                f"  job_conclusion: {red['job_conclusion']}",
+                f"  queue_summary_status: {red['queue_summary_status']}",
+                f"  metadata_error: {red['metadata_error']}",
+                f"  cleanup_succeeded: {red['cleanup_succeeded']}",
+                f"  compose_teardown_succeeded: {red['compose_teardown_succeeded']}",
+            ]
+        )
+    if (pr_stats.get("metadata_failures") or 0) > 0 or (heavy_stats.get("metadata_failures") or 0) > 0:
+        lines.append(
+            "Note: runs from before the readiness metadata rollout cannot count green because they lack metadata artifacts."
+        )
+    if evaluation["reasons"]:
+        lines.append("Reasons:")
+        lines.extend([f"  - {reason}" for reason in evaluation["reasons"]])
+    return "\n".join(lines)
 
 
 def build_queue_metadata_from_run_dir(run_dir: Path, mode: str) -> dict[str, Any]:

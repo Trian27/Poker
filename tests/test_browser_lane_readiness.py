@@ -1,17 +1,25 @@
 from pathlib import Path
 import json
+import pytest
 import subprocess
 import sys
 
+from scripts import browser_lane_readiness_report
 from scripts.browser_lane_readiness import (
     QUEUE_SCENARIO_NAME,
+    HEAVY_JOB_NAME,
+    QUEUE_PR_JOB_NAME,
     WorkflowJobInfo,
+    artifact_name_for_job,
     build_queue_metadata_from_mode_root,
     classify_heavy_queue_sample,
     classify_pr_queue_sample,
+    collect_queue_samples,
     consecutive_green_streak,
+    download_metadata_artifact,
     evaluate_readiness,
     parse_iso8601,
+    render_text_report,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -749,3 +757,366 @@ def test_evaluate_readiness_with_short_streak_does_not_emit_duration_noise() -> 
     assert not any("median" in reason for reason in evaluation["reasons"])
     assert not any("p95" in reason for reason in evaluation["reasons"])
     assert not any("span" in reason for reason in evaluation["reasons"])
+
+
+def test_artifact_name_for_job_returns_exact_names() -> None:
+    assert artifact_name_for_job(QUEUE_PR_JOB_NAME, 1, 3) == "compose-browser-queue-pr-readiness-metadata-1-3"
+    assert artifact_name_for_job(HEAVY_JOB_NAME, 1, 3) == "compose-browser-e2e-queue-readiness-metadata-1-3"
+
+
+def test_download_metadata_artifact_reads_the_matching_json(tmp_path: Path, monkeypatch) -> None:
+    expected_payload = {
+        "mode": "compose-browser-queue-pr",
+        "compose_teardown_succeeded": True,
+        "metadata_error": None,
+        "queue_summary": {
+            "found": True,
+            "status": "passed",
+            "cleanup_succeeded": True,
+            "scenario_duration_seconds": 9.0,
+        },
+    }
+
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> subprocess.CompletedProcess[str]:
+        assert cmd[:3] == ["gh", "run", "download"]
+        assert artifact_name_for_job("compose-browser-queue-pr", 1, 3) in cmd
+        target_dir = Path(cmd[cmd.index("--dir") + 1]) / "compose-browser-queue-pr-readiness-metadata-1-3"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / "queue-readiness-metadata.json").write_text(json.dumps(expected_payload), encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    payload = download_metadata_artifact(1, 3, "compose-browser-queue-pr")
+
+    assert payload == expected_payload
+
+
+def test_download_metadata_artifact_wraps_gh_errors(tmp_path: Path, monkeypatch) -> None:
+    def fake_run(cmd: list[str], check: bool, capture_output: bool, text: bool) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(1, cmd, stderr="artifact missing")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="artifact missing"):
+        download_metadata_artifact(1, 3, QUEUE_PR_JOB_NAME)
+
+
+def test_render_text_report_contains_the_key_sections() -> None:
+    report_text = render_text_report({
+        "ready_to_require": False,
+        "reasons": ["PR queue shadow streak is 3, need 10"],
+        "pr_queue_shadow": {
+            "sample_count": 5,
+            "green_streak": 3,
+            "median_job_duration_seconds": 120.0,
+            "p95_job_duration_seconds": 140.0,
+            "missing_job_duration_count": 0,
+            "span_days": 1.5,
+            "merge_group_samples_in_streak": 0,
+            "metadata_failures": 1,
+            "cleanup_failures": 0,
+            "teardown_failures": 0,
+            "other_failures": 1,
+            "most_recent_red_sample": {
+                "run_id": 123,
+                "run_attempt": 2,
+                "event": "pull_request",
+                "job_conclusion": "failure",
+                "queue_summary_status": None,
+                "metadata_error": "metadata artifact missing",
+                "cleanup_succeeded": None,
+                "compose_teardown_succeeded": None,
+            },
+        },
+        "heavy_queue": {
+            "sample_count": 4,
+            "green_streak": 2,
+            "median_queue_duration_seconds": 9.0,
+            "p95_queue_duration_seconds": 11.0,
+            "missing_queue_duration_count": 0,
+            "span_days": 1.0,
+            "metadata_failures": 0,
+            "cleanup_failures": 0,
+            "teardown_failures": 0,
+            "other_failures": 0,
+            "most_recent_red_sample": None,
+        },
+    })
+
+    assert "Browser Lane Readiness Report" in report_text
+    assert "PR Queue Shadow" in report_text
+    assert "Heavy Queue Soak" in report_text
+    assert "Fetched samples: 5" in report_text
+    assert "Metadata failures in fetched sample: 1" in report_text
+    assert "Most recent PR red sample" in report_text
+    assert "runs from before the readiness metadata rollout cannot count green" in report_text
+    assert "Ready to require compose-browser-queue-pr: no" in report_text
+
+
+def test_collect_queue_samples_skips_artifact_download_for_skipped_queue_jobs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_gameplay_runs",
+        lambda limit, repo=None: [
+            {
+                "attempt": 1,
+                "databaseId": 77,
+                "createdAt": "2026-05-19T16:54:28Z",
+                "event": "pull_request",
+                "headBranch": "feature-branch",
+                "status": "completed",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_jobs_for_run",
+        lambda run_id, run_attempt, repo=None: [
+            {
+                "name": "compose-browser-queue-pr",
+                "conclusion": "skipped",
+                "startedAt": "2026-05-19T16:56:31Z",
+                "completedAt": "2026-05-19T16:56:31Z",
+            }
+        ],
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("download_metadata_artifact should not be called for skipped queue jobs")
+
+    monkeypatch.setattr("scripts.browser_lane_readiness.download_metadata_artifact", fail_if_called)
+
+    pr_samples, heavy_samples = collect_queue_samples(limit=5)
+
+    assert pr_samples == []
+    assert heavy_samples == []
+
+
+def test_collect_queue_samples_turns_missing_metadata_into_a_red_sample(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_gameplay_runs",
+        lambda limit, repo=None: [
+            {
+                "attempt": 2,
+                "databaseId": 88,
+                "createdAt": "2026-05-19T16:54:28Z",
+                "event": "pull_request",
+                "headBranch": "feature-branch",
+                "status": "completed",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_jobs_for_run",
+        lambda run_id, run_attempt, repo=None: [
+            {
+                "name": "compose-browser-queue-pr",
+                "conclusion": "failure",
+                "startedAt": "2026-05-19T16:56:31Z",
+                "completedAt": "2026-05-19T16:58:12Z",
+            }
+        ],
+    )
+
+    def raise_missing_artifact(run_id: int, run_attempt: int, job_name: str, repo=None) -> dict:
+        raise FileNotFoundError("metadata artifact missing")
+
+    monkeypatch.setattr("scripts.browser_lane_readiness.download_metadata_artifact", raise_missing_artifact)
+
+    pr_samples, heavy_samples = collect_queue_samples(limit=5)
+
+    assert heavy_samples == []
+    assert len(pr_samples) == 1
+    assert pr_samples[0].is_green is False
+    assert pr_samples[0].metadata_error == "metadata artifact missing"
+
+
+def test_collect_queue_samples_skips_in_progress_runs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_gameplay_runs",
+        lambda limit, repo=None: [
+            {
+                "attempt": 1,
+                "databaseId": 99,
+                "createdAt": "2026-05-19T16:54:28Z",
+                "event": "pull_request",
+                "headBranch": "feature-branch",
+                "status": "in_progress",
+            }
+        ],
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("list_jobs_for_run should not be called for incomplete runs")
+
+    monkeypatch.setattr("scripts.browser_lane_readiness.list_jobs_for_run", fail_if_called)
+
+    pr_samples, heavy_samples = collect_queue_samples(limit=5)
+
+    assert pr_samples == []
+    assert heavy_samples == []
+
+
+def test_collect_queue_samples_turns_invalid_metadata_schema_into_a_red_sample(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_gameplay_runs",
+        lambda limit, repo=None: [
+            {
+                "attempt": 1,
+                "databaseId": 111,
+                "createdAt": "2026-05-19T16:54:28Z",
+                "event": "pull_request",
+                "headBranch": "feature-branch",
+                "status": "completed",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_jobs_for_run",
+        lambda run_id, run_attempt, repo=None: [
+            {
+                "name": "compose-browser-queue-pr",
+                "conclusion": "success",
+                "startedAt": "2026-05-19T16:56:31Z",
+                "completedAt": "2026-05-19T16:58:12Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.download_metadata_artifact",
+        lambda run_id, run_attempt, job_name, repo=None: {
+            "schema_version": 999,
+            "mode": "compose-browser-queue-pr",
+            "queue_summary": {"found": True, "scenario": "wrong scenario"},
+        },
+    )
+
+    pr_samples, heavy_samples = collect_queue_samples(limit=5)
+
+    assert heavy_samples == []
+    assert len(pr_samples) == 1
+    assert pr_samples[0].is_green is False
+    assert "Unsupported metadata schema_version" in pr_samples[0].metadata_error
+
+
+def test_collect_queue_samples_raw_limit_can_crowd_out_heavy_runs(monkeypatch) -> None:
+    all_runs = [
+        {
+            "attempt": 1,
+            "databaseId": 201,
+            "createdAt": "2026-05-19T16:54:28Z",
+            "event": "pull_request",
+            "headBranch": "feature-a",
+            "status": "completed",
+        },
+        {
+            "attempt": 1,
+            "databaseId": 202,
+            "createdAt": "2026-05-19T15:54:28Z",
+            "event": "pull_request",
+            "headBranch": "feature-b",
+            "status": "completed",
+        },
+        {
+            "attempt": 1,
+            "databaseId": 203,
+            "createdAt": "2026-05-19T14:54:28Z",
+            "event": "pull_request",
+            "headBranch": "feature-c",
+            "status": "completed",
+        },
+        {
+            "attempt": 1,
+            "databaseId": 204,
+            "createdAt": "2026-05-19T13:54:28Z",
+            "event": "schedule",
+            "headBranch": "main",
+            "status": "completed",
+        },
+    ]
+
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_gameplay_runs",
+        lambda limit, repo=None: all_runs[:limit],
+    )
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.list_jobs_for_run",
+        lambda run_id, run_attempt, repo=None: [
+            {
+                "name": QUEUE_PR_JOB_NAME if run_id != 204 else HEAVY_JOB_NAME,
+                "conclusion": "success",
+                "startedAt": "2026-05-19T16:56:31Z",
+                "completedAt": "2026-05-19T16:58:12Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "scripts.browser_lane_readiness.download_metadata_artifact",
+        lambda run_id, run_attempt, job_name, repo=None: {
+            "schema_version": 1,
+            "mode": job_name,
+            "compose_teardown_succeeded": True,
+            "metadata_error": None,
+            "queue_summary": {
+                "found": True,
+                "scenario": "full table queue promotion reserves buy-in, promotes, and rejoins",
+                "status": "passed",
+                "cleanup_succeeded": True,
+                "scenario_duration_seconds": 9.0,
+            },
+        },
+    )
+
+    pr_samples, heavy_samples = collect_queue_samples(limit=3)
+
+    assert len(pr_samples) == 3
+    assert heavy_samples == []
+
+
+def test_report_cli_json_output_returns_zero(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(browser_lane_readiness_report, "collect_queue_samples", lambda limit, repo=None: ([], []))
+    monkeypatch.setattr(
+        browser_lane_readiness_report,
+        "evaluate_readiness",
+        lambda pr_samples, heavy_samples, require_merge_group_sample=False: {
+            "ready_to_require": True,
+            "reasons": [],
+            "pr_queue_shadow": {"sample_count": 0},
+            "heavy_queue": {"sample_count": 0},
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["browser_lane_readiness_report", "--json"])
+
+    exit_code = browser_lane_readiness_report.main()
+
+    assert exit_code == 0
+    assert '"ready_to_require": true' in capsys.readouterr().out
+
+
+def test_report_cli_fail_if_not_ready_returns_one(monkeypatch) -> None:
+    monkeypatch.setattr(browser_lane_readiness_report, "collect_queue_samples", lambda limit, repo=None: ([], []))
+    monkeypatch.setattr(
+        browser_lane_readiness_report,
+        "evaluate_readiness",
+        lambda pr_samples, heavy_samples, require_merge_group_sample=False: {
+            "ready_to_require": False,
+            "reasons": ["not ready"],
+            "pr_queue_shadow": {"sample_count": 0},
+            "heavy_queue": {"sample_count": 0},
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["browser_lane_readiness_report", "--fail-if-not-ready"])
+
+    assert browser_lane_readiness_report.main() == 1
+
+
+def test_report_cli_returns_error_exit_code_on_exception(monkeypatch, capsys) -> None:
+    def raise_runtime_error(limit, repo=None):
+        raise RuntimeError("gh failed")
+
+    monkeypatch.setattr(browser_lane_readiness_report, "collect_queue_samples", raise_runtime_error)
+    monkeypatch.setattr(sys, "argv", ["browser_lane_readiness_report"])
+
+    exit_code = browser_lane_readiness_report.main()
+
+    assert exit_code == browser_lane_readiness_report.CLI_ERROR_EXIT_CODE
+    assert "browser lane readiness report failed: gh failed" in capsys.readouterr().err
