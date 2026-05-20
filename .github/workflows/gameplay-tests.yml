@@ -2,21 +2,47 @@ name: Gameplay Tests
 
 on:
   pull_request:
-    paths:
-      - 'GameImplementation/**'
-      - 'poker-api/**'
-      - 'poker-ui/**'
-      - 'docker-compose.yml'
-      - 'scripts/test_autonomous_bot_gameplay.py'
-      - 'scripts/test-gameplay.sh'
-      - '.github/workflows/gameplay-tests.yml'
   merge_group:
   workflow_dispatch:
   schedule:
     - cron: '0 9 * * *'
 
 jobs:
+  gameplay-scope:
+    runs-on: ubuntu-latest
+    outputs:
+      run_gameplay_jobs: ${{ steps.scope.outputs.run_gameplay_jobs }}
+      reason: ${{ steps.scope.outputs.reason }}
+      matching_paths_json: ${{ steps.scope.outputs.matching_paths_json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Collect pull request changed files
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p .tmp
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          git diff --name-only FETCH_HEAD...HEAD > .tmp/gameplay-changed-files.txt
+      - name: Evaluate gameplay workflow scope
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            python3 -m scripts.gameplay_workflow_scope \
+              --event-name pull_request \
+              --changed-files-file .tmp/gameplay-changed-files.txt \
+              --github-output "$GITHUB_OUTPUT"
+          else
+            {
+              echo "run_gameplay_jobs=true"
+              echo "reason=non-pull_request events always run gameplay jobs"
+              echo 'matching_paths_json=[]'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
   gameimplementation:
+    needs: gameplay-scope
+    if: github.event_name != 'pull_request' || needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
     runs-on: ubuntu-latest
     services:
       redis:
@@ -39,6 +65,8 @@ jobs:
       - run: npm run test:gameplay
 
   poker-api-gameplay:
+    needs: gameplay-scope
+    if: github.event_name != 'pull_request' || needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -71,6 +99,8 @@ jobs:
       - run: python -m pytest -m gameplay tests/gameplay/test_tables_gameplay.py -q
 
   poker-ui:
+    needs: gameplay-scope
+    if: github.event_name != 'pull_request' || needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -119,6 +149,7 @@ jobs:
 
   compose-browser-pr-smoke:
     name: compose-browser-pr-smoke
+    needs: gameplay-scope
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -128,18 +159,29 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: gameplay-browser-pr-smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
+      - name: Skip compose-browser-pr-smoke on non-gameplay PR
+        if: github.event_name == 'pull_request' && needs.gameplay-scope.outputs.run_gameplay_jobs != 'true'
+        run: |
+          echo "compose-browser-pr-smoke not required for this PR."
+          echo "Reason: ${{ needs.gameplay-scope.outputs.reason }}"
+          echo "Matching gameplay paths: ${{ needs.gameplay-scope.outputs.matching_paths_json }}"
       - uses: actions/checkout@v4
+        if: needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
       - uses: actions/setup-node@v4
+        if: needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: poker-ui/package-lock.json
       - run: npm ci
+        if: needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
         working-directory: poker-ui
       - run: npx playwright install --with-deps chromium
+        if: needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
         working-directory: poker-ui
       - run: ./scripts/test-gameplay.sh compose-browser-pr-smoke
-      - if: failure()
+        if: needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
+      - if: failure() && needs.gameplay-scope.outputs.run_gameplay_jobs == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: compose-browser-pr-smoke-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
@@ -148,8 +190,8 @@ jobs:
 
   compose-browser-queue-pr:
     name: compose-browser-queue-pr
-    needs: compose-browser-pr-smoke
-    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs['compose-browser-pr-smoke'].result == 'success'
+    needs: [gameplay-scope, compose-browser-pr-smoke]
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.gameplay-scope.outputs.run_gameplay_jobs == 'true' && needs['compose-browser-pr-smoke'].result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:

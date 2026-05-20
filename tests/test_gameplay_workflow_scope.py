@@ -108,3 +108,21 @@ def test_scope_cli_writes_github_output_file(tmp_path: Path) -> None:
     assert "run_gameplay_jobs=true" in lines
     assert "reason=pull_request changed files match gameplay workflow scope" in lines
     assert 'matching_paths_json=["poker-ui/src/App.tsx"]' in lines
+
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "gameplay-tests.yml"
+
+
+def test_gameplay_workflow_no_longer_uses_pull_request_paths_filter() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "pull_request:\n    paths:" not in workflow_text
+
+
+
+def test_gameplay_workflow_uses_scope_job_and_required_smoke_noop_path() -> None:
+    workflow_text = WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "gameplay-scope:" in workflow_text
+    assert "python3 -m scripts.gameplay_workflow_scope" in workflow_text
+    assert "name: Skip compose-browser-pr-smoke on non-gameplay PR" in workflow_text
+    assert "needs: [gameplay-scope, compose-browser-pr-smoke]" in workflow_text
