@@ -196,3 +196,5 @@ For maintenance safety checks (including DB target verification before cleanup),
 
 ## License
 This project is licensed under the MIT License.
+
+<!-- temporary validation branch for non-gameplay workflow scope -->
