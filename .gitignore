@@ -13,3 +13,10 @@ logs/
 .idea/
 poker-ui/dist/
 poker-ui/node_modules/
+.runtime/
+tools/g5-runtime-probe/bin/
+tools/g5-runtime-probe/obj/
+g5-advisor-service/bin/
+g5-advisor-service/obj/
+g5-advisor-service.Tests/bin/
+g5-advisor-service.Tests/obj/

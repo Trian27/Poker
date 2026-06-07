@@ -478,16 +478,8 @@ export const learningApi = {
   },
 
   recommendAction: async (payload: {
-    street: 'preflop' | 'flop' | 'turn' | 'river';
-    hole_cards: Array<{ rank: string; suit: string }>;
-    community_cards: Array<{ rank: string; suit: string }>;
-    pot: number;
-    to_call: number;
-    min_raise: number;
-    stack: number;
-    players_in_hand: number;
-    can_check: boolean;
-    position?: string;
+    hand_id: string;
+    decision_sequence: number;
   }) => {
     const response = await api.post('/api/learning/coach/recommend', payload);
     return response.data;

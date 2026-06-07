@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { handsApi, learningApi } from '../api';
 import { useAuth } from '../auth-context';
@@ -43,11 +43,6 @@ interface CardLike {
   suit?: string;
 }
 
-interface CoachCard {
-  rank: string;
-  suit: string;
-}
-
 interface HandPlayerLike {
   user_id?: number | string | null;
   hole_cards?: CardLike[];
@@ -61,24 +56,9 @@ interface HandDataShape {
 
 const ANALYZABLE_ACTIONS = new Set(['fold', 'check', 'call', 'bet', 'raise', 'all-in']);
 
-const stageBoardCardCount: Record<Street, number> = {
-  preflop: 0,
-  flop: 3,
-  turn: 4,
-  river: 5,
-};
-
 const parseNumber = (value: unknown, fallback = 0): number => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
-};
-
-const normalizeStreet = (value: unknown): Street => {
-  const text = String(value || '').toLowerCase();
-  if (text === 'flop' || text === 'turn' || text === 'river') {
-    return text;
-  }
-  return 'preflop';
 };
 
 const suitSymbol = (suit: string) => {
@@ -98,28 +78,25 @@ const suitSymbol = (suit: string) => {
 
 const renderCardText = (card: { rank?: string; suit?: string }) => `${card.rank ?? '?'}${suitSymbol(card.suit ?? '')}`;
 
-const normalizeCoachCards = (cards: unknown): CoachCard[] => {
-  if (!Array.isArray(cards)) {
-    return [];
+const formatActionLabel = (action: string | null | undefined) => {
+  if (!action) {
+    return 'No action';
   }
-  return cards
-    .map((card) => {
-      if (!card || typeof card !== 'object') {
-        return null;
-      }
-      const maybeCard = card as CardLike;
-      if (typeof maybeCard.rank !== 'string' || typeof maybeCard.suit !== 'string') {
-        return null;
-      }
-      return { rank: maybeCard.rank, suit: maybeCard.suit };
-    })
-    .filter((card): card is CoachCard => card !== null);
+  return action.replace(/-/g, ' ').replace(/\b\w/g, (match) => match.toUpperCase());
+};
+
+const formatStreetLabel = (street: Street | null) => {
+  if (!street) {
+    return 'Unknown street';
+  }
+  return street.charAt(0).toUpperCase() + street.slice(1);
 };
 
 export const LearningPage: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { user } = useAuth();
+  const coachPanelRef = useRef<HTMLDivElement | null>(null);
   const [sessions, setSessions] = useState<LearningSessionSummary[]>([]);
   const [legacyHands, setLegacyHands] = useState<HandHistorySummary[]>([]);
   const [sessionHands, setSessionHands] = useState<HandHistorySummary[]>([]);
@@ -254,7 +231,7 @@ export const LearningPage: React.FC = () => {
   }, [handData, user]);
 
   const analyzeDecision = async (entry: ActionLogEntry) => {
-    if (!user || !myPlayerData) {
+    if (!user || !selectedHandId) {
       return;
     }
 
@@ -263,29 +240,23 @@ export const LearningPage: React.FC = () => {
       return;
     }
 
-    const street = normalizeStreet(entry.stage);
-    const boardCount = stageBoardCardCount[street] ?? 0;
-    const communityCards = normalizeCoachCards(handData.community_cards).slice(0, boardCount);
-    const holeCards = normalizeCoachCards(myPlayerData.hole_cards);
-
     setLoadingCoach(true);
     setSelectedDecisionSequence(entry.sequence);
     setCoachResult(null);
     setError('');
+    window.requestAnimationFrame(() => {
+      coachPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
 
     try {
       const result = await learningApi.recommendAction({
-        street,
-        hole_cards: holeCards,
-        community_cards: communityCards,
-        pot: parseNumber(entry.potBefore ?? entry.pot_before, 0),
-        to_call: parseNumber(entry.toCallBefore ?? entry.to_call_before, 0),
-        min_raise: parseNumber(entry.minimumRaiseBefore ?? entry.minimum_raise_before, 1),
-        stack: parseNumber(entry.playerStackBefore ?? entry.player_stack_before, 0),
-        players_in_hand: parseNumber(entry.playersInHandBefore ?? entry.players_in_hand_before, 2),
-        can_check: parseNumber(entry.toCallBefore ?? entry.to_call_before, 0) <= 0,
+        hand_id: selectedHandId,
+        decision_sequence: entry.sequence,
       });
       setCoachResult(result);
+      window.requestAnimationFrame(() => {
+        coachPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
     } catch (err: unknown) {
       setError(getApiErrorMessage(err, 'Failed to analyze decision'));
     } finally {
@@ -418,27 +389,85 @@ export const LearningPage: React.FC = () => {
                 </div>
               )}
 
-              <div className="feature-card coach-panel">
+              <div ref={coachPanelRef} className="feature-card coach-panel">
                 <h3>Coach Move</h3>
                 {!selectedDecisionSequence && <div className="feature-meta">Select one of your actions and click Analyze.</div>}
                 {loadingCoach && <div className="feature-meta">Analyzing decision...</div>}
+                {selectedDecisionSequence && !loadingCoach && !coachResult && (
+                  <div className="coach-unsupported-card">
+                    <div className="coach-unsupported-title">Analysis unavailable</div>
+                    <div className="coach-unsupported-message">
+                      {error || 'No recommendation was returned for this decision.'}
+                    </div>
+                  </div>
+                )}
                 {coachResult && (
                   <>
-                    <div className="coach-summary">{coachResult.summary}</div>
-                    <div className="coach-tags">
-                      {coachResult.tags.map((tag) => (
-                        <span key={tag} className="coach-tag">{tag}</span>
-                      ))}
-                    </div>
-                    <div className="coach-actions">
-                      {coachResult.top_actions.map((option, index) => (
-                        <div key={`${option.action}-${index}`} className="coach-action-row">
-                          <strong>{option.action.toUpperCase()}{option.amount ? ` ${option.amount}` : ''}</strong>
-                          <span>{Math.round(option.score * 100)}%</span>
-                          <div className="feature-meta">{option.rationale}</div>
+                    {coachResult.status === 'ok' ? (
+                      <div className="coach-result-card">
+                        <div className="coach-result-header">
+                          <div className="coach-result-title">
+                            <span className="coach-engine-pill">{coachResult.engine.toUpperCase()}</span>
+                            <strong>{formatActionLabel(coachResult.recommended_action)}</strong>
+                            {coachResult.amount !== null && (
+                              <span className="coach-amount-pill">{coachResult.amount} chips</span>
+                            )}
+                          </div>
+                          <div className="feature-meta">{formatStreetLabel(coachResult.street)}</div>
                         </div>
-                      ))}
-                    </div>
+
+                        <div className="coach-metrics-grid">
+                          <div className="coach-metric-card">
+                            <span className="coach-metric-label">Check/Call EV</span>
+                            <strong>{coachResult.check_call_ev ?? 'N/A'}</strong>
+                          </div>
+                          <div className="coach-metric-card">
+                            <span className="coach-metric-label">Bet/Raise EV</span>
+                            <strong>{coachResult.bet_raise_ev ?? 'N/A'}</strong>
+                          </div>
+                          <div className="coach-metric-card">
+                            <span className="coach-metric-label">Decision Time</span>
+                            <strong>{coachResult.time_spent_seconds ?? 'N/A'}</strong>
+                          </div>
+                          <div className="coach-metric-card">
+                            <span className="coach-metric-label">Raw Action</span>
+                            <strong>
+                              {coachResult.raw_action_type
+                                ? `${coachResult.raw_action_type}${coachResult.raw_by_amount !== null ? ` ${coachResult.raw_by_amount}` : ''}`
+                                : 'N/A'}
+                            </strong>
+                          </div>
+                        </div>
+
+                        {coachResult.warnings.length > 0 && (
+                          <div className="coach-warning-list">
+                            {coachResult.warnings.map((warning) => (
+                              <span key={warning} className="coach-warning-pill">{warning}</span>
+                            ))}
+                          </div>
+                        )}
+
+                        {coachResult.message && (
+                          <div className="coach-message-box">
+                            <div className="coach-section-label">G5 Message</div>
+                            <div>{coachResult.message}</div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="coach-unsupported-card">
+                        <div className="coach-unsupported-title">Not supported yet</div>
+                        <div className="coach-unsupported-message">
+                          {coachResult.unsupported_message || 'G5 analysis is not available for this action yet.'}
+                        </div>
+                        <div className="coach-unsupported-meta">
+                          <span>Street: {formatStreetLabel(coachResult.street)}</span>
+                          {coachResult.unsupported_code && (
+                            <span>Code: {coachResult.unsupported_code}</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </>
                 )}
               </div>
