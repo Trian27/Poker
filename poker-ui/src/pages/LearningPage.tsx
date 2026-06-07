@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { handsApi, learningApi } from '../api';
 import { useAuth } from '../auth-context';
@@ -96,6 +96,7 @@ export const LearningPage: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { user } = useAuth();
+  const coachPanelRef = useRef<HTMLDivElement | null>(null);
   const [sessions, setSessions] = useState<LearningSessionSummary[]>([]);
   const [legacyHands, setLegacyHands] = useState<HandHistorySummary[]>([]);
   const [sessionHands, setSessionHands] = useState<HandHistorySummary[]>([]);
@@ -243,6 +244,9 @@ export const LearningPage: React.FC = () => {
     setSelectedDecisionSequence(entry.sequence);
     setCoachResult(null);
     setError('');
+    window.requestAnimationFrame(() => {
+      coachPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
 
     try {
       const result = await learningApi.recommendAction({
@@ -250,6 +254,9 @@ export const LearningPage: React.FC = () => {
         decision_sequence: entry.sequence,
       });
       setCoachResult(result);
+      window.requestAnimationFrame(() => {
+        coachPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
     } catch (err: unknown) {
       setError(getApiErrorMessage(err, 'Failed to analyze decision'));
     } finally {
@@ -382,10 +389,18 @@ export const LearningPage: React.FC = () => {
                 </div>
               )}
 
-              <div className="feature-card coach-panel">
+              <div ref={coachPanelRef} className="feature-card coach-panel">
                 <h3>Coach Move</h3>
                 {!selectedDecisionSequence && <div className="feature-meta">Select one of your actions and click Analyze.</div>}
                 {loadingCoach && <div className="feature-meta">Analyzing decision...</div>}
+                {selectedDecisionSequence && !loadingCoach && !coachResult && (
+                  <div className="coach-unsupported-card">
+                    <div className="coach-unsupported-title">Analysis unavailable</div>
+                    <div className="coach-unsupported-message">
+                      {error || 'No recommendation was returned for this decision.'}
+                    </div>
+                  </div>
+                )}
                 {coachResult && (
                   <>
                     {coachResult.status === 'ok' ? (
