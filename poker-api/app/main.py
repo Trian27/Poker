@@ -5330,6 +5330,7 @@ LEARNING_STREETS = {"preflop", "flop", "turn", "river"}
 LEARNING_DECISION_ACTIONS = {"fold", "check", "call", "bet", "raise", "all-in"}
 G5_UNSUPPORTED_CODES = {
     "unsupported_hidden_forced_contribution",
+    "unsupported_heads_up_postflop_ordering",
     "unsupported_action",
 }
 

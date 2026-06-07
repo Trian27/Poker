@@ -179,6 +179,61 @@ public sealed class G5RuntimeHostIntegrationTests
         Assert.Equal("stage_transition_before_round_complete", ex.ErrorCode);
     }
 
+    [Fact]
+    public void HeadsUp_PreflopFoldTarget_ReturnsSupportedRecommendation()
+    {
+        var result = _fixture.Host.AnalyzeForTesting(CreateHeadsUpPreflopFoldTargetRequest());
+
+        Assert.Equal("g5", result.Response.Engine);
+        Assert.Equal(4, result.Response.DecisionSequence);
+        Assert.Equal("heads_up", result.Response.Debug?.TableProfile);
+        Assert.Equal("preflop", result.Response.Debug?.TargetStreet);
+        AssertSupportedRecommendation(result.Response);
+    }
+
+    [Fact]
+    public void HeadsUp_FlopBetTarget_ReturnsSupportedRecommendation()
+    {
+        var result = _fixture.Host.AnalyzeForTesting(CreateHeadsUpFlopBetTargetRequest());
+
+        Assert.Equal("g5", result.Response.Engine);
+        Assert.Equal(5, result.Response.DecisionSequence);
+        Assert.Equal("heads_up", result.Response.Debug?.TableProfile);
+        Assert.Equal("flop", result.Response.Debug?.TargetStreet);
+        AssertSupportedRecommendation(result.Response);
+    }
+
+    [Fact]
+    public void HeadsUp_FlopRaiseTarget_ReturnsSupportedRecommendation()
+    {
+        var result = _fixture.Host.AnalyzeForTesting(CreateHeadsUpFlopRaiseTargetRequest());
+
+        Assert.Equal("g5", result.Response.Engine);
+        Assert.Equal(6, result.Response.DecisionSequence);
+        Assert.Equal("heads_up", result.Response.Debug?.TableProfile);
+        Assert.Equal("flop", result.Response.Debug?.TargetStreet);
+        AssertSupportedRecommendation(result.Response);
+    }
+
+    [Fact]
+    public void ThreePlayer_FlopAllInTarget_ReturnsSupportedRecommendation()
+    {
+        var result = _fixture.Host.AnalyzeForTesting(CreateThreePlayerFlopAllInTargetRequest());
+
+        Assert.Equal("g5", result.Response.Engine);
+        Assert.Equal(7, result.Response.DecisionSequence);
+        Assert.Equal("six_max", result.Response.Debug?.TableProfile);
+        Assert.Equal("flop", result.Response.Debug?.TargetStreet);
+        AssertSupportedRecommendation(result.Response);
+    }
+
+    [Fact]
+    public void HeadsUp_ButtonFirstPostflopEngineOrdering_IsReportedUnsupported()
+    {
+        var ex = Assert.Throws<ServiceApiException>(() => _fixture.Host.AnalyzeForTesting(CreateHeadsUpButtonFirstPostflopCallTargetRequest()));
+        Assert.Equal("unsupported_heads_up_postflop_ordering", ex.ErrorCode);
+    }
+
     private static void AssertSnapshotSequence(IReadOnlyList<ReplayStateSnapshot> actual, params ExpectedSnapshot[] expected)
     {
         Assert.Equal(expected.Length, actual.Count);
@@ -199,6 +254,48 @@ public sealed class G5RuntimeHostIntegrationTests
         Assert.Equal(expected.ActiveNonAllInPlayers, actual.ActiveNonAllInPlayers);
         Assert.Equal(expected.MoneyInPotByPlayer, actual.MoneyInPotByPlayer);
         Assert.Equal(expected.StackByPlayer, actual.StackByPlayer);
+    }
+
+    private static void AssertSupportedRecommendation(AnalyzeDecisionResponse response)
+    {
+        var allowedActions = new[] { "fold", "check", "call", "bet", "raise", "all-in" };
+        if (response.RecommendedAction is null)
+        {
+            Assert.Contains("no_action_returned", response.Warnings);
+            return;
+        }
+
+        Assert.Contains(response.RecommendedAction, allowedActions);
+    }
+
+    private static AnalyzeDecisionRequest CreateHeadsUpPreflopFoldTargetRequest()
+    {
+        return new AnalyzeDecisionRequest
+        {
+            HeroPlayerId = "hero",
+            DecisionSequence = 4,
+            HandData = new HandData
+            {
+                CommunityCards = Cards(),
+                Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
+                DealerPlayerId = "villain",
+                SmallBlindPlayerId = "villain",
+                BigBlindPlayerId = "hero",
+                Players = new List<PlayerSnapshot>
+                {
+                    Player("villain", 1, 1),
+                    Player("hero", 2, 2, holeCards: HoleCards(("A", "hearts"), ("9", "clubs"))),
+                },
+                StartingStacks = Stacks(("villain", 10000), ("hero", 10000)),
+                ActionLog = new List<ActionLogEntry>
+                {
+                    Entry(1, "preflop", "villain", "small-blind", source: "forced", requestedAmount: 50, committedChips: 50, playerBetBefore: 0, playerBetAfter: 50, playerStackBefore: 10000, playerStackAfter: 9950),
+                    Entry(2, "preflop", "hero", "big-blind", source: "forced", requestedAmount: 100, committedChips: 100, playerBetBefore: 0, playerBetAfter: 100, playerStackBefore: 10000, playerStackAfter: 9900),
+                    Entry(3, "preflop", "villain", "raise", requestedAmount: 200, committedChips: 250, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 300, playerStackBefore: 9950, playerStackAfter: 9700),
+                    Entry(4, "preflop", "hero", "fold", toCallBefore: 200, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
+                },
+            },
+        };
     }
 
     private static AnalyzeDecisionRequest CreateHeadsUpFlopCheckRequest()
@@ -227,6 +324,71 @@ public sealed class G5RuntimeHostIntegrationTests
                     Entry(3, "preflop", "villain", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
                     Entry(4, "preflop", "hero", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
                     Entry(5, "flop", "hero", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
+                },
+            },
+        };
+    }
+
+    private static AnalyzeDecisionRequest CreateHeadsUpButtonFirstPostflopCallTargetRequest()
+    {
+        return new AnalyzeDecisionRequest
+        {
+            HeroPlayerId = "hero",
+            DecisionSequence = 6,
+            HandData = new HandData
+            {
+                CommunityCards = Cards(("A", "spades"), ("7", "clubs"), ("2", "diamonds")),
+                Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
+                DealerPlayerId = "villain",
+                SmallBlindPlayerId = "villain",
+                BigBlindPlayerId = "hero",
+                Players = new List<PlayerSnapshot>
+                {
+                    Player("villain", 1, 1),
+                    Player("hero", 2, 2, holeCards: HoleCards(("A", "hearts"), ("K", "diamonds"))),
+                },
+                StartingStacks = Stacks(("villain", 10000), ("hero", 10000)),
+                ActionLog = new List<ActionLogEntry>
+                {
+                    Entry(1, "preflop", "villain", "small-blind", source: "forced", requestedAmount: 50, committedChips: 50, playerBetBefore: 0, playerBetAfter: 50, playerStackBefore: 10000, playerStackAfter: 9950),
+                    Entry(2, "preflop", "hero", "big-blind", source: "forced", requestedAmount: 100, committedChips: 100, playerBetBefore: 0, playerBetAfter: 100, playerStackBefore: 10000, playerStackAfter: 9900),
+                    Entry(3, "preflop", "villain", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
+                    Entry(4, "preflop", "hero", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
+                    Entry(5, "flop", "villain", "bet", requestedAmount: 120, committedChips: 120, toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 220, playerStackBefore: 9900, playerStackAfter: 9780),
+                    Entry(6, "flop", "hero", "call", requestedAmount: 120, committedChips: 120, toCallBefore: 120, playerBetBefore: 100, playerBetAfter: 220, playerStackBefore: 9900, playerStackAfter: 9780),
+                },
+            },
+        };
+    }
+
+    private static AnalyzeDecisionRequest CreateHeadsUpFlopBetTargetRequest()
+    {
+        return new AnalyzeDecisionRequest
+        {
+            HeroPlayerId = "hero",
+            DecisionSequence = 5,
+            HandData = new HandData
+            {
+                CommunityCards = Cards(("A", "spades"), ("7", "clubs"), ("2", "diamonds"), ("4", "hearts")),
+                Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
+                DealerPlayerId = "villain",
+                SmallBlindPlayerId = "villain",
+                BigBlindPlayerId = "hero",
+                Players = new List<PlayerSnapshot>
+                {
+                    Player("villain", 1, 1),
+                    Player("hero", 2, 2, holeCards: HoleCards(("A", "hearts"), ("K", "diamonds"))),
+                },
+                StartingStacks = Stacks(("villain", 10000), ("hero", 10000)),
+                ActionLog = new List<ActionLogEntry>
+                {
+                    Entry(1, "preflop", "villain", "small-blind", source: "forced", requestedAmount: 50, committedChips: 50, playerBetBefore: 0, playerBetAfter: 50, playerStackBefore: 10000, playerStackAfter: 9950),
+                    Entry(2, "preflop", "hero", "big-blind", source: "forced", requestedAmount: 100, committedChips: 100, playerBetBefore: 0, playerBetAfter: 100, playerStackBefore: 10000, playerStackAfter: 9900),
+                    Entry(3, "preflop", "villain", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
+                    Entry(4, "preflop", "hero", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
+                    Entry(5, "flop", "hero", "bet", requestedAmount: 120, committedChips: 120, toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 220, playerStackBefore: 9900, playerStackAfter: 9780),
+                    Entry(6, "flop", "villain", "call", requestedAmount: 120, committedChips: 120, toCallBefore: 120, playerBetBefore: 100, playerBetAfter: 220, playerStackBefore: 9900, playerStackAfter: 9780),
+                    Entry(7, "turn", "hero", "check", toCallBefore: 0, playerBetBefore: 220, playerBetAfter: 220, playerStackBefore: 9780, playerStackAfter: 9780),
                 },
             },
         };
@@ -393,7 +555,42 @@ public sealed class G5RuntimeHostIntegrationTests
                     Entry(3, "preflop", "hero", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
                     Entry(4, "preflop", "villain", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
                     Entry(5, "flop", "villain", "bet", requestedAmount: 100, committedChips: 100, toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 200, playerStackBefore: 9900, playerStackAfter: 9800),
-                    Entry(6, "flop", "hero", "raise", requestedAmount: 300, committedChips: 300, toCallBefore: 100, playerBetBefore: 100, playerBetAfter: 400, playerStackBefore: 9900, playerStackAfter: 9600),
+                    Entry(6, "flop", "hero", "raise", requestedAmount: 200, committedChips: 300, toCallBefore: 100, playerBetBefore: 100, playerBetAfter: 400, playerStackBefore: 9900, playerStackAfter: 9600),
+                    Entry(7, "flop", "villain", "call", requestedAmount: 200, committedChips: 200, toCallBefore: 200, playerBetBefore: 200, playerBetAfter: 400, playerStackBefore: 9800, playerStackAfter: 9600),
+                    Entry(8, "turn", "villain", "check", toCallBefore: 0, playerBetBefore: 400, playerBetAfter: 400, playerStackBefore: 9600, playerStackAfter: 9600),
+                    Entry(9, "turn", "hero", "check", toCallBefore: 0, playerBetBefore: 400, playerBetAfter: 400, playerStackBefore: 9600, playerStackAfter: 9600),
+                },
+            },
+        };
+    }
+
+    private static AnalyzeDecisionRequest CreateHeadsUpFlopRaiseTargetRequest()
+    {
+        return new AnalyzeDecisionRequest
+        {
+            HeroPlayerId = "hero",
+            DecisionSequence = 6,
+            HandData = new HandData
+            {
+                CommunityCards = Cards(("A", "spades"), ("7", "clubs"), ("2", "diamonds"), ("4", "hearts")),
+                Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
+                DealerPlayerId = "hero",
+                SmallBlindPlayerId = "hero",
+                BigBlindPlayerId = "villain",
+                Players = new List<PlayerSnapshot>
+                {
+                    Player("hero", 1, 1, holeCards: HoleCards(("A", "hearts"), ("K", "diamonds"))),
+                    Player("villain", 2, 2),
+                },
+                StartingStacks = Stacks(("hero", 10000), ("villain", 10000)),
+                ActionLog = new List<ActionLogEntry>
+                {
+                    Entry(1, "preflop", "hero", "small-blind", source: "forced", requestedAmount: 50, committedChips: 50, playerBetBefore: 0, playerBetAfter: 50, playerStackBefore: 10000, playerStackAfter: 9950),
+                    Entry(2, "preflop", "villain", "big-blind", source: "forced", requestedAmount: 100, committedChips: 100, playerBetBefore: 0, playerBetAfter: 100, playerStackBefore: 10000, playerStackAfter: 9900),
+                    Entry(3, "preflop", "hero", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
+                    Entry(4, "preflop", "villain", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 9900, playerStackAfter: 9900),
+                    Entry(5, "flop", "villain", "bet", requestedAmount: 100, committedChips: 100, toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 200, playerStackBefore: 9900, playerStackAfter: 9800),
+                    Entry(6, "flop", "hero", "raise", requestedAmount: 200, committedChips: 300, toCallBefore: 100, playerBetBefore: 100, playerBetAfter: 400, playerStackBefore: 9900, playerStackAfter: 9600),
                     Entry(7, "flop", "villain", "call", requestedAmount: 200, committedChips: 200, toCallBefore: 200, playerBetBefore: 200, playerBetAfter: 400, playerStackBefore: 9800, playerStackAfter: 9600),
                     Entry(8, "turn", "villain", "check", toCallBefore: 0, playerBetBefore: 400, playerBetAfter: 400, playerStackBefore: 9600, playerStackAfter: 9600),
                     Entry(9, "turn", "hero", "check", toCallBefore: 0, playerBetBefore: 400, playerBetAfter: 400, playerStackBefore: 9600, playerStackAfter: 9600),
@@ -430,7 +627,43 @@ public sealed class G5RuntimeHostIntegrationTests
                     Entry(4, "preflop", "hero", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
                     Entry(5, "preflop", "shorty", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 80, playerStackAfter: 80),
                     Entry(6, "flop", "hero", "bet", requestedAmount: 200, committedChips: 200, toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 300, playerStackBefore: 9900, playerStackAfter: 9700),
-                    Entry(7, "flop", "shorty", "all-in", requestedAmount: 80, committedChips: 80, toCallBefore: 200, playerBetBefore: 100, playerBetAfter: 180, playerStackBefore: 80, playerStackAfter: 0),
+                    Entry(7, "flop", "shorty", "all-in", committedChips: 80, toCallBefore: 200, playerBetBefore: 100, playerBetAfter: 180, playerStackBefore: 80, playerStackAfter: 0),
+                    Entry(8, "flop", "button", "call", requestedAmount: 200, committedChips: 200, toCallBefore: 200, playerBetBefore: 100, playerBetAfter: 300, playerStackBefore: 9900, playerStackAfter: 9700),
+                    Entry(9, "turn", "hero", "check", toCallBefore: 0, playerBetBefore: 300, playerBetAfter: 300, playerStackBefore: 9700, playerStackAfter: 9700),
+                },
+            },
+        };
+    }
+
+    private static AnalyzeDecisionRequest CreateThreePlayerFlopAllInTargetRequest()
+    {
+        return new AnalyzeDecisionRequest
+        {
+            HeroPlayerId = "shorty",
+            DecisionSequence = 7,
+            HandData = new HandData
+            {
+                CommunityCards = Cards(("Q", "hearts"), ("8", "clubs"), ("3", "spades"), ("2", "diamonds")),
+                Blinds = new BlindConfig { SmallBlind = 50, BigBlind = 100 },
+                DealerPlayerId = "button",
+                SmallBlindPlayerId = "hero",
+                BigBlindPlayerId = "shorty",
+                Players = new List<PlayerSnapshot>
+                {
+                    Player("button", 1, 1),
+                    Player("hero", 2, 2),
+                    Player("shorty", 3, 3, holeCards: HoleCards(("A", "spades"), ("K", "diamonds"))),
+                },
+                StartingStacks = Stacks(("button", 10000), ("hero", 10000), ("shorty", 180)),
+                ActionLog = new List<ActionLogEntry>
+                {
+                    Entry(1, "preflop", "hero", "small-blind", source: "forced", requestedAmount: 50, committedChips: 50, playerBetBefore: 0, playerBetAfter: 50, playerStackBefore: 10000, playerStackAfter: 9950),
+                    Entry(2, "preflop", "shorty", "big-blind", source: "forced", requestedAmount: 100, committedChips: 100, playerBetBefore: 0, playerBetAfter: 100, playerStackBefore: 180, playerStackAfter: 80),
+                    Entry(3, "preflop", "button", "call", requestedAmount: 100, committedChips: 100, toCallBefore: 100, playerBetBefore: 0, playerBetAfter: 100, playerStackBefore: 10000, playerStackAfter: 9900),
+                    Entry(4, "preflop", "hero", "call", requestedAmount: 50, committedChips: 50, toCallBefore: 50, playerBetBefore: 50, playerBetAfter: 100, playerStackBefore: 9950, playerStackAfter: 9900),
+                    Entry(5, "preflop", "shorty", "check", toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 100, playerStackBefore: 80, playerStackAfter: 80),
+                    Entry(6, "flop", "hero", "bet", requestedAmount: 200, committedChips: 200, toCallBefore: 0, playerBetBefore: 100, playerBetAfter: 300, playerStackBefore: 9900, playerStackAfter: 9700),
+                    Entry(7, "flop", "shorty", "all-in", committedChips: 80, toCallBefore: 200, playerBetBefore: 100, playerBetAfter: 180, playerStackBefore: 80, playerStackAfter: 0),
                     Entry(8, "flop", "button", "call", requestedAmount: 200, committedChips: 200, toCallBefore: 200, playerBetBefore: 100, playerBetAfter: 300, playerStackBefore: 9900, playerStackAfter: 9700),
                     Entry(9, "turn", "hero", "check", toCallBefore: 0, playerBetBefore: 300, playerBetAfter: 300, playerStackBefore: 9700, playerStackAfter: 9700),
                 },

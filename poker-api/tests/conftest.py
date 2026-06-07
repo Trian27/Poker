@@ -12,6 +12,12 @@ from psycopg2 import sql
 import pytest
 from fastapi.testclient import TestClient
 
+collect_ignore = [
+    # Legacy localhost smoke scripts; these are not hermetic pytest tests.
+    "test_api.py",
+    "test_chunk2.py",
+]
+
 
 DEFAULT_DATABASE_URL = "postgresql://trian@localhost:5432/poker_platform"
 

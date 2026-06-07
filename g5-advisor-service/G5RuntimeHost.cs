@@ -427,6 +427,13 @@ internal sealed class G5RuntimeHost
         });
         warnings.AddRange(replayPlan.Warnings);
         var headsUpButtonActsFirstPostflop = seatedPlayerCount == 2 && UsesButtonFirstPostflopOrdering(actionLog, dealerPlayerId);
+        if (headsUpButtonActsFirstPostflop && !string.Equals(targetStreet, "preflop", StringComparison.Ordinal))
+        {
+            throw new ServiceApiException(
+                StatusCodes.Status422UnprocessableEntity,
+                "unsupported_heads_up_postflop_ordering",
+                "This heads-up hand uses dealer-first postflop action ordering that the current G5 replay cannot represent exactly.");
+        }
 
         var startingStacks = request.HandData.StartingStacks ?? new Dictionary<string, int>(StringComparer.Ordinal);
         var stackSizes = new int[orderedPlayers.Count];
@@ -874,6 +881,7 @@ internal sealed class G5RuntimeHost
 
     private int ComputeChipsAddedByAction(ActionLogEntry entry)
     {
+        var normalizedAction = ReplayHelpers.NormalizeActionName(entry.Action);
         var candidates = new List<(string Source, int Value)>();
 
         if (entry.EffectivePlayerBetBefore is int playerBetBefore && entry.EffectivePlayerBetAfter is int playerBetAfter)
@@ -902,9 +910,14 @@ internal sealed class G5RuntimeHost
             candidates.Add(("player_stack_delta", delta));
         }
 
-        if (entry.EffectiveRequestedAmount is int requestedAmount && requestedAmount > 0)
+        if (entry.EffectiveCommittedChips is int committedChips && committedChips > 0)
         {
-            candidates.Add(("requested_amount", requestedAmount));
+            candidates.Add(("committed_chips", committedChips));
+        }
+
+        if (TryGetRequestedAmountAsChipsAdded(entry, normalizedAction, out var requestedAmountAsChipsAdded))
+        {
+            candidates.Add(("requested_amount", requestedAmountAsChipsAdded));
         }
 
         if (candidates.Count == 0)
@@ -926,6 +939,37 @@ internal sealed class G5RuntimeHost
         }
 
         return distinctValues[0];
+    }
+
+    private static bool TryGetRequestedAmountAsChipsAdded(ActionLogEntry entry, string normalizedAction, out int chipsAdded)
+    {
+        chipsAdded = 0;
+        if (entry.EffectiveRequestedAmount is not int requestedAmount || requestedAmount <= 0)
+        {
+            return false;
+        }
+
+        switch (normalizedAction)
+        {
+            case "bet":
+                chipsAdded = requestedAmount;
+                return true;
+            case "raise":
+                // Hand history stores raise as the extra amount above the call, not total chips added.
+                if (entry.EffectiveToCallBefore is int toCallBefore && toCallBefore >= 0)
+                {
+                    chipsAdded = requestedAmount + toCallBefore;
+                    return true;
+                }
+
+                chipsAdded = requestedAmount;
+                return true;
+            case "all-in":
+                return false;
+            default:
+                chipsAdded = requestedAmount;
+                return true;
+        }
     }
 
     private ReplayStateSnapshot CaptureSnapshot(G5ReflectionBindings bindings, object botGameState, string label)

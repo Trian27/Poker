@@ -134,13 +134,20 @@ Possible `warnings` values:
 - `no_action_returned`
 - `unsupported_hidden_forced_contribution`
 
+## Action amount semantics
+
+- `committed_chips` is the authoritative "chips added by this action" value
+- for `bet`, `requested_amount` is the bet size
+- for `raise`, `requested_amount` is the raise increment above the call amount, not the total chips added
+- for `all-in`, `requested_amount` is usually omitted and replay derives chips from `committed_chips` / stack deltas
+
 ## Important limitations
 
 - profile selection is based on validated seated/dealt player count, not active players:
   - `2` players => `heads_up`
   - `3..6` players => `six_max`
 - `multiway_postflop_fallback` means G5 used its simplified large-multiway postflop path because `numActivePlayers() >= 5` at decision time
-- amount semantics are still experimental pending replay-validation tests
+- heads-up postflop hands that use dealer-first action ordering are returned as `unsupported_heads_up_postflop_ordering` because the current G5 replay expects the big blind to act first and the adapter does not silently remap that spot
 - the service is an infrastructure/runtime integration step, not a strategy-quality guarantee
 
 ## Learning Kill Switch
