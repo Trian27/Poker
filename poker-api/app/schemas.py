@@ -35,6 +35,14 @@ class TableTournamentState(str, Enum):
     CANCELED = "canceled"
 
 
+class BetaInviteStatus(str, Enum):
+    """Lifecycle status for a beta invite."""
+    PENDING = "pending"
+    REDEEMED = "redeemed"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
 # ============================================================================
 # User Schemas
 # ============================================================================
@@ -79,6 +87,35 @@ class AdminInviteRequest(BaseModel):
     """Invite a user to be a league/community admin."""
     username: Optional[str] = None
     email: Optional[EmailStr] = None
+
+
+class BetaInviteCreateRequest(BaseModel):
+    """Admin request to create a beta invite."""
+    email: EmailStr
+    notes: Optional[str] = Field(default=None, max_length=1000)
+    model_config = ConfigDict(extra="forbid")
+
+
+class BetaInviteAdminResponse(BaseModel):
+    """Admin view of a beta invite."""
+    id: int
+    email: EmailStr
+    notes: Optional[str] = None
+    created_by_user_id: int
+    redeemed_by_user_id: Optional[int] = None
+    created_at: datetime
+    expires_at: datetime
+    sent_at: Optional[datetime] = None
+    used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    status: BetaInviteStatus
+    invite_url: Optional[str] = None
+    delivery_status: str
+
+
+class BetaInviteListResponse(BaseModel):
+    """Admin list response for beta invites."""
+    invites: list[BetaInviteAdminResponse]
 
 
 class AdminUserResponse(BaseModel):

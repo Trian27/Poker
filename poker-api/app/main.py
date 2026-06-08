@@ -5,11 +5,13 @@ from fastapi import FastAPI, Depends, HTTPException, status, Body, Query, Reques
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import or_, and_, func, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from decimal import Decimal
 import math
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 import re
 import secrets
 import string
@@ -17,7 +19,7 @@ import string
 from .config import settings
 from .database import get_db, SessionLocal
 from .models import (
-    User, League, Community, Wallet, Table, TableStatus, GameType, HandHistory, TableSeat, TableQueue,
+    User, BetaInvite, League, Community, Wallet, Table, TableStatus, GameType, HandHistory, TableSeat, TableQueue,
     LeagueAdmin, CommunityAdmin, LeagueMember, LeagueJoinRequest, JoinRequest, InboxMessage,
     Skin, UserSkin, SkinSubmission, SkinSubmissionWorkflowState, DirectMessage, CoinPurchaseIntent,
     CreatorPayoutRequest, CreatorPayoutStatus,
@@ -28,7 +30,8 @@ from .models import (
 from .schema_migrations import ensure_schema
 from .schemas import (
     UserCreate, UserResponse, Token,
-    AdminInviteRequest, AdminUserResponse, BanStatusRequest, CurrencyUpdateRequest,
+    AdminInviteRequest, AdminUserResponse, BanStatusRequest, BetaInviteAdminResponse, BetaInviteCreateRequest,
+    BetaInviteListResponse, BetaInviteStatus, CurrencyUpdateRequest,
     LeagueCreate, LeagueResponse,
     CommunityBase, CommunityCreate, CommunityResponse,
     WalletCreate, WalletResponse, CommunityWalletSummaryResponse, CommunityWalletAdjustRequest, CommunityWalletAdjustResponse,
@@ -58,12 +61,12 @@ from .auth import (
 )
 import httpx
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import random
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 logger = logging.getLogger(__name__)
 UI_CLIENT_HEADER_NAME = "X-Dormstacks-UI"
@@ -541,6 +544,64 @@ def _fixture_cleanup_counts() -> dict[str, int]:
 def _generate_test_password() -> str:
     alphabet = string.ascii_letters + string.digits
     return "T-" + "".join(secrets.choice(alphabet) for _ in range(20))
+
+
+def _generate_beta_invite_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _hash_beta_invite_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _beta_invite_status(invite: BetaInvite, now: datetime | None = None) -> BetaInviteStatus:
+    reference_time = now or _utc_now()
+    if invite.revoked_at is not None:
+        return BetaInviteStatus.REVOKED
+    if invite.used_at is not None or invite.redeemed_by_user_id is not None:
+        return BetaInviteStatus.REDEEMED
+    if invite.expires_at <= reference_time:
+        return BetaInviteStatus.EXPIRED
+    return BetaInviteStatus.PENDING
+
+
+def _build_beta_invite_url(token: str) -> str:
+    base_url = settings.BETA_INVITE_BASE_URL.rstrip("/")
+    return f"{base_url}/invite?{urlencode({'token': token})}"
+
+
+def _beta_invite_delivery_status(invite: BetaInvite) -> str:
+    return "sent" if invite.sent_at is not None else "pending"
+
+
+def _serialize_beta_invite_admin_response(
+    invite: BetaInvite,
+    *,
+    invite_url: str | None = None,
+) -> BetaInviteAdminResponse:
+    return BetaInviteAdminResponse(
+        id=invite.id,
+        email=invite.email,
+        notes=invite.notes,
+        created_by_user_id=invite.created_by_user_id,
+        redeemed_by_user_id=invite.redeemed_by_user_id,
+        created_at=invite.created_at,
+        expires_at=invite.expires_at,
+        sent_at=invite.sent_at,
+        used_at=invite.used_at,
+        revoked_at=invite.revoked_at,
+        status=_beta_invite_status(invite),
+        invite_url=invite_url,
+        delivery_status=_beta_invite_delivery_status(invite),
+    )
+
+
+def _send_beta_invite_email(email: str, invite_url: str) -> bool:
+    return True
 
 
 def _validate_fixture_stack_request(payload: TestFixtureGameplayStackCreate) -> str:
@@ -6428,6 +6489,100 @@ def list_creator_payout_requests_as_admin(
         query = query.filter(CreatorPayoutRequest.status == status_filter)
     requests = query.order_by(CreatorPayoutRequest.requested_at.desc()).all()
     return [_creator_payout_to_response(request) for request in requests]
+
+
+@app.post("/api/admin/beta-invites", response_model=BetaInviteAdminResponse, status_code=status.HTTP_201_CREATED)
+def create_beta_invite(
+    payload: BetaInviteCreateRequest,
+    _: None = Depends(_require_ui_create_request),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    admin_user = _require_global_admin(db, current_user)
+    normalized_email = payload.email.strip().lower()
+    now = _utc_now()
+
+    existing_user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A user with this email already exists",
+        )
+
+    existing_pending_invite = (
+        db.query(BetaInvite)
+        .filter(
+            func.lower(BetaInvite.email) == normalized_email,
+            BetaInvite.redeemed_by_user_id.is_(None),
+            BetaInvite.used_at.is_(None),
+            BetaInvite.revoked_at.is_(None),
+            BetaInvite.expires_at > now,
+        )
+        .first()
+    )
+    if existing_pending_invite:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pending beta invite already exists for this email",
+        )
+
+    expired_open_invites = (
+        db.query(BetaInvite)
+        .filter(
+            func.lower(BetaInvite.email) == normalized_email,
+            BetaInvite.redeemed_by_user_id.is_(None),
+            BetaInvite.used_at.is_(None),
+            BetaInvite.revoked_at.is_(None),
+            BetaInvite.expires_at <= now,
+        )
+        .all()
+    )
+    for invite in expired_open_invites:
+        invite.revoked_at = now
+
+    invite_token = _generate_beta_invite_token()
+    invite_url = _build_beta_invite_url(invite_token)
+    invite = BetaInvite(
+        email=normalized_email,
+        token_hash=_hash_beta_invite_token(invite_token),
+        notes=payload.notes,
+        created_by_user_id=admin_user.id,
+        expires_at=now + timedelta(hours=settings.BETA_INVITE_TTL_HOURS),
+    )
+    db.add(invite)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        if "uq_beta_invites_pending_email" in str(exc.orig):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Pending beta invite already exists for this email",
+            ) from exc
+        raise
+
+    if _send_beta_invite_email(normalized_email, invite_url):
+        invite.sent_at = now
+
+    db.commit()
+    db.refresh(invite)
+    return _serialize_beta_invite_admin_response(invite, invite_url=invite_url)
+
+
+@app.get("/api/admin/beta-invites", response_model=BetaInviteListResponse)
+def list_beta_invites(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    _require_global_admin(db, current_user)
+    invites = (
+        db.query(BetaInvite)
+        .order_by(BetaInvite.created_at.desc(), BetaInvite.id.desc())
+        .all()
+    )
+    return BetaInviteListResponse(
+        invites=[_serialize_beta_invite_admin_response(invite) for invite in invites]
+    )
 
 
 @app.post("/api/admin/creator-payout-requests/{request_id}/process", response_model=CreatorPayoutRequestResponse)

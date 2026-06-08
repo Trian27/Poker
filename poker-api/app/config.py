@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     EMAIL_FROM: str = "noreply@poker-platform.com"
     EMAIL_VERIFICATION_EXPIRE_MINUTES: int = 15
     FEEDBACK_EXPORT_DIR: str = "feedback_reports"
+    INVITE_ONLY_REGISTRATION: bool = False
+    BETA_INVITE_TTL_HOURS: int = 168
+    BETA_INVITE_BASE_URL: str = "https://beta.example.com"
 
     # Internal advisor integration
     G5_ADVISOR_SERVICE_URL: str = "http://g5-advisor-service:8002"
