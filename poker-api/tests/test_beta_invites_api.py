@@ -113,3 +113,101 @@ def test_non_admin_cannot_create_beta_invites(client, db_session, auth_state, ap
 
     assert response.status_code == 403
     assert response.json() == {"detail": "Admin access required"}
+
+
+def test_admin_can_resend_and_rotate_beta_invite_token(client, db_session, auth_state, app_modules, monkeypatch):
+    auth_module = app_modules["auth"]
+    main_module = app_modules["main"]
+    models_module = app_modules["models"]
+    admin_user = create_user(db_session, auth_module, models_module, "adminresend", is_admin=True)
+    set_current_user(auth_state, admin_user)
+    token_values = iter(["first-token", "second-token"])
+    monkeypatch.setattr(main_module.settings, "BETA_INVITE_BASE_URL", "https://beta.example.com")
+    monkeypatch.setattr(main_module, "_generate_beta_invite_token", lambda: next(token_values))
+    monkeypatch.setattr(main_module, "_send_beta_invite_email", lambda *args, **kwargs: True)
+
+    created = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "resend@example.com"},
+    )
+
+    assert created.status_code == 201
+    invite_id = created.json()["id"]
+    original_hash = db_session.query(models_module.BetaInvite).filter_by(id=invite_id).one().token_hash
+
+    resent = client.post(
+        f"/api/admin/beta-invites/{invite_id}/resend",
+        headers=UI_HEADERS,
+    )
+
+    assert resent.status_code == 200
+    body = resent.json()
+    assert body["status"] == "pending"
+    assert body["delivery_status"] == "sent"
+    assert body["invite_url"].endswith("/invite/second-token")
+
+    refreshed_invite = db_session.query(models_module.BetaInvite).filter_by(id=invite_id).one()
+    assert refreshed_invite.token_hash != original_hash
+    assert refreshed_invite.sent_at is not None
+
+
+def test_admin_gets_manual_link_when_invite_email_send_fails(client, db_session, auth_state, app_modules, monkeypatch):
+    auth_module = app_modules["auth"]
+    main_module = app_modules["main"]
+    models_module = app_modules["models"]
+    admin_user = create_user(db_session, auth_module, models_module, "adminmanual", is_admin=True)
+    set_current_user(auth_state, admin_user)
+    monkeypatch.setattr(main_module.settings, "BETA_INVITE_BASE_URL", "https://beta.example.com")
+    monkeypatch.setattr(main_module, "_generate_beta_invite_token", lambda: "manual-token")
+    monkeypatch.setattr(main_module, "_send_beta_invite_email", lambda *args, **kwargs: False)
+
+    created = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "manual@example.com"},
+    )
+
+    assert created.status_code == 201
+    invite_id = created.json()["id"]
+
+    resent = client.post(
+        f"/api/admin/beta-invites/{invite_id}/resend",
+        headers=UI_HEADERS,
+    )
+
+    assert resent.status_code == 200
+    body = resent.json()
+    assert body["delivery_status"] == "manual_required"
+    assert body["invite_url"].endswith("/invite/manual-token")
+    assert body["sent_at"] is None
+
+
+def test_admin_can_revoke_pending_beta_invite(client, db_session, auth_state, app_modules, monkeypatch):
+    auth_module = app_modules["auth"]
+    main_module = app_modules["main"]
+    models_module = app_modules["models"]
+    admin_user = create_user(db_session, auth_module, models_module, "adminrevoke", is_admin=True)
+    set_current_user(auth_state, admin_user)
+    monkeypatch.setattr(main_module.settings, "BETA_INVITE_BASE_URL", "https://beta.example.com")
+    monkeypatch.setattr(main_module, "_generate_beta_invite_token", lambda: "revoke-token")
+    monkeypatch.setattr(main_module, "_send_beta_invite_email", lambda *args, **kwargs: True)
+
+    created = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "revoke@example.com"},
+    )
+
+    assert created.status_code == 201
+    invite_id = created.json()["id"]
+
+    revoked = client.post(
+        f"/api/admin/beta-invites/{invite_id}/revoke",
+        headers=UI_HEADERS,
+    )
+
+    assert revoked.status_code == 200
+    body = revoked.json()
+    assert body["status"] == "revoked"
+    assert body["revoked_at"] is not None

@@ -602,8 +602,55 @@ def _serialize_beta_invite_admin_response(
     )
 
 
+def _send_smtp_plaintext_email(*, to_email: str, subject: str, body: str, log_label: str) -> bool:
+    if not settings.is_production:
+        logger.info("[DEV MODE] %s email to %s: %s", log_label, to_email, body)
+        return True
+
+    if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
+        logger.error("SMTP credentials not configured for %s email", log_label)
+        return False
+
+    import smtplib
+    from email.mime.text import MIMEText
+
+    message = MIMEText(body, "plain")
+    message["From"] = settings.EMAIL_FROM
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    try:
+        smtp = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+        smtp.starttls()
+        smtp.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        smtp.sendmail(settings.EMAIL_FROM, to_email, message.as_string())
+        smtp.quit()
+        return True
+    except Exception as exc:
+        logger.error("Failed to send %s email: %s", log_label, exc)
+        return False
+
+
 def _send_beta_invite_email(email: str, invite_url: str) -> bool:
-    return True
+    body = (
+        "Hello,\n\n"
+        "You have been invited to the DormStacks beta.\n\n"
+        f"Use this one-time link to create your account:\n{invite_url}\n\n"
+        f"This link expires in {settings.BETA_INVITE_TTL_HOURS} hours.\n"
+    )
+    return _send_smtp_plaintext_email(
+        to_email=email,
+        subject="DormStacks Beta Invite",
+        body=body,
+        log_label="beta invite",
+    )
+
+
+def _get_beta_invite_or_404(db: Session, invite_id: int) -> BetaInvite:
+    invite = db.query(BetaInvite).filter(BetaInvite.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Beta invite not found")
+    return invite
 
 
 def _validate_fixture_stack_request(payload: TestFixtureGameplayStackCreate) -> str:
@@ -6569,6 +6616,52 @@ def list_beta_invites(
     return BetaInviteListResponse(
         items=[_serialize_beta_invite_admin_response(invite) for invite in invites]
     )
+
+
+@app.post("/api/admin/beta-invites/{invite_id}/resend", response_model=BetaInviteAdminResponse)
+def resend_beta_invite(
+    invite_id: int,
+    _: None = Depends(_require_ui_create_request),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_global_admin(db, current_user)
+    invite = _get_beta_invite_or_404(db, invite_id)
+    if invite.used_at is not None or invite.redeemed_by_user_id is not None:
+        raise HTTPException(status_code=409, detail="Cannot resend a redeemed beta invite")
+    if invite.revoked_at is not None:
+        raise HTTPException(status_code=409, detail="Cannot resend a revoked beta invite")
+
+    now = _utc_now()
+    raw_token = _generate_beta_invite_token()
+    invite.token_hash = _hash_beta_invite_token(raw_token)
+    invite.expires_at = now + timedelta(hours=settings.BETA_INVITE_TTL_HOURS)
+    invite_url = _build_beta_invite_url(raw_token)
+    if _send_beta_invite_email(invite.email, invite_url):
+        invite.sent_at = now
+    else:
+        invite.sent_at = None
+    db.commit()
+    db.refresh(invite)
+    return _serialize_beta_invite_admin_response(invite, invite_url=invite_url)
+
+
+@app.post("/api/admin/beta-invites/{invite_id}/revoke", response_model=BetaInviteAdminResponse)
+def revoke_beta_invite(
+    invite_id: int,
+    _: None = Depends(_require_ui_create_request),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_global_admin(db, current_user)
+    invite = _get_beta_invite_or_404(db, invite_id)
+    if invite.used_at is not None or invite.redeemed_by_user_id is not None:
+        raise HTTPException(status_code=409, detail="Cannot revoke a redeemed beta invite")
+    if invite.revoked_at is None:
+        invite.revoked_at = _utc_now()
+        db.commit()
+        db.refresh(invite)
+    return _serialize_beta_invite_admin_response(invite)
 
 
 @app.post("/api/admin/creator-payout-requests/{request_id}/process", response_model=CreatorPayoutRequestResponse)
