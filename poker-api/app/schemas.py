@@ -118,6 +118,39 @@ class BetaInviteListResponse(BaseModel):
     items: list[BetaInviteAdminResponse]
 
 
+class BetaInviteLookupResponse(BaseModel):
+    """Public lookup response for a valid beta invite."""
+    email: EmailStr
+    expires_at: datetime
+
+
+class BetaInviteAcceptRequest(BaseModel):
+    """Public request to accept a beta invite."""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=100)
+    model_config = ConfigDict(extra="forbid")
+
+
+class BetaInviteAcceptedUser(BaseModel):
+    """Public user payload returned after invite redemption."""
+    id: int
+    username: str
+    email: EmailStr
+    created_at: datetime
+    is_admin: bool = False
+    is_banned: bool = False
+    is_test_user: bool = False
+
+
+class BetaInviteAcceptResponse(BaseModel):
+    """Successful beta invite acceptance response."""
+    success: bool
+    message: str
+    access_token: str
+    token_type: str = "bearer"
+    user: BetaInviteAcceptedUser
+
+
 class AdminUserResponse(BaseModel):
     """Response schema for admin users."""
     id: int

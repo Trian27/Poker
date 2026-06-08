@@ -53,7 +53,8 @@ from .schemas import (
     FeedbackCreate, FeedbackResponse, FeedbackComplaintBucket,
     ProfileUpdateRequest, ProfileUpdateInitResponse, ProfileUpdateVerifyRequest, ProfileUpdateResponse,
     AccountRecoveryRequest, AccountRecoveryVerifyRequest, AccountRecoveryVerifyResponse,
-    TestFixtureGameplayStackCreate, TestFixtureGameplayStackResponse, TestFixtureCleanupResponse
+    TestFixtureGameplayStackCreate, TestFixtureGameplayStackResponse, TestFixtureCleanupResponse,
+    BetaInviteLookupResponse, BetaInviteAcceptRequest, BetaInviteAcceptedUser, BetaInviteAcceptResponse,
 )
 from .auth import (
     get_password_hash, verify_password,
@@ -650,6 +651,19 @@ def _get_beta_invite_or_404(db: Session, invite_id: int) -> BetaInvite:
     invite = db.query(BetaInvite).filter(BetaInvite.id == invite_id).first()
     if not invite:
         raise HTTPException(status_code=404, detail="Beta invite not found")
+    return invite
+
+
+def _get_pending_beta_invite_by_token_or_error(db: Session, raw_token: str) -> BetaInvite:
+    invite = db.query(BetaInvite).filter(BetaInvite.token_hash == _hash_beta_invite_token(raw_token)).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Beta invite not found")
+    if invite.revoked_at is not None:
+        raise HTTPException(status_code=410, detail="Beta invite has been revoked")
+    if invite.used_at is not None or invite.redeemed_by_user_id is not None:
+        raise HTTPException(status_code=410, detail="Beta invite has already been used")
+    if invite.expires_at <= _utc_now():
+        raise HTTPException(status_code=410, detail="Beta invite has expired")
     return invite
 
 
@@ -1798,6 +1812,9 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     In production mode, sends a verification email with 6-digit code.
     In dev mode, creates the user immediately.
     """
+    if settings.INVITE_ONLY_REGISTRATION:
+        raise HTTPException(status_code=403, detail="Registration is invite-only for this beta")
+
     # Check if username already exists
     existing_user = db.query(User).filter(User.username == user_data.username).first()
     if existing_user:
@@ -1856,6 +1873,60 @@ def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     db.refresh(new_user)
     
     return UserResponse.model_validate(new_user)
+
+
+@app.get("/auth/invite/{token}", response_model=BetaInviteLookupResponse)
+def get_beta_invite(token: str, db: Session = Depends(get_db)):
+    invite = _get_pending_beta_invite_by_token_or_error(db, token)
+    return BetaInviteLookupResponse(email=invite.email, expires_at=invite.expires_at)
+
+
+@app.post("/auth/invite/{token}/accept", response_model=BetaInviteAcceptResponse, status_code=status.HTTP_201_CREATED)
+def accept_beta_invite(
+    token: str,
+    payload: BetaInviteAcceptRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_ui_create_request),
+):
+    invite = _get_pending_beta_invite_by_token_or_error(db, token)
+
+    if db.query(User).filter(User.username == payload.username).first():
+        raise HTTPException(status_code=400, detail="Username already registered")
+    if db.query(User).filter(func.lower(User.email) == invite.email.lower()).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    new_user = User(
+        username=payload.username,
+        email=invite.email,
+        hashed_password=get_password_hash(payload.password),
+        email_verified=True,
+        is_admin=False,
+        is_active=True,
+    )
+    db.add(new_user)
+    db.flush()
+
+    invite.used_at = _utc_now()
+    invite.redeemed_by_user_id = new_user.id
+
+    db.commit()
+    db.refresh(new_user)
+    db.refresh(invite)
+
+    return BetaInviteAcceptResponse(
+        success=True,
+        message="Account created from beta invite",
+        access_token=_issue_access_token_for_user(new_user),
+        user=BetaInviteAcceptedUser(
+            id=new_user.id,
+            username=new_user.username,
+            email=new_user.email,
+            created_at=new_user.created_at,
+            is_admin=bool(new_user.is_admin),
+            is_banned=bool(new_user.is_banned),
+            is_test_user=bool(new_user.is_test_user),
+        ),
+    )
 
 
 @app.post("/auth/login")
