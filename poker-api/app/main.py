@@ -66,7 +66,7 @@ from pathlib import Path
 import json
 import random
 import uuid
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 UI_CLIENT_HEADER_NAME = "X-Dormstacks-UI"
@@ -570,12 +570,14 @@ def _beta_invite_status(invite: BetaInvite, now: datetime | None = None) -> Beta
 
 
 def _build_beta_invite_url(token: str) -> str:
-    base_url = settings.BETA_INVITE_BASE_URL.rstrip("/")
-    return f"{base_url}/invite?{urlencode({'token': token})}"
+    base_url = (settings.BETA_INVITE_BASE_URL or "").strip().rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=500, detail="BETA_INVITE_BASE_URL is not configured")
+    return f"{base_url}/invite/{token}"
 
 
 def _beta_invite_delivery_status(invite: BetaInvite) -> str:
-    return "sent" if invite.sent_at is not None else "pending"
+    return "sent" if invite.sent_at is not None else "manual_required"
 
 
 def _serialize_beta_invite_admin_response(
@@ -6506,17 +6508,15 @@ def create_beta_invite(
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="A user with this email already exists",
+            detail="Email already belongs to an existing user",
         )
 
     existing_pending_invite = (
         db.query(BetaInvite)
         .filter(
             func.lower(BetaInvite.email) == normalized_email,
-            BetaInvite.redeemed_by_user_id.is_(None),
             BetaInvite.used_at.is_(None),
             BetaInvite.revoked_at.is_(None),
-            BetaInvite.expires_at > now,
         )
         .first()
     )
@@ -6525,20 +6525,6 @@ def create_beta_invite(
             status_code=status.HTTP_409_CONFLICT,
             detail="Pending beta invite already exists for this email",
         )
-
-    expired_open_invites = (
-        db.query(BetaInvite)
-        .filter(
-            func.lower(BetaInvite.email) == normalized_email,
-            BetaInvite.redeemed_by_user_id.is_(None),
-            BetaInvite.used_at.is_(None),
-            BetaInvite.revoked_at.is_(None),
-            BetaInvite.expires_at <= now,
-        )
-        .all()
-    )
-    for invite in expired_open_invites:
-        invite.revoked_at = now
 
     invite_token = _generate_beta_invite_token()
     invite_url = _build_beta_invite_url(invite_token)
@@ -6581,7 +6567,7 @@ def list_beta_invites(
         .all()
     )
     return BetaInviteListResponse(
-        invites=[_serialize_beta_invite_admin_response(invite) for invite in invites]
+        items=[_serialize_beta_invite_admin_response(invite) for invite in invites]
     )
 
 

@@ -37,11 +37,15 @@ def set_current_user(auth_state: dict[str, Any], user: Any) -> None:
     auth_state["username"] = user.username
 
 
-def test_global_admin_can_create_beta_invite_and_list_it(client, db_session, auth_state, app_modules):
+def test_global_admin_can_create_beta_invite_and_list_it(client, db_session, auth_state, app_modules, monkeypatch):
     auth_module = app_modules["auth"]
+    main_module = app_modules["main"]
     models_module = app_modules["models"]
     admin_user = create_user(db_session, auth_module, models_module, "globaladmin", is_admin=True)
     set_current_user(auth_state, admin_user)
+    monkeypatch.setattr(main_module.settings, "BETA_INVITE_BASE_URL", "https://beta.example.com")
+    monkeypatch.setattr(main_module, "_generate_beta_invite_token", lambda: "fixed-token")
+    monkeypatch.setattr(main_module, "_send_beta_invite_email", lambda *args, **kwargs: True)
 
     create_response = client.post(
         "/api/admin/beta-invites",
@@ -60,8 +64,7 @@ def test_global_admin_can_create_beta_invite_and_list_it(client, db_session, aut
     assert create_body["redeemed_by_user_id"] is None
     assert create_body["status"] == "pending"
     assert create_body["delivery_status"] == "sent"
-    assert create_body["invite_url"].startswith("https://beta.example.com")
-    assert create_body["invite_url"].count("token=") == 1
+    assert create_body["invite_url"].endswith("/invite/fixed-token")
     assert create_body["used_at"] is None
     assert create_body["revoked_at"] is None
     assert create_body["sent_at"] is not None
@@ -71,8 +74,8 @@ def test_global_admin_can_create_beta_invite_and_list_it(client, db_session, aut
 
     assert list_response.status_code == 200
     list_body = list_response.json()
-    assert len(list_body["invites"]) == 1
-    listed_invite = list_body["invites"][0]
+    assert len(list_body["items"]) == 1
+    listed_invite = list_body["items"][0]
     assert listed_invite["id"] == create_body["id"]
     assert listed_invite["email"] == create_body["email"]
     assert listed_invite["notes"] == create_body["notes"]

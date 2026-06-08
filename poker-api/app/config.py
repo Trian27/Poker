@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     FEEDBACK_EXPORT_DIR: str = "feedback_reports"
     INVITE_ONLY_REGISTRATION: bool = False
     BETA_INVITE_TTL_HOURS: int = 168
-    BETA_INVITE_BASE_URL: str = "https://beta.example.com"
+    BETA_INVITE_BASE_URL: Optional[str] = None
 
     # Internal advisor integration
     G5_ADVISOR_SERVICE_URL: str = "http://g5-advisor-service:8002"

@@ -92,7 +92,7 @@ class AdminInviteRequest(BaseModel):
 class BetaInviteCreateRequest(BaseModel):
     """Admin request to create a beta invite."""
     email: EmailStr
-    notes: Optional[str] = Field(default=None, max_length=1000)
+    notes: Optional[str] = Field(default=None, max_length=500)
     model_config = ConfigDict(extra="forbid")
 
 
@@ -101,7 +101,7 @@ class BetaInviteAdminResponse(BaseModel):
     id: int
     email: EmailStr
     notes: Optional[str] = None
-    created_by_user_id: int
+    created_by_user_id: Optional[int] = None
     redeemed_by_user_id: Optional[int] = None
     created_at: datetime
     expires_at: datetime
@@ -110,12 +110,12 @@ class BetaInviteAdminResponse(BaseModel):
     revoked_at: Optional[datetime] = None
     status: BetaInviteStatus
     invite_url: Optional[str] = None
-    delivery_status: str
+    delivery_status: Optional[Literal["sent", "manual_required"]] = None
 
 
 class BetaInviteListResponse(BaseModel):
     """Admin list response for beta invites."""
-    invites: list[BetaInviteAdminResponse]
+    items: list[BetaInviteAdminResponse]
 
 
 class AdminUserResponse(BaseModel):

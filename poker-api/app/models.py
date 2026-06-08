@@ -10,7 +10,6 @@ from sqlalchemy import (
     Numeric,
     Boolean,
     Enum,
-    Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -62,11 +61,11 @@ class BetaInvite(Base):
     __tablename__ = "beta_invites"
 
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), nullable=False, index=True)
-    token_hash = Column(String(64), nullable=False)
-    notes = Column(Text, nullable=True)
-    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    redeemed_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    email = Column(String(100), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    notes = Column(String(500), nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    redeemed_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     expires_at = Column(DateTime(timezone=True), nullable=False)
     sent_at = Column(DateTime(timezone=True), nullable=True)
