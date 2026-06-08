@@ -6636,13 +6636,12 @@ def create_beta_invite(
             BetaInvite.used_at.is_(None),
             BetaInvite.revoked_at.is_(None),
         )
-        .first()
+        .all()
     )
     if existing_pending_invite:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Pending beta invite already exists for this email",
-        )
+        logger.info("Revoking %s existing pending beta invite(s) for %s", len(existing_pending_invite), normalized_email)
+        for pending_invite in existing_pending_invite:
+            pending_invite.revoked_at = now
 
     invite_token = _generate_beta_invite_token()
     invite_url = _build_beta_invite_url(invite_token)
@@ -6670,11 +6669,13 @@ def create_beta_invite(
 
     db.commit()
     db.refresh(invite)
+    logger.info("Created beta invite id=%s email=%s created_by=%s", invite.id, invite.email, admin_user.id)
     return _serialize_beta_invite_admin_response(invite, invite_url=invite_url)
 
 
 @app.get("/api/admin/beta-invites", response_model=BetaInviteListResponse)
 def list_beta_invites(
+    status_filter: BetaInviteStatus | None = None,
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -6685,7 +6686,11 @@ def list_beta_invites(
         .all()
     )
     return BetaInviteListResponse(
-        items=[_serialize_beta_invite_admin_response(invite) for invite in invites]
+        items=[
+            _serialize_beta_invite_admin_response(invite)
+            for invite in invites
+            if status_filter is None or _beta_invite_status(invite) == status_filter
+        ]
     )
 
 

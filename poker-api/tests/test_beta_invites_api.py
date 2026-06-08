@@ -298,3 +298,70 @@ def test_register_is_blocked_when_invite_only_registration_is_enabled(client, ap
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Registration is invite-only for this beta"
+
+
+def test_create_invite_revokes_previous_pending_invite_for_same_email(client, db_session, auth_state, app_modules, monkeypatch):
+    auth_module = app_modules["auth"]
+    main_module = app_modules["main"]
+    models_module = app_modules["models"]
+    admin_user = create_user(db_session, auth_module, models_module, "adminreplace", is_admin=True)
+    set_current_user(auth_state, admin_user)
+    token_values = iter(["first-same", "second-same"])
+    monkeypatch.setattr(main_module.settings, "BETA_INVITE_BASE_URL", "https://beta.example.com")
+    monkeypatch.setattr(main_module, "_generate_beta_invite_token", lambda: next(token_values))
+    monkeypatch.setattr(main_module, "_send_beta_invite_email", lambda *args, **kwargs: True)
+
+    first = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "same@example.com"},
+    )
+    second = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "same@example.com"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+
+    first_row = db_session.query(models_module.BetaInvite).filter_by(id=first.json()["id"]).one()
+    second_row = db_session.query(models_module.BetaInvite).filter_by(id=second.json()["id"]).one()
+
+    assert first_row.revoked_at is not None
+    assert second_row.revoked_at is None
+
+
+def test_list_beta_invites_can_filter_by_status(client, db_session, auth_state, app_modules, monkeypatch):
+    auth_module = app_modules["auth"]
+    main_module = app_modules["main"]
+    models_module = app_modules["models"]
+    admin_user = create_user(db_session, auth_module, models_module, "adminfilter", is_admin=True)
+    set_current_user(auth_state, admin_user)
+    token_values = iter(["expired-a", "pending-b"])
+    monkeypatch.setattr(main_module.settings, "BETA_INVITE_BASE_URL", "https://beta.example.com")
+    monkeypatch.setattr(main_module, "_generate_beta_invite_token", lambda: next(token_values))
+    monkeypatch.setattr(main_module, "_send_beta_invite_email", lambda *args, **kwargs: True)
+
+    first = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "expired@example.com"},
+    )
+    second = client.post(
+        "/api/admin/beta-invites",
+        headers=UI_HEADERS,
+        json={"email": "pending@example.com"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+
+    expired_row = db_session.query(models_module.BetaInvite).filter_by(id=first.json()["id"]).one()
+    expired_row.expires_at = main_module._utc_now() - timedelta(hours=1)
+    db_session.commit()
+
+    response = client.get("/api/admin/beta-invites?status_filter=expired")
+
+    assert response.status_code == 200
+    assert [item["email"] for item in response.json()["items"]] == ["expired@example.com"]

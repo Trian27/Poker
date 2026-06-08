@@ -70,7 +70,7 @@ def test_database_url() -> str:
 @pytest.fixture(scope="session")
 def app_modules(test_database_url: str) -> dict[str, Any]:
     os.environ["DATABASE_URL"] = test_database_url
-    os.environ.setdefault("ENV_MODE", "dev")
+    os.environ["ENV_MODE"] = "dev"
     os.environ.setdefault("GAME_SERVER_URL", "http://game-server:3000")
 
     for module_name in APP_MODULE_IMPORT_ORDER:
