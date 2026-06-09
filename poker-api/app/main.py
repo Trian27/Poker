@@ -72,8 +72,9 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 UI_CLIENT_HEADER_NAME = "X-Dormstacks-UI"
 UI_CLIENT_HEADER_VALUE = "web"
-UI_ALLOWED_ORIGINS = {origin.rstrip("/").lower() for origin in settings.CORS_ORIGINS}
+UI_ALLOWED_ORIGINS = {origin.rstrip("/").lower() for origin in settings.cors_origins}
 LOCAL_UI_ORIGIN_PATTERN = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+G5_HEALTHCHECK_TIMEOUT_SECONDS = 1.0
 
 # Security scheme for JWT Bearer tokens (optional so query params can be used)
 security = HTTPBearer(auto_error=False)
@@ -88,7 +89,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=settings.cors_origins,
     allow_origin_regex=None if settings.is_production else LOCAL_UI_ORIGIN_PATTERN.pattern,
     allow_credentials=True,
     allow_methods=["*"],
@@ -182,11 +183,13 @@ def read_root():
 
 
 @app.get("/health")
-def health_check():
-    """Detailed health check"""
+async def health_check():
+    """Detailed health check."""
+    g5_status = await _get_g5_health_status()
     return {
-        "status": "healthy",
-        "database": "connected"
+        "status": "healthy" if g5_status["ready"] else "degraded",
+        "database": "connected",
+        "g5_advisor": g5_status,
     }
 
 
@@ -209,6 +212,47 @@ TABLE_NOT_FOUND_SOCKET_REASON = "table_not_found"
 class PartitionContext:
     kind: str
     run_tag: str | None = None
+
+
+async def _get_g5_health_status() -> dict[str, object]:
+    client = getattr(app.state, "g5_advisor_client", None)
+    if client is None:
+        return {
+            "status": "degraded",
+            "ready": False,
+            "http_status": None,
+            "startup_stage": None,
+            "error": "G5 advisor client unavailable",
+        }
+
+    try:
+        response = await client.get(
+            "/health",
+            timeout=min(settings.G5_ADVISOR_TIMEOUT_SECONDS, G5_HEALTHCHECK_TIMEOUT_SECONDS),
+        )
+    except httpx.RequestError as exc:
+        return {
+            "status": "degraded",
+            "ready": False,
+            "http_status": None,
+            "startup_stage": None,
+            "error": str(exc) or exc.__class__.__name__,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    ready = response.status_code == status.HTTP_200_OK and bool(payload.get("ready", True))
+    return {
+        "status": "healthy" if ready else "degraded",
+        "ready": ready,
+        "http_status": response.status_code,
+        "startup_stage": payload.get("startup_stage"),
+        "error": payload.get("error"),
+        "service_status": payload.get("status"),
+    }
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),

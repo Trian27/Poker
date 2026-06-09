@@ -416,6 +416,207 @@
   margin: 0;
 }
 
+.beta-invites-panel {
+  margin-bottom: 48px;
+}
+
+.beta-invites-header {
+  padding-bottom: 20px;
+  margin-bottom: 24px;
+}
+
+.beta-invites-summary {
+  margin: 12px 0 0;
+  color: rgba(232, 239, 243, 0.76);
+  font-size: 0.98rem;
+}
+
+.beta-invites-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+
+.beta-invite-create-card,
+.beta-invite-list-card,
+.beta-invite-notice {
+  border: 1px solid rgba(232, 239, 243, 0.18);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(17, 26, 34, 0.98) 0%, rgba(10, 16, 22, 0.98) 100%);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.32);
+  padding: 22px;
+}
+
+.beta-invite-create-card h3,
+.beta-invite-list-card h3 {
+  margin: 0 0 18px;
+  color: #f5f7fa;
+}
+
+.beta-invite-side-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.beta-invite-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.beta-invite-notice {
+  color: #f0f5f8;
+}
+
+.beta-invite-notice p {
+  margin: 0;
+}
+
+.beta-invite-manual-link {
+  margin-top: 16px;
+}
+
+.beta-invite-manual-link label {
+  display: block;
+  margin-bottom: 8px;
+  color: #d9e4eb;
+  font-weight: 600;
+}
+
+.beta-invite-manual-link-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.beta-invite-manual-link-controls input {
+  flex: 1;
+}
+
+.beta-invite-copy-feedback {
+  margin-top: 10px;
+  color: #d8f3dc;
+  font-size: 0.9rem;
+}
+
+.beta-invite-error {
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: rgba(127, 29, 29, 0.3);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  color: #fecaca;
+}
+
+.beta-invite-list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.beta-invite-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.beta-invite-row {
+  border: 1px solid rgba(232, 239, 243, 0.16);
+  border-radius: 14px;
+  padding: 16px;
+  background: rgba(7, 12, 18, 0.82);
+}
+
+.beta-invite-row-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.beta-invite-email {
+  color: #f4f7fb;
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.beta-invite-notes {
+  margin: 8px 0 0;
+  color: rgba(232, 239, 243, 0.72);
+  font-size: 0.92rem;
+}
+
+.beta-invite-status {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.beta-invite-status-pending {
+  background: rgba(250, 204, 21, 0.18);
+  color: #fde68a;
+}
+
+.beta-invite-status-expired {
+  background: rgba(251, 146, 60, 0.18);
+  color: #fdba74;
+}
+
+.beta-invite-status-redeemed {
+  background: rgba(34, 197, 94, 0.18);
+  color: #86efac;
+}
+
+.beta-invite-status-revoked {
+  background: rgba(248, 113, 113, 0.18);
+  color: #fca5a5;
+}
+
+.beta-invite-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px 14px;
+  margin: 0 0 14px;
+}
+
+.beta-invite-meta div {
+  min-width: 0;
+}
+
+.beta-invite-meta dt {
+  color: rgba(232, 239, 243, 0.58);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+}
+
+.beta-invite-meta dd {
+  margin: 0;
+  color: #f0f5f8;
+  font-size: 0.92rem;
+}
+
+.beta-invite-delivery {
+  color: rgba(232, 239, 243, 0.74);
+  font-size: 0.9rem;
+}
+
+.beta-invite-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
 /* Inbox button */
 .inbox-btn {
   position: relative;
@@ -1037,6 +1238,24 @@
     margin-bottom: 18px;
   }
 
+  .beta-invites-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .beta-invite-manual-link-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .beta-invite-row-header {
+    flex-direction: column;
+  }
+
+  .beta-invite-row-actions {
+    justify-content: stretch;
+    flex-direction: column;
+  }
+
   .platform-tools {
     padding: 12px 16px 0;
     display: grid;
@@ -1366,6 +1585,19 @@
 
 .dashboard-container .league-settings-invite-actions {
   margin-top: 0.9rem;
+}
+
+.dashboard-container .beta-invite-create-card,
+.dashboard-container .beta-invite-list-card,
+.dashboard-container .beta-invite-notice,
+.dashboard-container .beta-invite-row {
+  color: #e8eff3;
+}
+
+.dashboard-container .beta-invite-manual-link-controls input {
+  background: #111a22;
+  border-color: #2f4350;
+  color: #e8eff3;
 }
 
 .dashboard-container .settings-footer-actions {

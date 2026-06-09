@@ -8,6 +8,7 @@ import { communitiesApi, walletsApi, leaguesApi, inboxApi, tablesApi } from '../
 import type { Community, Wallet, League, InboxMessage, AdminUser, ActiveSeatStatus } from '../types';
 import UserMenu from '../components/UserMenu';
 import CommunitySettingsModal from '../components/CommunitySettingsModal';
+import BetaInviteAdminPanel from './BetaInviteAdminPanel';
 import './Dashboard.css';
 import { getApiErrorMessage } from "../utils/error";
 import {
@@ -642,6 +643,8 @@ export const DashboardPage: React.FC = () => {
       {error && <div className="error-message">{error}</div>}
 
       <main className="dashboard-main">
+        {user?.is_admin && <BetaInviteAdminPanel />}
+
         <section className="leagues-section">
           <div className="section-header">
             <h2>Leagues</h2>

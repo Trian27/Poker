@@ -1,0 +1,27 @@
+{
+	email {$LETSENCRYPT_EMAIL:ops@example.com}
+}
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy auth-api:8000
+	}
+
+	handle /auth/* {
+		reverse_proxy auth-api:8000
+	}
+
+	handle /socket.io/* {
+		reverse_proxy game-server:3000
+	}
+
+	handle /health {
+		reverse_proxy auth-api:8000
+	}
+
+	handle {
+		reverse_proxy react-ui:80
+	}
+}

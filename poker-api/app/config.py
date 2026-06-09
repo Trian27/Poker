@@ -1,6 +1,7 @@
 """
 Application configuration using Pydantic settings
 """
+import json
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
@@ -56,7 +57,7 @@ class Settings(BaseSettings):
     STRIPE_SECRET_KEY: Optional[str] = None
     
     # CORS
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 
     # Internal services
     GAME_SERVER_URL: str = "http://game-server:3000"
@@ -74,6 +75,17 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.ENV_MODE.lower() in ("production", "prod")
+
+    @property
+    def cors_origins(self) -> list[str]:
+        normalized = self.CORS_ORIGINS.strip()
+        if not normalized:
+            return []
+        if normalized.startswith("["):
+            parsed = json.loads(normalized)
+            if isinstance(parsed, list):
+                return [str(origin).strip() for origin in parsed if str(origin).strip()]
+        return [origin.strip() for origin in normalized.split(",") if origin.strip()]
     
     model_config = SettingsConfigDict(
         env_file=".env",

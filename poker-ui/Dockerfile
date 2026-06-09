@@ -17,6 +17,7 @@ COPY . .
 # Build arguments for API URLs (injected at build time)
 ARG VITE_API_URL=http://localhost:8000
 ARG VITE_GAME_SERVER_URL=http://localhost:3000
+ARG VITE_INVITE_ONLY_REGISTRATION=false
 
 # Build the application
 RUN npm run build

@@ -154,6 +154,15 @@
   text-decoration: underline;
 }
 
+.auth-static-value {
+  margin: 0 0 1.5rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid #2f4350;
+  background: #111a22;
+  color: #e8eff3;
+  font-weight: 600;
+}
+
 /* Success message */
 .success-message {
   background-color: #1b2c1f;

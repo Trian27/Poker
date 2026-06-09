@@ -10,6 +10,7 @@ import { getApiErrorMessage } from "../utils/error";
 import { consumePostSignupTutorialPending, hasSeenDormstacks, markDormstacksSeen } from '../utils/visitorState';
 
 export const RegisterPage: React.FC = () => {
+  const isInviteOnlyRegistration = import.meta.env.VITE_INVITE_ONLY_REGISTRATION === 'true';
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -33,10 +34,13 @@ export const RegisterPage: React.FC = () => {
   );
 
   useEffect(() => {
+    if (isInviteOnlyRegistration) {
+      return;
+    }
     if (!hasSeenDormstacks()) {
       navigate('/', { replace: true });
     }
-  }, [navigate]);
+  }, [isInviteOnlyRegistration, navigate]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -191,6 +195,26 @@ export const RegisterPage: React.FC = () => {
               Back to Registration
             </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (isInviteOnlyRegistration) {
+    return (
+      <div className="auth-container">
+        <div className="auth-card">
+          {brandHeading}
+          <h2>Invite Required</h2>
+          <p className="verification-info">
+            DormStacks beta access is invite-only.
+          </p>
+          <p className="verification-info">
+            Use the account-creation link from your beta invite email to register.
+          </p>
+          <p className="auth-link">
+            Already have an account? <Link to="/login">Login here</Link>
+          </p>
         </div>
       </div>
     );
