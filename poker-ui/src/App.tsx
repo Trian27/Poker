@@ -6,6 +6,7 @@ import { AuthProvider } from './AuthContext';
 import { ProtectedRoute } from './ProtectedRoute';
 import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
+import { BetaInvitePage } from './pages/BetaInvitePage';
 import { WelcomeGatePage } from './pages/WelcomeGatePage';
 import { WelcomeChipGatePage } from './pages/WelcomeChipGatePage';
 import { WelcomeChipFlipGatePage } from './pages/WelcomeChipFlipGatePage';
@@ -34,6 +35,7 @@ function AppRoutes() {
     || location.pathname === '/learningmode'
     || location.pathname === '/login'
     || location.pathname === '/register'
+    || location.pathname.startsWith('/invite/')
     || location.pathname === '/tutorial'
   );
   const showMenuRules = !isInGame && !hideGlobalFloatingUi;
@@ -49,6 +51,7 @@ function AppRoutes() {
         <Route path="/learningmode" element={<WelcomeGatePage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
+        <Route path="/invite/:token" element={<BetaInvitePage />} />
         <Route
           path="/tutorial"
           element={

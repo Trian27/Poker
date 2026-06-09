@@ -1,0 +1,183 @@
+services:
+  postgres-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: poker_db
+      POSTGRES_USER: poker_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poker_user -d poker_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+  redis-cache:
+    image: redis:7-alpine
+    command: redis-server --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+  g5-advisor-service:
+    platform: linux/amd64
+    build:
+      context: ./g5-advisor-service
+      dockerfile: Dockerfile
+    environment:
+      G5_RUNTIME_BUNDLE_SOURCE_DIR: /opt/g5-bundle
+      G5_RUNTIME_WORK_DIR: /var/lib/g5-runtime/current
+      G5_RECENT_HANDS_COUNT: ${G5_RECENT_HANDS_COUNT:-15}
+      G5_PREFLOP_CHARTS_LEVEL: ${G5_PREFLOP_CHARTS_LEVEL:-4}
+      G5_DEBUG_RESPONSE: ${G5_DEBUG_RESPONSE:-false}
+      G5_SERVICE_PORT: 8002
+      ENV_MODE: production
+    volumes:
+      - ./.runtime/engines/g5/current/app:/opt/g5-bundle:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8002/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+  auth-api:
+    build:
+      context: ./poker-api
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://poker_user:${POSTGRES_PASSWORD}@postgres-db:5432/poker_db
+      SECRET_KEY: ${JWT_SECRET_KEY}
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      ENV_MODE: production
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      EMAIL_FROM: ${EMAIL_FROM}
+      EMAIL_VERIFICATION_EXPIRE_MINUTES: ${EMAIL_VERIFICATION_EXPIRE_MINUTES:-15}
+      CORS_ORIGINS: ${PUBLIC_APP_ORIGIN}
+      INVITE_ONLY_REGISTRATION: ${INVITE_ONLY_REGISTRATION:-true}
+      BETA_INVITE_TTL_HOURS: ${BETA_INVITE_TTL_HOURS:-168}
+      BETA_INVITE_BASE_URL: ${PUBLIC_APP_ORIGIN}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ADMIN_RESET_PASSWORD: ${ADMIN_RESET_PASSWORD:-false}
+      ENABLE_TEST_FIXTURE_API: ${ENABLE_TEST_FIXTURE_API:-false}
+      G5_ADVISOR_SERVICE_URL: http://g5-advisor-service:8002
+      G5_ADVISOR_TIMEOUT_SECONDS: ${G5_ADVISOR_TIMEOUT_SECONDS:-5}
+      G5_ENABLE_POSTFLOP_ANALYSIS: ${G5_ENABLE_POSTFLOP_ANALYSIS:-true}
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      g5-advisor-service:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+  game-server:
+    build:
+      context: ./GameImplementation
+      dockerfile: Dockerfile
+    environment:
+      REDIS_HOST: redis-cache
+      REDIS_PORT: 6379
+      AUTH_API_URL: http://auth-api:8000
+      PORT: 3000
+      NODE_ENV: production
+      SOCKET_IO_ALLOWED_ORIGINS: ${PUBLIC_APP_ORIGIN}
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      auth-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+  react-ui:
+    build:
+      context: ./poker-ui
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${PUBLIC_APP_ORIGIN}
+        VITE_GAME_SERVER_URL: ${PUBLIC_APP_ORIGIN}
+        VITE_INVITE_ONLY_REGISTRATION: ${INVITE_ONLY_REGISTRATION:-true}
+    depends_on:
+      auth-api:
+        condition: service_healthy
+      game-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      auth-api:
+        condition: service_healthy
+      game-server:
+        condition: service_healthy
+      react-ui:
+        condition: service_healthy
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/beta/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - poker-beta-network
+    restart: unless-stopped
+
+networks:
+  poker-beta-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local

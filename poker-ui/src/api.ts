@@ -4,6 +4,8 @@
 import axios from 'axios';
 import type {
   ActiveSeatStatus,
+  BetaInviteAdmin,
+  BetaInviteStatus,
   CommunityWalletAdjustResponse,
   CommunityWalletSummary,
   TableQueuePosition,
@@ -149,6 +151,19 @@ export const authApi = {
     return response.data;
   },
 
+  lookupBetaInvite: async (token: string) => {
+    const response = await api.get(`/auth/invite/${token}`);
+    return response.data;
+  },
+
+  acceptBetaInvite: async (token: string, username: string, password: string) => {
+    const response = await api.post(`/auth/invite/${token}/accept`, {
+      username,
+      password,
+    });
+    return response.data;
+  },
+
   verifyAdminLogin: async (email: string, verificationCode: string) => {
     const response = await api.post('/auth/verify-admin-login', null, {
       params: { email, verification_code: verificationCode },
@@ -172,6 +187,33 @@ export const authApi = {
 
   getCurrentUser: async () => {
     const response = await api.get('/auth/me');
+    return response.data;
+  },
+};
+
+export const betaInvitesApi = {
+  list: async (statusFilter?: BetaInviteStatus): Promise<{ items: BetaInviteAdmin[] }> => {
+    const response = await api.get('/api/admin/beta-invites', {
+      params: statusFilter ? { status_filter: statusFilter } : undefined,
+    });
+    return response.data;
+  },
+
+  create: async (email: string, notes?: string): Promise<BetaInviteAdmin> => {
+    const response = await api.post('/api/admin/beta-invites', {
+      email,
+      notes: notes || undefined,
+    });
+    return response.data;
+  },
+
+  resend: async (inviteId: number): Promise<BetaInviteAdmin> => {
+    const response = await api.post(`/api/admin/beta-invites/${inviteId}/resend`);
+    return response.data;
+  },
+
+  revoke: async (inviteId: number): Promise<BetaInviteAdmin> => {
+    const response = await api.post(`/api/admin/beta-invites/${inviteId}/revoke`);
     return response.data;
   },
 };

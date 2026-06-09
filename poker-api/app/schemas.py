@@ -35,6 +35,14 @@ class TableTournamentState(str, Enum):
     CANCELED = "canceled"
 
 
+class BetaInviteStatus(str, Enum):
+    """Lifecycle status for a beta invite."""
+    PENDING = "pending"
+    REDEEMED = "redeemed"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
 # ============================================================================
 # User Schemas
 # ============================================================================
@@ -79,6 +87,68 @@ class AdminInviteRequest(BaseModel):
     """Invite a user to be a league/community admin."""
     username: Optional[str] = None
     email: Optional[EmailStr] = None
+
+
+class BetaInviteCreateRequest(BaseModel):
+    """Admin request to create a beta invite."""
+    email: EmailStr
+    notes: Optional[str] = Field(default=None, max_length=500)
+    model_config = ConfigDict(extra="forbid")
+
+
+class BetaInviteAdminResponse(BaseModel):
+    """Admin view of a beta invite."""
+    id: int
+    email: EmailStr
+    notes: Optional[str] = None
+    created_by_user_id: Optional[int] = None
+    redeemed_by_user_id: Optional[int] = None
+    created_at: datetime
+    expires_at: datetime
+    sent_at: Optional[datetime] = None
+    used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+    status: BetaInviteStatus
+    invite_url: Optional[str] = None
+    delivery_status: Optional[Literal["sent", "manual_required"]] = None
+
+
+class BetaInviteListResponse(BaseModel):
+    """Admin list response for beta invites."""
+    items: list[BetaInviteAdminResponse]
+
+
+class BetaInviteLookupResponse(BaseModel):
+    """Public lookup response for a valid beta invite."""
+    email: EmailStr
+    expires_at: datetime
+
+
+class BetaInviteAcceptRequest(BaseModel):
+    """Public request to accept a beta invite."""
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=100)
+    model_config = ConfigDict(extra="forbid")
+
+
+class BetaInviteAcceptedUser(BaseModel):
+    """Public user payload returned after invite redemption."""
+    id: int
+    username: str
+    email: EmailStr
+    created_at: datetime
+    is_admin: bool = False
+    is_banned: bool = False
+    is_test_user: bool = False
+
+
+class BetaInviteAcceptResponse(BaseModel):
+    """Successful beta invite acceptance response."""
+    success: bool
+    message: str
+    access_token: str
+    token_type: str = "bearer"
+    user: BetaInviteAcceptedUser
 
 
 class AdminUserResponse(BaseModel):

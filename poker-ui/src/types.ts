@@ -22,6 +22,24 @@ export interface AuthResponse {
   token_type: string;
 }
 
+export type BetaInviteStatus = 'pending' | 'expired' | 'redeemed' | 'revoked';
+
+export interface BetaInviteAdmin {
+  id: number;
+  email: string;
+  notes?: string | null;
+  created_by_user_id?: number | null;
+  redeemed_by_user_id?: number | null;
+  created_at: string;
+  expires_at: string;
+  sent_at?: string | null;
+  used_at?: string | null;
+  revoked_at?: string | null;
+  status: BetaInviteStatus;
+  invite_url?: string | null;
+  delivery_status?: 'sent' | 'manual_required' | null;
+}
+
 export interface League {
   id: number;
   name: string;

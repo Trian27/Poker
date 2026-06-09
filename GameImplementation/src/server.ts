@@ -6,9 +6,11 @@ import jwt, { JwtPayload } from 'jsonwebtoken';
 import { GameStateStorage, redis } from './redis';
 import express, { Request, Response } from 'express';
 import bodyParser from 'body-parser';
+import { resolveSocketCorsOrigin } from './socketCorsConfig';
 
 const PORT = parseInt(process.env.PORT || '3000');
 const FASTAPI_URL = process.env.AUTH_API_URL || 'http://localhost:8000';
+const SOCKET_IO_ALLOWED_ORIGINS = process.env.SOCKET_IO_ALLOWED_ORIGINS;
 const TABLE_NOT_FOUND_SOCKET_REASON = 'table_not_found';
 
 interface ConnectedPlayer {
@@ -147,7 +149,7 @@ export class PokerServer {
     
     this.io = new Server(httpServer, {
       cors: {
-        origin: '*',
+        origin: resolveSocketCorsOrigin(process.env.NODE_ENV, SOCKET_IO_ALLOWED_ORIGINS),
         methods: ['GET', 'POST']
       }
     });

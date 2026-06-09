@@ -44,6 +44,36 @@ class User(Base):
     # Relationships
     owned_leagues = relationship("League", back_populates="owner")
     wallets = relationship("Wallet", back_populates="user")
+    created_beta_invites = relationship(
+        "BetaInvite",
+        back_populates="created_by",
+        foreign_keys="BetaInvite.created_by_user_id",
+    )
+    redeemed_beta_invites = relationship(
+        "BetaInvite",
+        back_populates="redeemed_by",
+        foreign_keys="BetaInvite.redeemed_by_user_id",
+    )
+
+
+class BetaInvite(Base):
+    """Admin-created beta invite records."""
+    __tablename__ = "beta_invites"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(100), nullable=False, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    notes = Column(String(500), nullable=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    redeemed_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    used_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_by = relationship("User", foreign_keys=[created_by_user_id], back_populates="created_beta_invites")
+    redeemed_by = relationship("User", foreign_keys=[redeemed_by_user_id], back_populates="redeemed_beta_invites")
 
 
 class League(Base):
