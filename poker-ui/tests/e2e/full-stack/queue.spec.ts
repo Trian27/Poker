@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test';
 import { test, FULL_STACK_ENABLED } from './fullStackTest';
+import { getBackendPromotionObservation } from '../../../src/utils/queuePromotionBackend';
 import {
   assertUiSeatAssignments,
   assertUserNotOccupyingSeat,
@@ -155,21 +156,23 @@ test.describe('Browser full-stack queue promotion', () => {
         getTableSeats(userCApi.request, fixture.table_id),
       ]);
 
-      const ownQueueEntry = queueEntriesNow.find((entry) => entry.userId === String(userCApi.userId));
-      const promotedSession = activeSessions.find((entry) => Number(entry.user_id) === userCApi.userId);
-      const promotedSeat = seats.find((seat) => Number(seat.user_id) === userCApi.userId);
+      const activeSeatMatchesTable = Boolean(activeSeatC.active) && Number(activeSeatC.table_id) === fixture.table_id;
+      if (activeSeatMatchesTable && !activeSeatObservedAt) {
+        activeSeatObservedAt = new Date().toISOString();
+      }
 
-      if (
-        !ownQueueEntry
-        && Boolean(activeSeatC.active)
-        && Number(activeSeatC.table_id) === fixture.table_id
-        && promotedSession
-        && Number(promotedSession.buy_in_amount) === chosenReservedBuyIn
-        && promotedSeat
-      ) {
+      const promotionObservation = getBackendPromotionObservation({
+        queueEntries: queueEntriesNow,
+        activeSessions,
+        seats,
+        reservedBuyInAmount: chosenReservedBuyIn,
+        tableId: fixture.table_id,
+        userId: userCApi.userId,
+      });
+
+      if (promotionObservation.observed) {
         promotionObservedAt = new Date().toISOString();
-        activeSeatObservedAt = promotionObservedAt;
-        promotedSeatNumber = Number(promotedSeat.seat_number);
+        promotedSeatNumber = promotionObservation.promotedSeatNumber;
         break;
       }
 
@@ -187,10 +190,28 @@ test.describe('Browser full-stack queue promotion', () => {
       promoted_table_id: fixture.table_id,
       promoted_seat_number: promotedSeatNumber,
       promotion_observed_at: promotionObservedAt,
-      active_seat_observed_at: activeSeatObservedAt,
     });
 
     await runtime.summary.markPhase('promotion_ui_catchup');
+    const activeSeatDeadline = Date.now() + UI_PROMOTION_DEADLINE_MS;
+    while (!activeSeatObservedAt && Date.now() < activeSeatDeadline) {
+      const activeSeat = await getActiveSeatStatus(userCApi.request);
+      if (
+        Boolean(activeSeat.active)
+        && Number(activeSeat.table_id) === fixture.table_id
+        && Number(activeSeat.seat_number) === promotedSeatNumber
+      ) {
+        activeSeatObservedAt = new Date().toISOString();
+        break;
+      }
+      await pageC.waitForTimeout(300);
+    }
+
+    if (!activeSeatObservedAt) {
+      throw new Error(`Active seat never reflected promotion within ${UI_PROMOTION_DEADLINE_MS}ms`);
+    }
+
+    await runtime.summary.update({ active_seat_observed_at: activeSeatObservedAt });
     await expect(pageC.getByTestId('queue-promoted-banner')).toBeVisible({ timeout: UI_PROMOTION_DEADLINE_MS });
     const bannerObservedAt = new Date().toISOString();
     await runtime.summary.update({ banner_observed_at: bannerObservedAt });

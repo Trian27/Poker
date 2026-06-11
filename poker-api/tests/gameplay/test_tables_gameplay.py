@@ -1276,6 +1276,33 @@ def test_active_seat_endpoint_reflects_join_and_leave(client, db_session, auth_s
     assert active_after_leave.json()["active"] is False
 
 
+def test_active_seat_endpoint_reflects_queue_promotion(client, db_session, auth_state, app_modules, monkeypatch):
+    fixture = setup_queue_promotion_fixture(
+        client,
+        db_session,
+        auth_state,
+        app_modules,
+        queue_specs=[{"user_key": "member", "buy_in_amount": 350}],
+    )
+    promoted_player = fixture.queued_players[0]
+
+    async def fake_post_game_server_json(path: str, payload: dict, timeout: float = 10.0) -> httpx.Response:
+        return httpx.Response(200, json={"success": True})
+
+    monkeypatch.setattr(app_modules["main"], "post_game_server_json", fake_post_game_server_json)
+
+    response = client.post(f"/api/internal/tables/{fixture.table.id}/unseat/{fixture.leaving_user.id}")
+    assert response.status_code == 200, response.text
+
+    set_current_user(auth_state, promoted_player.user)
+    active_response = client.get("/api/tables/me/active-seat")
+    assert active_response.status_code == 200
+    assert active_response.json()["active"] is True
+    assert active_response.json()["table_id"] == fixture.table.id
+    assert active_response.json()["community_id"] == fixture.setup.community.id
+    assert active_response.json()["seat_number"] == fixture.freed_seat_number
+
+
 
 def test_hand_history_summary_and_detail_are_scoped_to_participants(client, db_session, auth_state, app_modules):
     setup = seed_league_graph(db_session, app_modules)
