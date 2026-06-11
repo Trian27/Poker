@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     BETA_INVITE_BASE_URL: Optional[str] = None
 
     # Internal advisor integration
+    G5_ADVISOR_ENABLED: bool = True
     G5_ADVISOR_SERVICE_URL: str = "http://g5-advisor-service:8002"
     G5_ADVISOR_TIMEOUT_SECONDS: float = 5.0
     G5_ENABLE_POSTFLOP_ANALYSIS: bool = True

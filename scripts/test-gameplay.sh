@@ -16,6 +16,7 @@ REACT_UI_HOST_PORT="${REACT_UI_HOST_PORT:-18002}"
 AGENT_API_HOST_PORT="${AGENT_API_HOST_PORT:-18003}"
 ENABLE_TEST_FIXTURE_API="${ENABLE_TEST_FIXTURE_API:-true}"
 ENV_MODE="${ENV_MODE:-dev}"
+G5_ADVISOR_ENABLED="${G5_ADVISOR_ENABLED:-true}"
 ADMIN_USERNAME="${ADMIN_USERNAME:-e2e_admin}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-e2e-admin@example.test}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-E2EAdminPass123!}"
@@ -150,6 +151,7 @@ run_compose_mode() {
   export AGENT_API_HOST_PORT
   export ENABLE_TEST_FIXTURE_API
   export ENV_MODE
+  export G5_ADVISOR_ENABLED
   export ADMIN_USERNAME
   export ADMIN_EMAIL
   export ADMIN_PASSWORD
@@ -219,6 +221,7 @@ run_compose_browser_suite() {
   export AGENT_API_HOST_PORT
   export ENABLE_TEST_FIXTURE_API
   export ENV_MODE
+  export G5_ADVISOR_ENABLED
   export ADMIN_USERNAME
   export ADMIN_EMAIL
   export ADMIN_PASSWORD
@@ -263,19 +266,19 @@ case "$MODE" in
     run_poker_ui
     ;;
   compose-autonomous)
-    run_compose_mode "bot-vs-bot" "compose-autonomous" postgres-db redis-cache auth-api game-server
+    G5_ADVISOR_ENABLED=false run_compose_mode "bot-vs-bot" "compose-autonomous" postgres-db redis-cache auth-api game-server
     ;;
   compose-human-vs-bot)
-    run_compose_mode "human-vs-bot" "compose-human-vs-bot" postgres-db redis-cache auth-api game-server react-ui
+    G5_ADVISOR_ENABLED=false run_compose_mode "human-vs-bot" "compose-human-vs-bot" postgres-db redis-cache auth-api game-server react-ui
     ;;
   compose-browser-pr-smoke)
-    run_compose_browser_suite "compose-browser-pr-smoke" "test:e2e:gameplay:full-stack:smoke" "compose-browser-pr-smoke"
+    G5_ADVISOR_ENABLED=false run_compose_browser_suite "compose-browser-pr-smoke" "test:e2e:gameplay:full-stack:smoke" "compose-browser-pr-smoke"
     ;;
   compose-browser-queue-pr)
-    run_compose_browser_suite "compose-browser-queue-pr" "test:e2e:gameplay:full-stack:queue" "compose-browser-queue-pr"
+    G5_ADVISOR_ENABLED=false run_compose_browser_suite "compose-browser-queue-pr" "test:e2e:gameplay:full-stack:queue" "compose-browser-queue-pr"
     ;;
   compose-browser-e2e)
-    run_compose_browser_suite "compose-browser-e2e" "test:e2e:gameplay:full-stack" "compose-browser-e2e"
+    G5_ADVISOR_ENABLED=false run_compose_browser_suite "compose-browser-e2e" "test:e2e:gameplay:full-stack" "compose-browser-e2e"
     ;;
   *)
     echo "Usage: $0 [pr|full|compose-autonomous|compose-human-vs-bot|compose-browser-pr-smoke|compose-browser-queue-pr|compose-browser-e2e] [driver args...]" >&2

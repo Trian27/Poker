@@ -155,10 +155,13 @@ async def on_startup() -> None:
     _bootstrap_admin_user()
     if settings.ENABLE_TEST_FIXTURE_API and not settings.is_production:
         logger.warning("Test fixture API is enabled outside production")
-    app.state.g5_advisor_client = httpx.AsyncClient(
-        base_url=settings.G5_ADVISOR_SERVICE_URL.rstrip("/"),
-        timeout=settings.G5_ADVISOR_TIMEOUT_SECONDS,
-    )
+    if settings.G5_ADVISOR_ENABLED:
+        app.state.g5_advisor_client = httpx.AsyncClient(
+            base_url=settings.G5_ADVISOR_SERVICE_URL.rstrip("/"),
+            timeout=settings.G5_ADVISOR_TIMEOUT_SECONDS,
+        )
+    else:
+        app.state.g5_advisor_client = None
 
 
 @app.on_event("shutdown")
@@ -187,7 +190,7 @@ async def health_check():
     """Detailed health check."""
     g5_status = await _get_g5_health_status()
     return {
-        "status": "healthy" if g5_status["ready"] else "degraded",
+        "status": "healthy" if g5_status["status"] in {"healthy", "disabled"} else "degraded",
         "database": "connected",
         "g5_advisor": g5_status,
     }
@@ -215,6 +218,15 @@ class PartitionContext:
 
 
 async def _get_g5_health_status() -> dict[str, object]:
+    if not settings.G5_ADVISOR_ENABLED:
+        return {
+            "status": "disabled",
+            "ready": False,
+            "http_status": None,
+            "startup_stage": "disabled",
+            "error": None,
+        }
+
     client = getattr(app.state, "g5_advisor_client", None)
     if client is None:
         return {
@@ -5675,6 +5687,10 @@ async def _request_g5_learning_recommendation(
     hero_player_id: str,
     hand_data: dict[str, object],
 ) -> object:
+    if not settings.G5_ADVISOR_ENABLED:
+        logger.info("G5 advisor request skipped because advisor integration is disabled")
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, "g5_service_disabled", "G5 advisor service is disabled.")
+
     client = getattr(app.state, "g5_advisor_client", None)
     if client is None:
         logger.error("G5 advisor client missing from app state")

@@ -9,6 +9,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROOT_TESTS_DIR = REPO_ROOT / "tests"
 APPROVED_ROOT_TEST_FILES = {
+    "test_autonomous_gameplay_driver.py",
     "test_browser_lane_readiness.py",
     "test_gameplay_workflow_scope.py",
     "test_root_test_directory_contract.py",

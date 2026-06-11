@@ -98,3 +98,21 @@ def test_health_reports_degraded_when_g5_request_fails(client, app_modules):
     assert body["g5_advisor"]["http_status"] is None
     assert body["g5_advisor"]["startup_stage"] is None
     assert body["g5_advisor"]["error"] == "g5 unavailable"
+
+
+def test_health_reports_healthy_when_g5_is_explicitly_disabled(client, app_modules, monkeypatch):
+    main = app_modules["main"]
+    monkeypatch.setattr(main.settings, "G5_ADVISOR_ENABLED", False)
+    main.app.state.g5_advisor_client = None
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "healthy"
+    assert body["database"] == "connected"
+    assert body["g5_advisor"]["status"] == "disabled"
+    assert body["g5_advisor"]["ready"] is False
+    assert body["g5_advisor"]["http_status"] is None
+    assert body["g5_advisor"]["startup_stage"] == "disabled"
+    assert body["g5_advisor"]["error"] is None
